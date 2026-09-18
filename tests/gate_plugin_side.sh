@@ -207,6 +207,38 @@ for entry in "${NEGATIVE_CASES[@]}"; do
   if [[ $? -eq 0 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 done
 
+# ---- 🔴-R3 附带（评审「下一步要求 ③」）：**自报降级 ⇒ 甩锅上游**（真宿主，单独一段） ----
+# 为什么单列（不能塞进上面的负例循环）：本形态需要**逐夹具的环境变量**
+# （`DSH_CHANNEL_REDIRECT_MODE=degrade-claim`），而负例循环的每一行只给「夹具 | 期望项 | 完成位」。
+# 形态：重定向 fd3 **+ 伪造报告自称 `resultChannel: 'stdout-degraded'`**（=「本环境没有 fd3」）
+# ⇒ 旧实现下宿主落 `hostFatal[]` ⇒ `UPSTREAM_DRIFT` / **AMBER（甩锅上游）**：
+# 插件 tamper 被报成环境/上游问题，**修错方向**。
+# 收口 = 宿主侧 **fd3 能力独立实测**（`probeFd3Capability()`，真宿主下真的起子进程）：
+# 实测可用却自报不可用 = 自报与事实矛盾 ⇒ 判插件侧 `plugin.protocol_injection`。
+echo
+echo "▶ 🔴-R3 附带：自报降级甩锅上游（宿主侧 fd3 能力实测）"
+DEGRADE_OUT="$(DSH_CHANNEL_REDIRECT_MODE=degrade-claim "$NODE_BIN" "$ROOT/src/cli.mjs" verify --channel "$CHANNEL" \
+    --plugin "$ROOT/tests/fixtures/plugin-channel-redirect-plugin.mjs" --tools demo_echo \
+    --json "$WORK/verify-degrade-claim.json" > /dev/null 2>&1; echo "exit=$?")"
+if [[ "$DEGRADE_OUT" == "exit=0" ]]; then
+  bad "🔴-R3③ 自报降级形态被误判为通过（甩锅/放行级失效）"
+else
+  "$NODE_BIN" -e '
+    const r = require(process.argv[1]);
+    const c = r.channels[0] ?? {};
+    const failed = (c.checks ?? []).filter((x) => x.status === "fail").map((x) => x.name);
+    const bad = [];
+    if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因不是 PLUGIN_REGRESSION（实得 " + c.attribution + "）——插件 tamper 被甩给上游");
+    if ((c.hostFatal ?? []).length !== 0) bad.push("hostFatal 非空（自报降级不得落环境/上游信号）：" + JSON.stringify(c.hostFatal));
+    if (r.summary.verdict === "AMBER") bad.push("判决为 AMBER（甩锅上游）");
+    if (!failed.includes("plugin.protocol_injection")) bad.push("失败项不含 plugin.protocol_injection（实得：" + failed.join(",") + "）");
+    if (c.runCompleted !== false) bad.push("完成位应为 false（不采信任何一条）");
+    if (bad.length) { console.error("❌ 🔴-R3③ 闸门失败：" + bad.join("；")); process.exit(1); }
+    console.log("✅ 自报降级甩锅：PLUGIN_REGRESSION / hostFatal 为空 / verdict=" + r.summary.verdict + " / 失败项=[" + failed.join(",") + "]");
+  ' "$WORK/verify-degrade-claim.json"
+  if [[ $? -eq 0 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
+fi
+
 # ---- R24：同步死循环 → 宿主**二次终止**（`killSignal: 'SIGKILL'`） ----
 # 为什么单列（评审复评 R24）：探针的看门狗 / 信号处理器都是事件循环上的回调，插件 `apply()`
 # 同步占满事件循环后两者都不执行；而探针为出口③ 装了 `SIGTERM` 处理器 ⇒ Node 默认终止行为被禁用

@@ -54,6 +54,7 @@ import { channelFingerprint, loadChannels, runHostProbe } from '../src/harness/h
 // P2-8：插件侧 check 名单**从唯一事实源 import**（此前硬编码 12 项，表一改测试就不设防）
 import { PLUGIN_SIDE_CHECKS } from '../src/harness/contract.mjs';
 import { attributeFailure } from '../src/verify/runner.mjs';
+import { buildSecondary } from '../src/report/secondary.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -454,6 +455,34 @@ try {
     const healthy = verify(path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), 'demo_echo,demo_status');
     eq('🔴-R3′ 反向护栏（真宿主）：健康插件仍 PASS / 17 项全绿 / 未降级', 'PASS|17|false',
       `${healthy.attribution}|${(healthy.checks ?? []).length}|${healthy.resultChannelDegraded}`);
+  }
+
+  // ---- 11i. 🔴-R3 附带（评审「下一步要求 ③」）：**自报降级 ⇒ 甩锅上游**（真宿主） ----
+  // 为什么必须真宿主也跑：判据依赖**宿主侧 fd3 能力实测**（`probeFd3Capability()` 真的起子进程），
+  // 而离线回归台是假宿主 —— 真宿主能覆盖「真实 spawn 环境下的能力探测结果」这条前提。
+  console.log('  [8i] 🔴-R3 附带：自报降级甩锅上游（宿主侧 fd3 能力实测，真宿主）');
+  {
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'degrade-claim';
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'demo_echo');
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3③（真宿主）：归因**不得** UPSTREAM_DRIFT（插件 tamper 不甩给上游）', 'PLUGIN_REGRESSION', report.attribution);
+    eq('🔴-R3③（真宿主）：verdict=RED（不放行）', 'RED', report.summary?.verdict);
+    eq('🔴-R3③（真宿主）：hostFatal 为空（自报降级不得落环境/上游信号）', 0, (report.hostFatal ?? []).length);
+    eq('🔴-R3③（真宿主）：判 plugin.protocol_injection（自报与宿主实测矛盾）', true,
+      failed.includes('plugin.protocol_injection'));
+    eq('🔴-R3③（真宿主）：完成位 false + ok 不得为真', 'false|false', `${report.runCompleted}|${report.ok === true}`);
+    // 报告层：降级的两种成因必须分开说（否则人会把「插件篡改」读成「环境限制」）
+    const secondary = buildSecondary({
+      generatedAt: 'T',
+      plugin: 'p',
+      channels: [report],
+      summary: { total: 1, passed: 0, failed: 1, upstreamDrift: [], pluginRegression: [report.channel], unknown: [], verdict: report.summary?.verdict ?? 'RED' },
+    });
+    eq('🔴-R3③（真宿主·报告层）：自报降级 ⇒ 风险描述点明「自报与事实矛盾」', true,
+      (secondary.risks[0]?.description ?? '').includes('自报与事实矛盾'));
+    eq('🔴-R3③（真宿主·报告层）：规避动作指向**插件侧**（不是「修环境」）', true,
+      (secondary.risks[0]?.mitigation ?? '').includes('插件侧'));
   }
 
   console.log('  [8f] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');

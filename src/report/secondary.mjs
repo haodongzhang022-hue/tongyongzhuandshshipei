@@ -26,13 +26,22 @@ export function buildSecondary(report) {
     // 篡改证据，故本轮结论不可信。独立成一条风险（即便 channel.ok 为假也已由下面的通用分支覆盖，
     // 这里保证「降级」这件事**不会**被淹没在别的失败原因里）。
     if (channel.resultChannelDegraded === true) {
+      // 🔴-R3③：降级有**两种完全相反**的成因，报告必须分开说，否则人会把「插件篡改通道」读成「环境限制」：
+      // - 自报降级 + **宿主侧 fd3 能力实测可用** ⇒ 自报与事实矛盾 ⇒ 插件关闭/替换了通道
+      //   （落插件侧 check `plugin.protocol_injection`，归因 PLUGIN_REGRESSION）；
+      // - 真降级（宿主未提供 / 实测不可用）⇒ 环境限制 ⇒ `hostFatal[]` ⇒ UPSTREAM_DRIFT（AMBER）。
+      const tampered = (channel.checks ?? []).some((c) => c.name === 'plugin.protocol_injection' && c.status === 'fail');
       risks.push({
         severity: 'HIGH',
         channel: channel.channel,
         attribution: channel.attribution,
-        description: `${channel.label ?? channel.channel} 结构化结果的**通道降级**（\`${channel.resultChannel}\`）：fd3 不可用 ⇒ 结果走 stdout，「stdout 上出现结果行」不再构成篡改证据 ⇒ 本轮结论**不可信**（不得判 PASS）`,
-        reasons: [`resultChannel=${channel.resultChannel}`, `resultChannelAtStart=${channel.resultChannelAtStart ?? 'null'}`],
-        mitigation: '修环境（容器 / Windows 需支持 fd3）或改用支持独立 fd 的执行方式；降级运行**不得**作为放行依据',
+        description: tampered
+          ? `${channel.label ?? channel.channel} 报告**自称**结果通道降级（\`${channel.resultChannel}\`），但宿主侧 fd3 能力**实测可用** ⇒ 自报与事实矛盾 ⇒ 通道是在插件代码运行期间被**关闭/替换**的（判插件侧 \`plugin.protocol_injection\`），本轮结论**不可信**（不得判 PASS）`
+          : `${channel.label ?? channel.channel} 结构化结果的**通道降级**（\`${channel.resultChannel}\`）：fd3 不可用 ⇒ 结果走 stdout，「stdout 上出现结果行」不再构成篡改证据 ⇒ 本轮结论**不可信**（不得判 PASS）`,
+        reasons: [`resultChannel=${channel.resultChannel}`, `resultChannelAtStart=${channel.resultChannelAtStart ?? 'null'}`, `protocolInjection=${tampered}`],
+        mitigation: tampered
+          ? '插件侧问题：不要关闭 / 重定向探针的结果通道（fd3），也不要伪造报告里的 resultChannel 字段'
+          : '修环境（容器 / Windows 需支持 fd3）或改用支持独立 fd 的执行方式；降级运行**不得**作为放行依据',
         hostFatal: channel.hostFatal ?? [],
         errors: channel.errors ?? [],
       });

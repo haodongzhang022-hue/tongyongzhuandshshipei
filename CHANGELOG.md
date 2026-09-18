@@ -1,3 +1,45 @@
+## v0.2.6 · 🔴-R3 附带形态收口：**自报降级 ⇒ 甩锅上游**（宿主侧 fd3 能力实测）
+
+> 承接 v0.2.5（🔴-R3′ 通道重定向 + 压退出码，宿主侧通道观测交叉校验）。
+> 本版收口评审复评（锚 `cdef320`）§2.5 **附带发现** + §3「下一步要求 **③**」点名的那条**同源形态**：
+> **「自报 `stdout-degraded` ⇒ AMBER 甩锅上游」**；并把协议注入的三条判据收敛为**单一落点**。
+
+### 🔴-R3 附带：自报降级 ⇒ **甩锅上游**（同源，登记进 R31）
+
+| 项 | 内容 |
+|---|---|
+| 形态 | 插件 `closeSync(3)` / 直接伪造一条 `resultChannel: 'stdout-degraded'` 的报告（=「**本环境**没有 fd3」）⇒ 宿主按「环境限制」处理 ⇒ 落 `hostFatal[]` ⇒ `UPSTREAM_DRIFT` / **AMBER** |
+| 后果 | **责任错、修错方向**：插件 tamper 被报成环境 / 上游问题（与 🔴-R3 主形态「假绿」同源、但危害方向相反） |
+| 修法 | **宿主侧 fd3 能力独立实测**（`probeFd3Capability()`）：另起极小子进程写 fd3（`stdio: [ignore,ignore,ignore,pipe]`，约 40ms，**每进程记忆化一次**）。「报告自称降级」而「宿主侧实测可用**且确实提供了** fd3」⇒ 自报与事实矛盾 ⇒ 判 `plugin.protocol_injection`、**不再**落 `hostFatal[]` |
+| 关键纪律 | **不读自报字段做唯一依据**：`resultChannel` / `resultChannelAtStart` 由**被审查方**（探针与插件同进程）提供，必须与**宿主侧独立实测**交叉 |
+| 收敛 | 协议注入三条判据（多 marker / 通道重定向 / 自报降级）共用**单一落点** `markProtocolInjection()`（清空 checks/errors/hostFatal + 完成位 false + ok=false）——各自实现必然漏清某个字段，而漏清 = 假绿 |
+| 报告层 | 降级的**两种相反成因**分开说：自报降级（实测可用）⇒ 风险描述点明「自报与事实矛盾」+ 规避动作指向**插件侧**；真降级 ⇒ 仍按**环境限制**（AMBER） |
+| 反向护栏 | ① **真**降级（宿主**未提供** fd3 / 能力实测不可用）⇒ 不误判篡改，仍落 `hostFatal[]`；② 老装配器 / 合成输入（未传 `fd3Usable`/`fd3Provided`）⇒ 判据**不启用**（2 参调用历史行为不变）；③ 健康插件在同一份新代码下仍 **17/17** |
+| 残留边界（不越权承诺） | 本项测的是**环境**能力，不是「本次 spawn 的 fd3 是否被插件关掉」（后者由通道观测交叉校验覆盖）。能**同时**篡改退出码与伪造通道自报的插件仍属进程级对抗 ⇒ 根治归**批 2** |
+
+### 回归（本版新增）
+
+| 层 | 内容 |
+|---|---|
+| 离线（`test_offline.sh` **[21]** 追加 13 条） | 判据级最小复现（自称降级 + 宿主实测可用 ⇒ 判篡改；未提供 fd3 ⇒ 不误判；未传选项 ⇒ 不启用）+ 行为级 `degrade-claim` 形态 + **变异回退复现「甩锅上游」**（关掉判据 ⇒ `UPSTREAM_DRIFT`）+ 真降级反向护栏 + 能力实测可用 |
+| 离线（`test_attribution.mjs` **[9.16]** 新增 29 条） | 源码守卫（`probeFd3Capability` / 记忆化 / spawn 失败⇒null / 单一落点 ≥3 处调用）+ 可证伪正反 + 报告层两种成因分开说 + 行为级三形态 + 反向护栏 + **变异回退（复现甩锅上游）** + 夹具自检 |
+| 真宿主（`test_e2e_regression.mjs` **[8i]** 新增 7 条） | 归因不得 `UPSTREAM_DRIFT` / `hostFatal` 为空 / 判 `plugin.protocol_injection` / 完成位 false + 报告层描述与规避动作 |
+| 闸门（`tests/gate_plugin_side.sh`） | 新增独立一段（`DSH_CHANNEL_REDIRECT_MODE=degrade-claim`）——逐夹具环境变量无法塞进负例循环 ⇒ 单列；闸门 **25 → 26 项** |
+
+### 兼容性（行为变更，预期）
+
+- `host.mjs` 新增导出 `probeFd3Capability()`（宿主侧 fd3 能力实测，**每进程记忆化**，返回 `true/false/null`；`null` = 测不出来 ⇒ 判据不启用）。`src/index.mjs` 同步导出。
+- `interpretProbeStdout()` 选项新增 `fd3Usable` / `fd3Provided`（**未传 ⇒ 依赖它们的判据不启用** ⇒ 老装配器 / 合成输入 / 2 参调用行为不变）。
+- 夹具 `plugin-channel-redirect-plugin` 新增第三形态 `degrade-claim`（`DSH_CHANNEL_REDIRECT_MODE`）。
+
+### 测试项数（本版）
+
+- 离线单测 189 项（`tests/test_offline.sh`：178 → 189）
+- 归因离线回归 578 项（`tests/test_attribution.mjs`：541 → 578；**[9.16]** 新增 29 条 + 报告层）
+- 归因端到端回归 179 项（`tests/test_e2e_regression.mjs`：172 → 179；**[8i]** 新增 7 条）
+- 插件侧闸门 26 项（`tests/gate_plugin_side.sh`：25 → 26；+ 🔴-R3③ 独立一段）
+- 发布面自检 43 项（不变）
+
 ## v0.2.5 · 🔴-R3′ 收口：结果通道重定向 + 压退出码（宿主侧通道观测交叉校验）
 
 > 承接 v0.2.4。本版由**评审复评 🔴-R3′**（收窄后的活口）驱动：`1a09a83` 上「**fd3 重定向 + 压

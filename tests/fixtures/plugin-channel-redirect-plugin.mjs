@@ -20,14 +20,19 @@
  * - `all`（**R3′**，最强形态）：重定向 fd3 **+** 压 `process.exitCode = 0` —— 旧实现下
  *   **两条防线同时失效** ⇒ 实测 `ok=true / PASS / GREEN / fails=[] / exit status=0`（放行）；
  * - `no-squelch`（**R3 主形态**）：只重定向 fd3、**不**压退出码 —— 旧实现下由**退出码交叉**
- *   （`plugin.exit_code_mismatch`）兜住（这正是评审撤回的那条形态）。
- * 两者在收口后都必须判 `plugin.protocol_injection`（同一根因的两个出口）。
+ *   （`plugin.exit_code_mismatch`）兜住（这正是评审撤回的那条形态）；
+ * - `degrade-claim`（**R3 附带形态**，评审「下一步要求 ③」）：重定向 fd3 **+ 伪造报告自称
+ *   `resultChannel: 'stdout-degraded'`**（=「本环境没有 fd3」）—— 旧实现下宿主落 `hostFatal[]`
+ *   ⇒ `UPSTREAM_DRIFT` / **AMBER（甩锅上游）**：插件 tamper 被报成环境/上游问题，**修错方向**。
+ * 三者收口后都必须判 `plugin.protocol_injection`（同一根因的三个出口）。
  *
  * ## 收口判据（本夹具进闸门的意义）
- * 装配器新增**宿主侧通道观测**交叉校验：报告**自称**走 `fd3`（`resultChannel === 'fd3'`）
- * 却**宿主侧 fd3 无内容**、而 stdout 反而出现**匹配 nonce** 的结果行 ⇒ 判
- * `plugin.protocol_injection`（通道被重定向），**不采信任何一条**。
- * 本判据**只依赖宿主侧对 fd3 的实际观测**，不依赖探针自报、也不依赖退出码 ⇒ 压退出码无效。
+ * 装配器两条**宿主侧**交叉校验（都**不依赖探针自报**）：
+ * - 报告**自称**走 `fd3`（`resultChannel === 'fd3'`）却**宿主侧 fd3 无内容**、而 stdout 反而
+ *   出现**匹配 nonce** 的结果行 ⇒ 通道被重定向；
+ * - 报告**自称降级**（`stdout-degraded`）而**宿主侧 fd3 能力实测可用**（`probeFd3Capability()`
+ *   且确实提供了 fd3）⇒ 自报与事实矛盾 = 通道在插件代码运行期间被关闭/替换（**不再**甩锅上游）。
+ * 两条都判 `plugin.protocol_injection`、**不采信任何一条**。
  *
  * 期望行为：`PLUGIN_REGRESSION` / `RED`（**绝不放行**）、`hostFatal[]` **必须为空**、
  * 失败项含 `plugin.protocol_injection`；**真缺陷**（多注册 `demo_extra` ⇒ `registry.exact`）
@@ -83,6 +88,10 @@ export function apply(ctx) {
       if (payloadStart < 0) return;
       const prefix = line.slice(0, payloadStart);
       const payload = JSON.parse(line.slice(payloadStart));
+      // 🔴-R3 附带（评审「下一步要求 ③」）：第三种形态——**自报降级 ⇒ 甩锅上游**。
+      // 自报 `stdout-degraded`（=「本环境没有 fd3」）⇒ 旧实现下宿主落 `hostFatal[]`
+      // ⇒ `UPSTREAM_DRIFT` / AMBER（插件 tamper 被报成环境/上游问题，**修错方向**）。
+      const claimDegrade = mode === 'degrade-claim';
       const forged = {
         ...payload,
         checks: (payload.checks ?? []).map((c) => ({ ...c, status: 'pass' })),
@@ -90,10 +99,11 @@ export function apply(ctx) {
         hostFatal: [],
         ok: true,
         runCompleted: true,
-        resultChannel: 'fd3',
+        resultChannel: claimDegrade ? 'stdout-degraded' : 'fd3',
+        ...(claimDegrade ? { resultChannelAtStart: 'stdout-degraded' } : {}),
       };
       writeSync(1, `${prefix}${JSON.stringify(forged)}\n`);
-      if (mode === 'all') process.exitCode = 0;
+      if (mode === 'all' || claimDegrade) process.exitCode = 0;
     } catch { /* 崩溃路径上不再抛 */ }
   });
 }

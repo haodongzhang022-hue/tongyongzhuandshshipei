@@ -69,6 +69,7 @@ import { runOfflineProbe, runOfflineProbeWithSources } from './offline-probe-har
 // 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
 import { codeOnly, stripComments } from './source-scan.mjs';
 import { DRIFT_FIELDS, DRIFT_IMPACT, classifyDrift, diffReservedNames, triageUpstream } from '../src/triage/index.mjs';
+import { buildSecondary } from '../src/report/secondary.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -1966,12 +1967,161 @@ console.log('  [9.15] 🔴-R3′：通道重定向 + 压退出码（宿主侧通
       /readFileSync\(REDIRECT_PATH/.test(src));
     eq('🔴-R3′ 夹具：真的把绿卡写进 **stdout**（伪造结果行）', true, /writeSync\(1,/.test(src));
     eq('🔴-R3′ 夹具：两段式（all = 重定向 + 压退出码；no-squelch = 只重定向）', true,
-      /DSH_CHANNEL_REDIRECT_MODE/.test(src) && /mode === 'all'\) process\.exitCode = 0/.test(src));
+      /DSH_CHANNEL_REDIRECT_MODE/.test(src) && /mode === 'all' \|\| claimDegrade\) process\.exitCode = 0/.test(src));
     eq('🔴-R3′ 夹具：真缺陷（多注册 demo_extra ⇒ registry.exact 应红，绿卡不得掩盖它）', true,
       /demo_extra/.test(src));
     eq('🔴-R3′ 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
     eq('🔴-R3′ 夹具：自述口径不越权（残留边界指向批 2 / REDO-PROPOSAL）', true,
       src.includes('进程级对抗') && src.includes('REDO-PROPOSAL'));
+  }
+}
+
+// ---- 9.16. 🔴-R3 附带（评审「下一步要求 ③」）：**自报降级 ⇒ 甩锅上游** ----
+// 为什么单列（评审 §2.5 附带发现）：插件 `closeSync(3)` / 直接伪造一条
+// `resultChannel: 'stdout-degraded'` 的报告 ⇒ 宿主按「环境没有 fd3」处理 ⇒ 落 `hostFatal[]`
+// ⇒ `UPSTREAM_DRIFT` / **AMBER（甩锅上游）**：插件 tamper 被报成环境/上游问题，**修错方向**。
+// 收口与「通道重定向」同源：宿主侧 **fd3 能力独立实测**（`probeFd3Capability()`）——
+// 实测可用却自报不可用 = 自报与事实矛盾 = 通道在插件代码运行期间被关闭/替换。
+console.log('  [9.16] 🔴-R3 附带：自报降级甩锅上游（宿主侧 fd3 能力实测交叉校验）');
+{
+  const hostSrcForDegrade = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
+  const hostCodeForDegrade = codeOnly(hostSrcForDegrade);
+  // 源码守卫：宿主侧能力实测 + 判据前提
+  eq('🔴-R3③ 源码守卫：装配器提供宿主侧 fd3 能力实测（probeFd3Capability）', true,
+    /export function probeFd3Capability\(\)/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：生产路径把实测值交给解释器（fd3Usable）', true,
+    /fd3Usable: probeFd3Capability\(\)/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：生产路径声明「宿主确实提供了 fd3」（fd3Provided: true）', true,
+    /fd3Provided: true/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：判据 = 自报降级 ∧ 宿主侧实测可用 ∧ 确实提供了 fd3', true,
+    /result\.resultChannelDegraded && fd3Usable === true && fd3Provided !== false/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：能力实测**记忆化**（每进程只测一次，不重复起子进程）', true,
+    /fd3CapabilityCache !== undefined/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：spawn 失败 / 超时 ⇒ 返回 null（「测不出来」而非「不可用」，避免判据静默失效）', true,
+    /if \(run\.error\) \{[\s\S]{0,140}fd3CapabilityCache = null;/.test(hostSrcForDegrade));
+  eq('🔴-R3③ 源码守卫：协议注入落点抽成单一函数 markProtocolInjection（三条判据共用）', true,
+    /function markProtocolInjection\(result, evidence\)/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：三处判据都走该落点（≥3 次调用；各自实现必然漏清某个字段）', true,
+    (hostCodeForDegrade.match(/markProtocolInjection\(result,/g) ?? []).length >= 3);
+  eq('🔴-R3③：probeFd3Capability 在公共导出面（接入方可自检环境能力）', true,
+    /probeFd3Capability/.test(readText(path.join(ROOT, 'src/index.mjs'), 'utf8')));
+
+  // 判据级（可证伪正反两条 + 反向护栏）
+  {
+    const nonce = createProbeNonce(randomBytes).value;
+    const mk = (extra) => JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true, ...extra });
+    const run = (extra, opts = {}) => {
+      const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
+      interpretProbeStdout(r, `${probeResultPrefix(nonce)}${mk(extra)}\n`, { resultFd: '', nonce, ...opts });
+      return r;
+    };
+    const degraded = { resultChannel: 'stdout-degraded', resultChannelAtStart: 'stdout-degraded' };
+    // ① 正向：自报降级 + 宿主侧实测可用且确实提供了 fd3 ⇒ 必须判篡改（**不**甩锅上游）
+    const fake = run(degraded, { fd3Usable: true, fd3Provided: true });
+    eq('🔴-R3③ 正向：自报降级 + 宿主侧实测可用 ⇒ 判 plugin.protocol_injection', true,
+      fake.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 正向：**不得**落 hostFatal[]（不再把插件 tamper 报成环境/上游问题）', 0, fake.hostFatal.length);
+    eq('🔴-R3③ 正向：归因 PLUGIN_REGRESSION（**不得** UPSTREAM_DRIFT）', 'PLUGIN_REGRESSION',
+      attributeFailure(fake, channel, 'dev'));
+    eq('🔴-R3③ 正向：不采信任何一条（checks 只留篡改证据 + 完成位 false）', '1|false',
+      `${fake.checks.length}|${fake.runCompleted}`);
+    // ② 反向护栏 a（**真**降级）：宿主**未提供** fd3（离线台 noResultChannel 形态）⇒ 不误判篡改
+    const realByUnprovided = run(degraded, { fd3Usable: true, fd3Provided: false });
+    eq('🔴-R3③ 反向 a：宿主未提供 fd3（真降级）⇒ 不误判篡改', false,
+      realByUnprovided.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 反向 a：真降级仍落 hostFatal[] ⇒ UPSTREAM_DRIFT（AMBER，不放行）', '1|UPSTREAM_DRIFT',
+      `${realByUnprovided.hostFatal.length}|${attributeFailure(realByUnprovided, channel, 'dev')}`);
+    // ③ 反向护栏 b（能力实测不可用）⇒ 真降级，不误判
+    const realByCapability = run(degraded, { fd3Usable: false, fd3Provided: true });
+    eq('🔴-R3③ 反向 b：能力实测不可用 ⇒ 真降级，不误判篡改', false,
+      realByCapability.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    // ④ 反向护栏 c：老装配器 / 合成输入**未传**新选项 ⇒ 判据不启用（向后兼容，不制造假红）
+    const legacyOpts = run(degraded, {});
+    eq('🔴-R3③ 反向 c：未传 fd3Usable/fd3Provided（老装配器 / 合成输入）⇒ 判据不启用（向后兼容）', false,
+      legacyOpts.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 反向 c：兼容路径行为与 v0.2.3 一致（仍落 hostFatal[]）', 1, legacyOpts.hostFatal.length);
+  }
+
+  // 行为级（离线探针回归台：假宿主 + 真实探针 + 真实装配器实现）三形态 A/B
+  {
+    const fixture = path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs');
+    const probeOf = (mode) => {
+      process.env.DSH_CHANNEL_REDIRECT_MODE = mode;
+      const r = runOfflineProbe({ pluginPath: fixture, expectedTools: ['demo_echo'] });
+      return { r, failed: r.result.checks.filter((c) => c.status === 'fail').map((c) => c.name) };
+    };
+    const noSquelch = probeOf('no-squelch');
+    eq('🔴-R3③ 行为（主形态，不压退出码）：判 plugin.protocol_injection', true,
+      noSquelch.failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+    const all = probeOf('all');
+    eq('🔴-R3③ 行为（重定向 + 压退出码）：**不得**假绿（ok=false）', false, all.r.result.ok === true);
+    eq('🔴-R3③ 行为（压退出码）：判 plugin.protocol_injection（宿主侧观测压不掉）', true,
+      all.failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+    const degradeClaim = probeOf('degrade-claim');
+    eq('🔴-R3③ 行为（自报降级甩锅）：归因**不得** UPSTREAM_DRIFT', 'PLUGIN_REGRESSION', degradeClaim.r.attribution);
+    eq('🔴-R3③ 行为（自报降级甩锅）：hostFatal 为空（插件 tamper 不报成环境/上游问题）', 0,
+      degradeClaim.r.result.hostFatal.length);
+    eq('🔴-R3③ 行为（自报降级甩锅）：判 plugin.protocol_injection', true,
+      degradeClaim.failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+  }
+
+  // 反向护栏（防过度修正）：**真**降级（回归台故意不给 fd3）仍按环境限制处理
+  {
+    const realDegrade = runOfflineProbe({
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'),
+      expectedTools: ['demo_echo', 'demo_status'],
+      noResultChannel: true,
+    });
+    eq('🔴-R3③ 反向护栏：真降级（宿主未提供 fd3）不误判为篡改', false,
+      realDegrade.result.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 反向护栏：真降级仍判 UPSTREAM_DRIFT + hostFatal 非空（AMBER，不放行）', 'UPSTREAM_DRIFT|1',
+      `${realDegrade.attribution}|${realDegrade.result.hostFatal.length}`);
+    const healthy = runOfflineProbe({ pluginPath: path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), expectedTools: ['demo_echo', 'demo_status'] });
+    eq('🔴-R3③ 反向护栏：健康插件同代码下仍 17/17 全绿（防过度修正）', '17|0|true',
+      `${healthy.result.checks.filter((c) => c.status === 'pass').length}|${healthy.result.checks.filter((c) => c.status === 'fail').length}|${healthy.result.ok === true}`);
+  }
+
+  // 变异回退（**回退即红**）：关掉「自报降级 vs 宿主侧实测」判据 ⇒ 必须复现「**甩锅上游**」
+  {
+    const mutated = hostSrcForDegrade.replace(
+      'if (result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {',
+      'if (false && result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {');
+    eq('🔴-R3③ 变异自证：回退变异确实改动了源码', true, mutated !== hostSrcForDegrade);
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'degrade-claim';
+    const rBack = await runOfflineProbeWithSources({
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'),
+      expectedTools: ['demo_echo'],
+      hostSource: mutated,
+    });
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+    eq('🔴-R3③ 变异回退：关掉判据后复现「**甩锅上游**」（UPSTREAM_DRIFT / AMBER）', 'UPSTREAM_DRIFT', rBack.attribution);
+    eq('🔴-R3③ 变异回退：此时 hostFatal 非空（责任被推给环境）', true, rBack.result.hostFatal.length > 0);
+  }
+
+  // 报告层：降级的**两种成因**必须分开说（否则人会把「插件篡改通道」读成「环境限制」）
+  {
+    const chBase = { channel: 'stable', label: '稳定版通道', line: 'x', status: 'fail', lamp: '❌', checksPassed: 0, checksSkipped: 0, checksTotal: 1, durationMs: 1, failedChecks: [], errors: [], hostFatal: [], attributionReasons: [] };
+    const secOf = (c) => buildSecondary({ generatedAt: 'T', plugin: 'p', channels: [c], summary: { total: 1, passed: 0, failed: 1, upstreamDrift: [], pluginRegression: ['stable'], unknown: [], verdict: 'RED' } });
+    const tampered = secOf({ ...chBase, attribution: 'PLUGIN_REGRESSION', resultChannel: 'stdout-degraded', resultChannelDegraded: true, checks: [{ name: PLUGIN_PROTOCOL_INJECTION_CHECK, status: 'fail', detail: 'x' }] });
+    const realDegradeSec = secOf({ ...chBase, attribution: 'UPSTREAM_DRIFT', resultChannel: 'stdout-degraded', resultChannelDegraded: true, checks: [] });
+    eq('🔴-R3③ 报告层：自报降级（实测可用）⇒ 风险描述点明「自报与事实矛盾」', true,
+      tampered.risks[0].description.includes('自报与事实矛盾'));
+    eq('🔴-R3③ 报告层：自报降级 ⇒ 规避动作指向**插件侧**（不要关 fd3 / 不要伪造 resultChannel）', true,
+      tampered.risks[0].mitigation.includes('插件侧'));
+    eq('🔴-R3③ 报告层：真降级 ⇒ 仍按**环境限制**说（不含「自报与事实矛盾」）', false,
+      realDegradeSec.risks[0].description.includes('自报与事实矛盾'));
+    eq('🔴-R3③ 报告层：两种成因的判据里都看得见 protocolInjection 标记', true,
+      tampered.risks[0].reasons.some((r) => r === 'protocolInjection=true') && realDegradeSec.risks[0].reasons.some((r) => r === 'protocolInjection=false'));
+  }
+
+  // 夹具自检：第三形态必须真的做出来（否则上面的行为断言空转）
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'utf8');
+    eq('🔴-R3③ 夹具：含 degrade-claim 形态（自报降级甩锅上游）', true, /degrade-claim/.test(src));
+    eq('🔴-R3③ 夹具：该形态真的伪造 resultChannel=stdout-degraded', true,
+      /resultChannel: claimDegrade \? 'stdout-degraded' : 'fd3'/.test(src));
+    eq('🔴-R3③ 夹具：该形态自述「甩锅上游 / 修错方向」的口径', true, src.includes('甩锅上游') && src.includes('修错方向'));
   }
 }
 

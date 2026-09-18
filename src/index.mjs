@@ -29,7 +29,7 @@ export {
   wrapExecute,
   registerTools,
 } from './compat/tool.mjs';
-export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, pruneHostCache, interpretProbeStdout, HUB_ROOT } from './harness/host.mjs';
+export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, pruneHostCache, interpretProbeStdout, probeFd3Capability, HUB_ROOT } from './harness/host.mjs';
 export { verifyChannel, verifyAll, summarize, attributeFailure, attributionDetail, resolvePlugin } from './verify/runner.mjs';
 export {
   collectContract,
