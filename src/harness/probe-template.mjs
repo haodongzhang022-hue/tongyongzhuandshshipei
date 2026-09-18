@@ -35,7 +35,11 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 200));
 
   const tools = ctx.get('tools');
-  check('host.tools_ready', Boolean(tools), 'ctx.tools 未就绪（宿主未装配 ToolRuntime）');
+  check(
+    'host.tools_ready',
+    Boolean(tools),
+    tools ? `ctx.tools 已就绪（${tools.constructor?.name ?? 'ToolRuntime'}）` : 'ctx.tools 未就绪（宿主未装配 ToolRuntime）',
+  );
   if (!tools) throw new Error('ctx.tools 未就绪');
 
   // ---- 1. 版本线探测 ----
@@ -72,33 +76,54 @@ try {
   // ---- 3. 集成路径：调用插件自己的 apply（真实入口 + 中台适配器） ----
   const plugin = await import(pathToFileURL(pluginPath).href);
   const pluginCtx = { tools, effect: (fn, label) => ctx.effect(fn, label) };
-  check('plugin.loaded', typeof plugin.apply === 'function', '插件未导出 apply(ctx)');
+  check('plugin.loaded', typeof plugin.apply === 'function', typeof plugin.apply === 'function' ? '插件导出 apply(ctx)' : '插件未导出 apply(ctx)');
   if (typeof plugin.apply !== 'function') throw new Error('插件未导出 apply(ctx)');
   await plugin.apply(pluginCtx);
 
   const actual = tools.schemas().map((s) => s.name).filter((n) => !n.startsWith('probe_')).sort();
   const want = [...expectedTools].sort();
-  check('registry.exact', JSON.stringify(actual) === JSON.stringify(want), `期望 ${want.join(',')} / 实得 ${actual.join(',')}`);
+  const registryExact = JSON.stringify(actual) === JSON.stringify(want);
+  check('registry.exact', registryExact, registryExact ? `工具清单精确匹配（${actual.join(',')}）` : `期望 ${want.join(',')} / 实得 ${actual.join(',')}`);
 
   // ---- 4. 真实 dispatch：execute → output.schema 校验 → render 投影 ----
-  const echoName = want.find((n) => n.endsWith('echo')) ?? want[0];
-  const echo = await tools.execute({ callId: 'probe-echo', name: echoName, arguments: { text: 'hello' }, signal: new AbortController().signal });
-  check('dispatch.execute_ok', echo.isError !== true, JSON.stringify(echo.content)?.slice(0, 200));
-  check('dispatch.render_projected', Array.isArray(echo.content) && echo.content.length > 0 && typeof echo.content[0]?.text === 'string', JSON.stringify(echo.content)?.slice(0, 200));
-  check('dispatch.echo_payload', Array.isArray(echo.content) && String(echo.content[0]?.text ?? '').includes('echo: hello'), JSON.stringify(echo.content)?.slice(0, 200));
+  const echoName = want.find((n) => n.endsWith('echo'));
+  const dispatchName = echoName ?? want[0];
+  const dispatched = await tools.execute({ callId: 'probe-echo', name: dispatchName, arguments: { text: 'hello' }, signal: new AbortController().signal });
+  const dispatchDetail = JSON.stringify(dispatched.content)?.slice(0, 200);
+  check(
+    'dispatch.execute_ok',
+    dispatched.isError !== true,
+    dispatched.isError !== true ? `dispatch 成功：${dispatchDetail}` : `dispatch 失败：${dispatchDetail}`,
+  );
+  const projected = Array.isArray(dispatched.content) && dispatched.content.length > 0 && typeof dispatched.content[0]?.text === 'string';
+  check('dispatch.render_projected', projected, projected ? `output.render 投影正确：${dispatchDetail}` : `output.render 未产出 text 块：${dispatchDetail}`);
+  if (echoName) {
+    const echoed = Array.isArray(dispatched.content) && String(dispatched.content[0]?.text ?? '').includes('echo: hello');
+    check('dispatch.echo_payload', echoed, echoed ? `业务返回值正确：${dispatchDetail}` : `业务返回值不符（期望含 "echo: hello"）：${dispatchDetail}`);
+  } else {
+    check('dispatch.echo_payload', true, `插件未声明 *echo 工具（${dispatchName}），跳过回显载荷断言`);
+  }
 
   // ---- 5. 取消语义（宿主三线一致要求） ----
   const aborter = new AbortController();
   aborter.abort();
-  const cancelled = await tools.execute({ callId: 'probe-abort', name: echoName, arguments: { text: 'x' }, signal: aborter.signal });
-  check('dispatch.abort_semantics', cancelled.isError === true, `已中止的调用仍返回成功：${JSON.stringify(cancelled.content)?.slice(0, 160)}`);
+  const cancelled = await tools.execute({ callId: 'probe-abort', name: dispatchName, arguments: { text: 'x' }, signal: aborter.signal });
+  check(
+    'dispatch.abort_semantics',
+    cancelled.isError === true,
+    cancelled.isError === true
+      ? '取消语义生效（已中止调用被拒绝）'
+      : `取消语义失效：已中止的调用仍返回成功：${JSON.stringify(cancelled.content)?.slice(0, 160)}`,
+  );
 
   // ---- 6. 保留名护栏（插件侧显式失败，而非炸在宿主里） ----
-  check('guard.reserved_name', (() => { try { hub.assertNotReserved('run_code'); return false; } catch { return true; } })(), '插件侧未拒绝 DSH 保留名 run_code');
+  const guardWorks = (() => { try { hub.assertNotReserved('run_code'); return false; } catch { return true; } })();
+  check('guard.reserved_name', guardWorks, guardWorks ? '中台保留名护栏可用（run_code 被插件侧拒绝）' : '插件侧未拒绝 DSH 保留名 run_code');
 
   // ---- 7. schema 压平（作者侧宽松写法必须被压平而非原样透传） ----
   const flattened = hub.normalizeSchema({ type: 'object', properties: { a: { type: 'json' } } });
-  check('compat.schema_flatten', hub.collectSchemaViolations(flattened).length === 0, JSON.stringify(flattened));
+  const flattenOk = hub.collectSchemaViolations(flattened).length === 0;
+  check('compat.schema_flatten', flattenOk, flattenOk ? `schema 压平后无违规：${JSON.stringify(flattened)}` : `schema 压平后仍有违规：${JSON.stringify(flattened)}`);
 
   // ---- 8. 生命周期：disposer 语义（独立 Context，宿主拒绝同层重名注册） ----
   const definitions = typeof plugin.definitions === "function" ? plugin.definitions({ profile: profile.toJSON() }) : plugin.definitions;
@@ -109,14 +134,43 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 200));
     const tools2 = ctx2.get("tools");
     const lifecycle = hub.registerTools({ tools: tools2, effect: (fn, label) => ctx2.effect(fn, label) }, definitions, { profile });
-    check("lifecycle.disposer_count", lifecycle.disposers.length === definitions.length, lifecycle.disposers.length + "/" + definitions.length);
+    // 被拒绝的保留名不产生 disposer；按「可注册定义数」计数（避免把冲突误算成漏注册）
+    const expectedDisposers = definitions.length - lifecycle.reservedRejected.length;
+    check("lifecycle.disposer_count", lifecycle.disposers.length === expectedDisposers, lifecycle.disposers.length === expectedDisposers ? lifecycle.disposers.length + "/" + expectedDisposers + '（全部可注册定义均产出 disposer）' : lifecycle.disposers.length + "/" + expectedDisposers + '（数量不符）');
     const before = tools2.schemas().map((s) => s.name).sort();
-    check("lifecycle.registered", JSON.stringify(before) === JSON.stringify([...expectedTools].sort()), before.join(","));
+    const lifecycleRegistered = JSON.stringify(before) === JSON.stringify([...expectedTools].sort());
+    check("lifecycle.registered", lifecycleRegistered, lifecycleRegistered ? `独立上下文注册成功（${before.join(',')}）` : `独立上下文注册不符：${before.join(',')}`);
     lifecycle.disposers.forEach((dispose) => dispose());
     const after = tools2.schemas().map((s) => s.name);
-    check("lifecycle.dispose", after.length === 0, "卸载后仍残留：" + after.join(","));
+    check("lifecycle.dispose", after.length === 0, after.length === 0 ? '卸载后无残留' : '卸载后仍残留：' + after.join(','));
   } else {
     check("lifecycle.disposer_count", false, "插件未导出 definitions 数组，无法验证生命周期");
+  }
+
+  // ---- 9. 保留名冲突：既不得静默丢弃，也不得被放行（插件须改名） ----
+  const defsForGuard = typeof plugin.definitions === 'function'
+    ? plugin.definitions({ profile: profile.toJSON() })
+    : plugin.definitions;
+  const reservedInDefs = Array.isArray(defsForGuard)
+    ? defsForGuard.map((d) => d?.name).filter((n) => hub.RESERVED_TOOL_NAMES.includes(n))
+    : [];
+  if (reservedInDefs.length === 0) {
+    check('guard.reserved_rejected', true, `插件未使用 DSH 保留名（${hub.RESERVED_TOOL_NAMES.join(',')}）`);
+  } else {
+    const ctx3 = new Context();
+    ctx3.plugin(SystemPrompt, {});
+    ctx3.plugin(ToolRuntime, {});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const tools3 = ctx3.get('tools');
+    const guardResult = hub.registerTools({ tools: tools3 }, defsForGuard, { profile });
+    const reported = guardResult.reservedRejected.length === reservedInDefs.length
+      && guardResult.issues.some((issue) => issue.includes('reserved_name_conflict'));
+    // 插件声明保留名 = 违反宿主硬约束 → 验收必须判失败（且失败原因是插件侧，不是静默丢弃）
+    check(
+      'guard.reserved_rejected',
+      false,
+      `插件声明了 DSH 保留名 ${reservedInDefs.join(',')}，中台已拒绝并上报（reported=${reported}），但插件须改名后重跑`,
+    );
   }
 
   out.ok = out.errors.length === 0;

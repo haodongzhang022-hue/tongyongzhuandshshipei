@@ -87,8 +87,10 @@ export function detectHostFlavor(tools) {
   }
 
   // 信号 2：保留名拒绝措辞（Config 不可读时的兜底指纹）
+  // 注意：兜底探测会真的调用 `tools.register`，因此**探测后必须立即 dispose**，
+  // 不得在宿主上残留探测工具（否则一次探测即污染宿主工具目录）。
   try {
-    tools.register({
+    const disposer = tools.register({
       name: 'run_code',
       description: 'flavor-probe',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
@@ -96,6 +98,10 @@ export function detectHostFlavor(tools) {
       execute: async () => ({}),
     });
     signals.reservedProbe = 'accepted';
+    // 接受保留名的宿主（正是本中台要侦测的上游漂移）：立即卸载，不留副作用
+    if (typeof disposer === 'function') {
+      try { disposer(); signals.reservedProbeDisposed = true; } catch { signals.reservedProbeDisposed = false; }
+    }
   } catch (error) {
     const message = String(error?.message ?? error);
     signals.reservedProbe = message;

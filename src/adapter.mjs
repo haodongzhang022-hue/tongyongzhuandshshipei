@@ -28,6 +28,8 @@ export function createAdapter(ctx, options = {}) {
   const registered = [];
   /** @type {string[]} */
   const issues = [];
+  /** @type {string[]} */
+  const reservedRejected = [];
 
   return {
     /** 探测到的宿主画像。 */
@@ -38,12 +40,15 @@ export function createAdapter(ctx, options = {}) {
      *
      * @param {object[]} definitions 作者侧工具定义
      * @returns {{registered:string[], disposers:Function[], issues:string[], reservedRejected:string[]}}
+     *   `reservedRejected` 非空时，`issues` 中同时含 `reserved_name_conflict: ...` 项。
      */
     register(definitions) {
       const result = registerTools(ctx, definitions, { prefix: options.prefix, profile });
       disposers.push(...result.disposers);
       registered.push(...result.registered);
       issues.push(...result.issues);
+      reservedRejected.push(...result.reservedRejected);
+      // 保留名冲突已在 registerTools 内并入 result.issues，这里统一回调，保证不静默
       if (result.issues.length > 0 && typeof options.onIssues === 'function') options.onIssues(result.issues);
       return result;
     },
@@ -64,7 +69,12 @@ export function createAdapter(ctx, options = {}) {
 
     /** 适配状态（不注册为模型可见工具，避免污染工具目录）。 */
     toJSON() {
-      return { profile: profile.toJSON(), registered: [...registered], issues: [...issues] };
+      return {
+        profile: profile.toJSON(),
+        registered: [...registered],
+        issues: [...issues],
+        reservedRejected: [...reservedRejected],
+      };
     },
   };
 }

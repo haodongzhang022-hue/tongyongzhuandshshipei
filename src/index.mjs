@@ -7,7 +7,8 @@
  * 使用（插件侧，零 @deepseek-ai 依赖）：
  * ```js
  * // my-plugin/index.mjs
- * import { createAdapter } from '@dongdongxiaozu/dsh-adapt-hub/compat';
+ * import { createAdapter } from '@dongdongxiaozu/dsh-adapt-hub/adapter';
+ * // 或从根导出面取：import { createAdapter } from '@dongdongxiaozu/dsh-adapt-hub';
  * export const inject = ['tools'];
  * export function apply(ctx) {
  *   const adapter = createAdapter(ctx, { prefix: 'myplugin' });
@@ -28,7 +29,7 @@ export {
   wrapExecute,
   registerTools,
 } from './compat/tool.mjs';
-export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, HUB_ROOT } from './harness/host.mjs';
+export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, pruneHostCache, HUB_ROOT } from './harness/host.mjs';
 export { verifyChannel, verifyAll, summarize, attributeFailure, resolvePlugin } from './verify/runner.mjs';
 export { watchUpstream, fetchDistTags, contractSnapshot, diffContracts } from './watch/upstream.mjs';
 export { buildSecondary, toMarkdown } from './report/secondary.mjs';

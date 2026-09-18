@@ -21,6 +21,11 @@
 
 ## 二、最小接入（复制即用）
 
+> ⚠️ 模板 `templates/adapter/index.mjs` 拷出本仓后，**必须改第一行 import**（模板内有 `TODO(拷贝后必改)` 标记）：
+> 中台未发布 npm 包时，改成你 clone 的中台路径（如 `/tmp/hub/src/adapter.mjs`）；
+> 已发布时用 `@dongdongxiaozu/dsh-adapt-hub/adapter`。不改则 `ERR_MODULE_NOT_FOUND`。
+> 自检：`node tests/test_exports.mjs`（含「模板拷贝可用」用例）。
+
 ### 1. 插件入口 `index.mjs`
 
 ```js
@@ -122,7 +127,9 @@ main:
               --plugin ./index.mjs --tools myplugin_echo,myplugin_status
 ```
 
-> 也可用 `include` 把中台仓库的模板配置引入，避免复制（见 `docs/ARCHITECTURE.md` §4.2 与官方 `file-reference` 文档；跨私有仓需在模板文件声明 `allow_slugs`）。
+> 也可用 `include` 把中台仓库的模板配置引入，避免复制（见 `docs/ARCHITECTURE.md` §4.2 与官方 `file-reference` 文档）。
+>
+> ⚠️ **`allow_slugs` 未落地**：跨私有仓引用需模板文件声明 `allow_slugs`，本仓当前**未实现**该声明（中台保持 Public，接入默认走 `git clone` 直取）。口径见 `docs/RISKS.md` R2。
 
 ---
 
@@ -135,7 +142,7 @@ bash /path/to/hub/tests/test_offline.sh
 # 跑指定通道的真宿主验收（首次会装宿主依赖，之后走缓存）
 node /path/to/hub/src/cli.mjs verify --channel stable --plugin ./index.mjs --tools myplugin_echo,myplugin_status --markdown
 
-# 三通道全跑
+# 三通道全跑（all = stable + dev + legacy，与页面按钮同义）
 node /path/to/hub/src/cli.mjs verify --channel all --plugin ./index.mjs --tools myplugin_echo,myplugin_status
 
 # 看上游有没有发新版
@@ -148,8 +155,8 @@ node /path/to/hub/src/cli.mjs watch
 
 ```
 | 通道 | 版本线 | 状态 | 归因 | 版本线探测 | 检查项 |
-| ✅ 稳定版通道 | 0.1.5 | pass | PASS | modern | 13/13 |
-| ❌ 开发版通道 | 0.1.6 | fail | UPSTREAM_DRIFT | modern | 11/13 |
+| ✅ 稳定版通道 | 0.1.5 | pass | PASS | modern | 14/14 |
+| ❌ 开发版通道 | 0.1.6 | fail | UPSTREAM_DRIFT | modern | 12/14 |
 ```
 
 | 归因 | 含义 | 你该做什么 |
@@ -159,7 +166,7 @@ node /path/to/hub/src/cli.mjs watch
 | `PLUGIN_REGRESSION` | 你的插件出问题 | 看 `failedChecks[].name` 定位并修 |
 | `ENV_ERROR` | 环境/网络问题 | 检查网络或 `--offline` 缓存 |
 
-**13 项检查清单**（三通道一致）：
+**14 项检查清单**（三通道一致）：
 
 ```
 host.tools_ready        宿主 ToolRuntime 就绪
@@ -168,11 +175,12 @@ plugin.loaded           插件导出 apply(ctx)
 registry.exact          注册工具清单精确匹配
 dispatch.execute_ok     真实 dispatch 成功
 dispatch.render_projected  output.render 投影正确
-dispatch.echo_payload   业务返回值正确
+dispatch.echo_payload   业务返回值正确（插件无 *echo 工具时自动跳过）
 dispatch.abort_semantics  exec.signal 取消语义生效
-guard.reserved_name     保留名被插件侧拒绝
+guard.reserved_name     中台保留名护栏可用（run_code 被插件侧拒绝）
 compat.schema_flatten   schema 压平后无违规
-lifecycle.disposer_count disposer 数量正确
+guard.reserved_rejected 插件声明的保留名必须被拒绝并上报（声明即判失败）
+lifecycle.disposer_count disposer 数量正确（按可注册定义数计）
 lifecycle.registered    独立上下文注册成功
 lifecycle.dispose       卸载后无残留
 ```
@@ -183,8 +191,9 @@ lifecycle.dispose       卸载后无残留
 
 | 坑 | 现象 | 中台处置 |
 |---|---|---|
-| 工具名撞 `run_code` | `register()` 直接抛错，措辞提到 PTC/Code Mode | 注册前显式报「你的 prefix 选得不对」 |
+| 工具名撞 `run_code` | `register()` 直接抛错，措辞提到 PTC/Code Mode | 注册前显式报「你的 prefix 选得不对」，并**上报**（见下条） |
 | `output.schema` 用了 `type:'json'` | `unsupported JSON schema: ... must be one of object/array/...` | 自动压平为受支持子集 |
 | `output` 只写了 `schema` | `must declare output { schema, render, presentationMeta? }` | 自动补缺省文本 `render` |
 | `execute` 忽略 `exec.signal` | 取消后仍执行副作用 | 统一入口 `throwIfAborted()` |
 | 同层重复注册同名工具 | `is already registered` | 中台返回 `issues`，建议先 `disposeAll()` 或用独立 `Context` |
+| 工具名撞 `run_code`（保留名） | 被静默跳过、工具凭空消失 | **不静默**：进 `issues`（前缀 `reserved_name_conflict:`）+ 触发 `onIssues` + `adapter.toJSON().reservedRejected`；验收探针 `guard.reserved_rejected` 判失败 |

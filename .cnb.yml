@@ -13,6 +13,10 @@ main:
         - name: offline-tests
           script: |
             bash tests/test_offline.sh
+        - name: exports-selfcheck
+          script: |
+            # 发布面自检：exports 全解析 + 文档 import 路径 + 模板拷贝可用（防同类回归）
+            node tests/test_exports.mjs
     - name: dual-channel-verify
       docker:
         image: node:22
@@ -57,6 +61,9 @@ main:
         - name: offline-tests
           script: |
             bash tests/test_offline.sh
+        - name: exports-selfcheck
+          script: |
+            node tests/test_exports.mjs
     - name: dual-channel-verify
       docker:
         image: node:22
@@ -110,6 +117,7 @@ $:
         - name: dual-channel
           script: |
             # CHANNEL 由页面按钮传入：both(默认) / stable / dev / all
+            # 语义与 CLI 的 --channel 完全一致（all = stable+dev+legacy）
             case "$CHANNEL" in
               stable) CHANNELS="stable" ;;
               dev) CHANNELS="dev" ;;

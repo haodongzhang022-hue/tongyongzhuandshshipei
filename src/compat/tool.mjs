@@ -128,6 +128,8 @@ export function wrapExecute(name, execute) {
  * @param {object[]} definitions 作者侧工具定义数组
  * @param {{ prefix?: string, profile?: import('../detect/flavor.mjs').HostProfile }} [options]
  * @returns {{ registered: string[], disposers: Function[], issues: string[], reservedRejected: string[] }}
+ *   注意：`reservedRejected` 中的每一项**同时**会以 `reserved_name_conflict: ...`
+ *   形式进入 `issues`——保留名冲突绝不静默丢弃（本仓纪律「不吞异常」）。
  */
 export function registerTools(ctx, definitions, options = {}) {
   const tools = ctx?.tools;
@@ -143,7 +145,10 @@ export function registerTools(ctx, definitions, options = {}) {
     try {
       assertNotReserved(definition?.name);
     } catch (error) {
-      reservedRejected.push(`${definition?.name}: ${error.message}`);
+      // 不吞异常：保留名冲突必须显式上报（进 issues + 触发 onIssues + 进 toJSON）
+      const conflict = `${definition?.name}: ${error.message}`;
+      reservedRejected.push(conflict);
+      issues.push(`reserved_name_conflict: ${conflict}`);
       continue;
     }
     const normalized = normalizeToolDefinition(definition, options);

@@ -12,7 +12,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -55,6 +55,29 @@ export function channelFingerprint(channel) {
 }
 
 /**
+ * 清理宿主依赖缓存。
+ *
+ * 策略：默认**只保留当前钉版指纹**对应的缓存目录（其余为历史版本残留，白占磁盘）；
+ * `keepAll` 为 true 时仅清理临时工作目录（不动缓存）。
+ *
+ * @param {{cacheDir?:string, keepFingerprints?:string[], keepAll?:boolean}} [options] 选项
+ * @returns {{removed:string[], kept:string[]}} 清理结果
+ */
+export function pruneHostCache(options = {}) {
+  const cacheDir = options.cacheDir ?? path.join(tmpdir(), 'dsh-adapt-host-cache');
+  const keep = new Set(options.keepFingerprints ?? []);
+  const removed = [];
+  const kept = [];
+  if (!existsSync(cacheDir)) return { removed, kept };
+  for (const entry of readdirSync(cacheDir)) {
+    if (options.keepAll || keep.size === 0 || keep.has(entry)) { kept.push(entry); continue; }
+    rmSync(path.join(cacheDir, entry), { recursive: true, force: true });
+    removed.push(entry);
+  }
+  return { removed, kept };
+}
+
+/**
  * 在临时目录装配真实宿主并跑探针。
  *
  * @param {object} options 选项
@@ -67,6 +90,9 @@ export function channelFingerprint(channel) {
  * @param {boolean} [options.offline] 仅用缓存，缺失即失败
  * @param {number} [options.timeoutMs] 安装 / 探针超时
  * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], contract:object, install:string, cacheHit:boolean, durationMs:number}}
+ *
+ * 缓存策略：命中时以**软链**挂载缓存 `node_modules`（不再全量复制）；
+ * 历史残留用 {@link pruneHostCache} 清理（保留当前钉版指纹）。
  */
 export function runHostProbe(options) {
   const {
@@ -120,7 +146,15 @@ export function runHostProbe(options) {
     }
 
     if (!existsSync(path.join(workDir, 'node_modules'))) {
-      cpSync(path.join(cachePath, 'node_modules'), path.join(workDir, 'node_modules'), { recursive: true });
+      // 缓存命中：软链而非全量复制（三通道三次全量 cpSync 是纯浪费；软链对 Node 解析透明）
+      const cacheModules = path.join(cachePath, 'node_modules');
+      const linkPath = path.join(workDir, 'node_modules');
+      try {
+        symlinkSync(cacheModules, linkPath, 'dir');
+        result.install = result.install.startsWith('cache:') ? `${result.install} (symlink)` : result.install;
+      } catch {
+        cpSync(cacheModules, linkPath, { recursive: true });
+      }
     }
 
     cpSync(path.join(hubRoot, 'src', 'harness', 'probe-template.mjs'), path.join(workDir, 'probe.mjs'));

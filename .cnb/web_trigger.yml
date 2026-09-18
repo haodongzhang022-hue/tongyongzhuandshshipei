@@ -35,7 +35,7 @@ branch:
                     value: stable
                   - name: 仅开发版
                     value: dev
-                  - name: 含历史线（+ legacy）
+                  - name: 三通道（stable + dev + legacy，等价 CLI 的 --channel all）
                     value: all
       - name: 上游漂移侦测
         description: 检查 DSH 上游 dist-tag 是否已越过本中台钉版

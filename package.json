@@ -1,6 +1,6 @@
 {
   "name": "@dongdongxiaozu/dsh-adapt-hub",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 适配中台：把「插件适配 DSH 生态」的重复劳动固化为可复用能力——版本线探测 / 契约兼容层 / 双通道（稳定版+开发版）验收 / 上游变更侦测。",
   "type": "module",
   "bin": {
@@ -8,6 +8,7 @@
   },
   "exports": {
     ".": "./src/index.mjs",
+    "./adapter": "./src/adapter.mjs",
     "./compat": "./src/compat/index.mjs",
     "./detect": "./src/detect/index.mjs",
     "./harness": "./src/harness/index.mjs",
@@ -27,9 +28,10 @@
     "watch": "node src/cli.mjs watch",
     "verify:stable": "node src/cli.mjs verify --channel stable --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
     "verify:dev": "node src/cli.mjs verify --channel dev --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
-    "verify:all": "npm run verify:stable && npm run verify:dev",
+    "verify:all": "node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
     "test": "bash tests/test_hub.sh",
-    "test:offline": "bash tests/test_offline.sh"
+    "test:offline": "bash tests/test_offline.sh",
+    "test:exports": "node tests/test_exports.mjs"
   },
   "keywords": [
     "dsh",

@@ -1,9 +1,16 @@
 /**
- * 中台自测用的**示例插件**（同时是给插件作者的模板）。
+ * 插件接入模板（拷贝到你的插件仓库后**改这一行**）。
  *
  * 注意本文件**不 import 任何 @deepseek-ai/* 符号**——这正是中台要达成的效果：
  * 插件产物与宿主版本解耦，上游换版不必改插件代码。
+ *
+ * ⚠️ 拷贝后必须修改下面这行 import：
+ * - 中台**已发布**（npm）：`import { createAdapter } from '@dongdongxiaozu/dsh-adapt-hub/adapter';`
+ * - 中台**未发布**（当前状态，git clone 接入）：改成你本地 clone 的绝对/相对路径，
+ *   例如 `import { createAdapter } from '/tmp/hub/src/adapter.mjs';`
+ *   （模板原样的 `../../src/adapter.mjs` 只在本仓库内可解析，拷走后必然 ERR_MODULE_NOT_FOUND）
  */
+// TODO(拷贝后必改)：把下面这行换成你的中台入口
 import { createAdapter } from '../../src/adapter.mjs';
 
 /** 声明只依赖宿主 tools 服务（新旧版语义一致）。 */

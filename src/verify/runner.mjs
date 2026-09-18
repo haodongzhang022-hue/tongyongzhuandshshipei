@@ -16,6 +16,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { HUB_ROOT, loadChannels, runHostProbe } from '../harness/host.mjs';
+import { channelContractDrift, contractSnapshot } from '../watch/upstream.mjs';
 
 /**
  * 运行一个通道的验收。
@@ -26,6 +27,7 @@ import { HUB_ROOT, loadChannels, runHostProbe } from '../harness/host.mjs';
  * @param {string[]} options.expectedTools 期望工具清单
  * @param {string} [options.hubRoot] 仓库根
  * @param {boolean} [options.offline] 离线模式
+ * @param {object|null} [options.previousContracts] 契约指纹基线（channel → contract）；用于漂移归因
  * @returns {object} 通道验收报告
  */
 export function verifyChannel(options) {
@@ -45,7 +47,11 @@ export function verifyChannel(options) {
     offline: options.offline ?? false,
   });
 
-  const attribution = probe.ok ? 'PASS' : attributeFailure(probe, channel, options.channel);
+  // 契约漂移：把本次指纹与该通道基线对比（失败运行的 `{}` 不参与对比，防假信号）
+  const contractDrift = channelContractDrift(options.previousContracts ?? null, options.channel, probe.contract);
+  const attribution = probe.ok
+    ? 'PASS'
+    : attributeFailure(probe, channel, options.channel, { contractDrift });
   return {
     channel: options.channel,
     label: channel.label,
@@ -55,6 +61,7 @@ export function verifyChannel(options) {
     attribution,
     profile: probe.profile,
     contract: probe.contract,
+    contractDrift,
     checks: probe.checks,
     errors: probe.errors,
     install: probe.install,
@@ -70,24 +77,44 @@ export function verifyChannel(options) {
  * 判据（保守，宁可报 UPSTREAM_DRIFT 让人确认，也不静默归为插件 bug）：
  * 1. 安装阶段失败（钉版包缺失 / peer 解析失败）→ `UPSTREAM_DRIFT`（上游包结构变了）；
  * 2. 宿主未就绪 / 版本线探测为 unknown / 探针 fatal → `UPSTREAM_DRIFT`；
- * 3. 契约指纹相关失败（保留名措辞变化、schema 子集校验变化、output 形状变化）→ `UPSTREAM_DRIFT`；
- * 4. 其余（工具清单不符 / dispatch 失败 / 取消语义失败 / 卸载残留）→ `PLUGIN_REGRESSION`。
+ * 3. **契约指纹与基线不一致**（保留名措辞 / schema 子集校验措辞 / output 形状）→ `UPSTREAM_DRIFT`；
+ * 4. 契约采集本身失败（本次指纹为空）→ `UPSTREAM_DRIFT`（无法判定上游，宁可让人确认）；
+ * 5. 其余（工具清单不符 / dispatch 失败 / 取消语义失败 / 卸载残留）→ `PLUGIN_REGRESSION`。
+ *
+ * 注：第 3 条按**真实 check 名**（`guard.reserved_name` / `compat.schema_flatten` /
+ * `contract.*`）与基线 diff 判定，不再使用不存在的 check 名（旧版 `register.count`
+ * 是死判据）。
  *
  * @param {object} probe 探针结果
  * @param {object} channel 通道定义
  * @param {string} channelName 通道名
+ * @param {{contractDrift?: {changed:boolean, items:object[], newBaseline:boolean}}} [evidence] 附加证据
  * @returns {'UPSTREAM_DRIFT'|'PLUGIN_REGRESSION'|'ENV_ERROR'}
  */
-export function attributeFailure(probe, channel, channelName) {
+export function attributeFailure(probe, channel, channelName, evidence = {}) {
   const errors = probe.errors.join('\n');
   if (/离线模式下缺少宿主依赖缓存|npm|ETARGET|notarget|ERESOLVE|装配失败/.test(errors)) return 'UPSTREAM_DRIFT';
   if (/host\.tools_ready|fatal:/.test(errors)) return 'UPSTREAM_DRIFT';
   if (probe.profile && probe.profile.flavor === 'unknown') return 'UPSTREAM_DRIFT';
   if (/detect\.flavor_known/.test(errors)) return 'UPSTREAM_DRIFT';
-  if (/register\.no_issues|register\.count|registry\.exact/.test(errors) && /not a supported keyword|reserved|must declare output/.test(errors)) {
-    return 'UPSTREAM_DRIFT';
+  // 契约指纹漂移：仅当**漂移字段与失败点相关**时判上游漂移（不把插件 bug 甩给上游）
+  const drift = evidence.contractDrift;
+  if (drift?.changed && drift.items?.length > 0) {
+    const fields = new Set(drift.items.map((item) => item.field));
+    const failedNames = new Set((probe.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name));
+    const related =
+      (fields.has('reservedName') && (failedNames.has('guard.reserved_name') || failedNames.has('guard.reserved_rejected')))
+      || (fields.has('schemaSubset') && failedNames.has('compat.schema_flatten'))
+      || (fields.has('configProjection') && failedNames.has('detect.flavor_known'))
+      || (fields.has('outputShape') && [...failedNames].some((n) => n.startsWith('dispatch.')));
+    if (related) return 'UPSTREAM_DRIFT';
   }
-  if (/plugin\.loaded/.test(errors)) return 'PLUGIN_REGRESSION';
+  // 契约相关 check 失败，且**没有可用基线**（首次采集）→ 无法判定上游是否变了，保守判漂移（让人确认）；
+  // 有基线且基线一致 → 上游契约没变，责任在插件侧（继续往下判）。
+  const contractChecksFailed = /guard\.reserved_name|compat\.schema_flatten/.test(errors);
+  const noUsableBaseline = !drift || drift.newBaseline === true;
+  if (contractChecksFailed && noUsableBaseline) return 'UPSTREAM_DRIFT';
+  if (/plugin\.loaded|registry\.exact|dispatch\.|lifecycle\./.test(errors)) return 'PLUGIN_REGRESSION';
   return 'PLUGIN_REGRESSION';
 }
 
@@ -100,11 +127,15 @@ export function attributeFailure(probe, channel, channelName) {
  * @param {string[]} options.expectedTools 期望工具清单
  * @param {string} [options.hubRoot] 仓库根
  * @param {boolean} [options.offline] 离线
+ * @param {object|null} [options.previousContracts] 契约指纹基线（channel → contract）
  * @returns {{generatedAt:string, plugin:string, channels:object[], summary:object}}
  */
 export function verifyAll(options) {
   const channels = options.channels ?? ['stable', 'dev'];
-  const reports = channels.map((channel) => verifyChannel({ ...options, channel }));
+  const previousContracts = options.previousContracts !== undefined
+    ? options.previousContracts
+    : (contractSnapshot({ hubRoot: options.hubRoot ?? HUB_ROOT }).load()?.contracts ?? null);
+  const reports = channels.map((channel) => verifyChannel({ ...options, previousContracts, channel }));
   return {
     generatedAt: new Date().toISOString(),
     plugin: options.pluginPath,
@@ -130,6 +161,7 @@ export function summarize(reports) {
     failed: total - passed,
     upstreamDrift: drift.map((r) => r.channel),
     pluginRegression: regression.map((r) => r.channel),
+    contractDrift: reports.filter((r) => r.contractDrift?.changed).map((r) => r.channel),
     verdict: total > 0 && passed === total ? 'GREEN' : regression.length > 0 ? 'RED' : drift.length > 0 ? 'AMBER' : 'UNKNOWN',
   };
 }

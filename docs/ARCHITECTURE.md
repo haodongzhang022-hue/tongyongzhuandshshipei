@@ -2,7 +2,7 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.1.0`（module `adapt-hub`）
+> 版本：`dsh-adapt-hub v0.1.1`（module `adapt-hub`，含评审 🔴 必修项修复）
 
 ---
 
@@ -24,10 +24,10 @@
 **已实测跑通**（非纸面设计）：
 
 ```
-stable(0.1.5-rc.2)  ✅ 13/13 检查通过   flavor=modern
-dev   (0.1.6-alpha.2) ✅ 13/13 检查通过   flavor=modern
-legacy(0.1.1-rc.2)  ✅ 13/13 检查通过   flavor=legacy
-离线单测 21 项 ✅   负例插件被正确拦下 ✅   上游侦测可用 ✅
+stable(0.1.5-rc.2)  ✅ 14/14 检查通过   flavor=modern
+dev   (0.1.6-alpha.2) ✅ 14/14 检查通过   flavor=modern
+legacy(0.1.1-rc.2)  ✅ 14/14 检查通过   flavor=legacy
+离线单测 46 项 + 发布面自检 16 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
 ```
 
 ---
@@ -146,7 +146,7 @@ flowchart TB
 
 | # | 假设 | 验证方式 | 结论 |
 |---|---|---|---|
-| A1 | 新旧版可同产物兼容（插件不 import 宿主包） | 隔离目录各装真宿主，装同一份插件产物 | ✅ **可行**（三通道各 13/13） |
+| A1 | 新旧版可同产物兼容（插件不 import 宿主包） | 隔离目录各装真宿主，装同一份插件产物 | ✅ **可行**（三通道各 14/14） |
 | A2 | 版本线可探测且无需 import | 读 `tools.constructor.Config.toString()` | ✅ 可行：`ptc`→modern、`code`→legacy |
 | A3 | 保留名 `run_code` 在新旧版都被拒 | 实测 `register({name:'run_code'})` | ✅ 两版均拒（措辞不同：PTC mode / Code Mode） |
 | A4 | `output.schema` 受强制子集校验 | 实测注册 `{type:'json'}` | ✅ 两版均拒，措辞一致 |
@@ -183,7 +183,7 @@ tongyongzhuandshshipei/
 │   ├── cli.mjs                        # matrix / verify / watch / report / detect
 │   ├── adapter.mjs                    # 插件侧唯一 import 面
 │   ├── index.mjs                      # 公共导出
-│   ├── detect/flavor.mjs              # 版本线探测
+│   ├── detect/{index.mjs,flavor.mjs}  # 版本线探测（+ 导出面）
 │   ├── compat/{schema,tool}.mjs       # 契约兼容层
 │   ├── harness/{host.mjs,probe-template.mjs}  # 隔离真宿主装配 + 探针
 │   ├── verify/runner.mjs              # 双通道验收 + 归因
@@ -191,7 +191,8 @@ tongyongzhuandshshipei/
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 21 项离线单测（无网可跑）
+│   ├── test_offline.sh                # 46 项离线单测（无网可跑）
+│   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
 │   └── fixtures/{demo,broken}-plugin.mjs
 └── docs/{ARCHITECTURE,ADAPTER_GUIDE,RISKS,INDEX}.md
@@ -202,7 +203,8 @@ tongyongzhuandshshipei/
 **① 插件侧（唯一需要 import 的面）**
 
 ```js
-import { createAdapter } from '@dongdongxiaozu/dsh-adapt-hub';
+// 推荐子路径（也可从根导出面取，二者等价）
+import { createAdapter } from '@dongdongxiaozu/dsh-adapt-hub/adapter';
 
 export const inject = ['tools'];                    // 新旧版语义一致
 
@@ -225,7 +227,7 @@ export function apply(ctx) {
 | 命令 | 退出码 | 含义 |
 |---|---|---|
 | `dsh-adapt matrix` | 0 | 打印通道矩阵 |
-| `dsh-adapt verify --channel stable\|dev\|legacy\|all` | 0 = GREEN；1 = 有失败 | 验收 |
+| `dsh-adapt verify --channel stable\|dev\|legacy\|all` | 0 = GREEN；1 = 有失败；2 = 用法/参数错误 | 验收（`all` = stable+dev+legacy） |
 | `dsh-adapt watch` | 0 = 无漂移；1 = 有漂移；2 = 离线 | 上游侦测 |
 | `dsh-adapt report --markdown` | 同 verify | 二级信息 |
 
@@ -274,7 +276,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 13/13 + 离线 21 项 + 负例拦下 | ✅ done |
+| M5 自验 | 三通道 14/14 + 离线 46 项 + 发布面自检 16 项 + 负例拦下 | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |
