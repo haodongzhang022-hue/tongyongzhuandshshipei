@@ -21,6 +21,12 @@ let pass = 0;
 let fail = 0;
 const ok = (name, detail = '') => { console.log(`  ✅ ${name}${detail ? ` (${detail})` : ''}`); pass += 1; };
 const bad = (name, detail = '') => { console.log(`  ❌ ${name}${detail ? `：${detail}` : ''}`); fail += 1; };
+const eq = (name, expected, actual) => {
+  const e = typeof expected === 'string' ? expected : JSON.stringify(expected);
+  const a = typeof actual === 'string' ? actual : JSON.stringify(actual);
+  if (e === a) ok(name, a);
+  else bad(name, `期望 ${e} / 实得 ${a}`);
+};
 
 console.log('▶ 发布面自检（tests/test_exports.mjs）');
 
@@ -118,6 +124,56 @@ console.log('  [2b] 文档检查清单顺序与探针一致');
       bad(`${file} 清单顺序`, `文档：${docOrder.join(' > ')}\n     探针：${probeOrder.join(' > ')}`);
     }
   }
+}
+
+// ---- 2b'. docs/INDEX.md 清单**标题/序号/注脚**结构守卫（复测 🟡P2-新） ----
+// 为什么单独成段：上轮 [2b] 只比对「检查名顺序」，INDEX 的标题后缀（「（按探针实际输出顺序）」）、
+// 注脚口径、`#` 序号列被删/改字时全绿逃逸 —— 而 CHANGELOG P2-2 防线栏与 INDEX 注脚都自述
+// 「由 [2b] 守住标题/序号」，属**自述与落地不符**。这里把结构也纳入断言。
+console.log("  [2b'] INDEX 清单标题/序号列/注脚结构");
+{
+  const idx = readFileSync(path.join(ROOT, 'docs/INDEX.md'), 'utf8');
+  // 标题必须带「（按探针实际输出顺序）」后缀（P2-1 的落地验收要件）
+  const titleLine = idx.split('\n').find((line) => /^#{1,6}[^\n]*17 项[^\n]*检查[^\n]*索引/.test(line)) ?? '';
+  ok('INDEX 存在「17 项验收检查索引」标题', titleLine.slice(0, 60));
+  eq('INDEX 标题带「（按探针实际输出顺序）」后缀', true, titleLine.includes('（按探针实际输出顺序）'));
+  // `#` 序号列必须存在，且 1..17 连续（缺失 / 全写 1 即红）
+  const serials = [...idx.matchAll(/^\|\s*(\d+)\s*\|/gm)].map((m) => Number(m[1]));
+  eq('INDEX 清单含 `#` 序号列且为 1..17 连续', JSON.stringify(Array.from({ length: 17 }, (_, i) => i + 1)), JSON.stringify(serials));
+  // 注脚必须写明「序号 = 探针实际输出顺序」，且声明由本文件的 [2b] 守住
+  // 注脚可能分多行（都是 `>` 引用块），取清单段落的引用块整体
+  const foot = idx.split('\n').filter((line) => /^>\s/.test(line)).join(' ') ?? '';
+  eq('INDEX 注脚写明「序号 = 探针实际输出顺序」', true, /序号\s*=\s*\*\*探针实际输出顺序\*\*/.test(foot));
+  eq('INDEX 注脚声明顺序由 tests/test_exports.mjs [2b] 守住', true,
+    foot.includes('test_exports.mjs') && foot.includes('[2b]'));
+}
+
+// ---- 2b''. CHANGELOG 对防线编号的自述必须可检索到真实断言（复测 🟡P2-新-3） ----
+// 为什么补：v0.1.5 曾自述「[2b] 守住 INDEX 标题/顺序」，但当时 [2b] 只守顺序、不守标题结构——
+// 即**自述超前于落地**。这里做机器可检：CHANGELOG 里点名的防线编号（[7b] / [2b] / [2b'] / [2c] 等）
+// 必须在对应测试文件中**存在同名编号**，否则红。
+console.log("  [2b''] CHANGELOG 防线编号自述可检索");
+{
+  const changelog = readFileSync(path.join(ROOT, 'CHANGELOG.md'), 'utf8');
+  const attrSrc = readFileSync(path.join(ROOT, 'tests/test_attribution.mjs'), 'utf8');
+  const expSrc = readFileSync(path.join(ROOT, 'tests/test_exports.mjs'), 'utf8');
+  const offlineSrc = readFileSync(path.join(ROOT, 'tests/test_offline.sh'), 'utf8');
+  // 已知防线编号 → 其应出现的测试文件（编号在文件里需以 `[编号]` 形式出现）
+  const registry = {
+    '[7b]': attrSrc,
+    "[2b']": expSrc,
+    '[2b]': expSrc,
+    '[2c]': expSrc,
+    '[13]': offlineSrc,
+  };
+  const claimed = new Set();
+  // 只扫「回归防线」列与「防线编号」提及，避免把正文里对其他编号的引用算成自述
+  for (const m of changelog.matchAll(/\[(\d+[a-z]?'{0,2})\]/g)) claimed.add(`[${m[1]}]`);
+  const unknown = [...claimed].filter((id) => !(id in registry));
+  // 未登记的编号：不判失败（可能是历史编号），但**已登记**的必须可检索
+  const missing = [...claimed].filter((id) => id in registry && !registry[id].includes(id));
+  eq('CHANGELOG 自述的防线编号均可在对应测试文件检索到', [], missing);
+  ok('CHANGELOG 防线编号自述扫描完成', `已声明 ${claimed.size} 类，未登记 ${unknown.length} 类`);
 }
 
 // ---- 2c. 文档自述版本 = package.json 版本（防「文档说 vX，实际是 vY」） ----

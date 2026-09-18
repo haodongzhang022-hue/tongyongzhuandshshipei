@@ -301,6 +301,74 @@ console.log('  [7b] ARCHITECTURE 归因判据表与唯一事实源一致（文�
   eq('判据表 2b 行覆盖 PLUGIN_HARD_EVIDENCE 全部条目', [], missingHard);
   const missingHost = HOST_SIDE_CHECKS.filter((name) => !section.includes(name));
   eq('判据表第 1 条覆盖 HOST_SIDE_CHECKS 全部条目', [], missingHost);
+
+  // --- 结构/行序断言（复测 🟠P1-新：段落级 includes 守不住「行序」与「整行删除」） ---
+  // 为什么必须按**行**抽、按**行序**判：上轮 11 条断言全是段落级 `includes`，
+  // 把 2b 行整行删掉、或把 2b 行挪到第 4 条之后，段落文本里仍有 `guard.reserved_rejected`
+  // （prose 提到）→ 断言空转、优先级被静默反转（= 🔴-C 语义反转）。
+  const rows = section.split('\n').filter((line) => /^\|\s*(\*\*)?\d/.test(line));
+  const rowKeys = rows.map((line) => {
+    const m = /^\|\s*(\*\*)?([0-9]+[a-z]?)\1?\s*\|/.exec(line);
+    return m ? m[2] : null;
+  }).filter(Boolean);
+  eq('判据表按优先级键抽到行（含 2b）', true, rowKeys.includes('1') && rowKeys.includes('2b') && rowKeys.includes('3'));
+  // 🟠P1-新-1 行序：2b 必须排在第 3 条**之前**（硬证据优先于漂移相关性）
+  const i2b = rowKeys.indexOf('2b');
+  const i3 = rowKeys.indexOf('3');
+  eq('🟠P1-新：判据表行序 2b 必须排在 3 之前（硬证据优先）', true, i2b !== -1 && i3 !== -1 && i2b < i3);
+  // 🟠P1-新-2 行级完整性：`^| **2b** |` 行**自身**必须带 guard.reserved_rejected（不是段落里别处出现）
+  const row2b = rows.find((line) => /^\|\s*\*\*2b\*\*\s*\|/.test(line)) ?? '';
+  eq('🟠P1-新：2b 行存在且行内声明 guard.reserved_rejected', true,
+    row2b.includes('guard.reserved_rejected') && row2b.includes('PLUGIN_REGRESSION'));
+  // 第 1 条同理：行内必须覆盖 HOST_SIDE_CHECKS 全部条目（整行删除 / 迁走后即红）
+  const row1 = rows.find((line) => /^\|\s*1\s*\|/.test(line)) ?? '';
+  eq('🟠P1-新：第 1 条行内覆盖 HOST_SIDE_CHECKS 全部条目', [],
+    HOST_SIDE_CHECKS.filter((name) => !row1.includes(name)));
+  eq('🟠P1-新：第 1 条行内显式引用 hostFatal[] 与 HOST_FATAL_FIELD', true,
+    row1.includes('hostFatal[]') && row1.includes('HOST_FATAL_FIELD'));
+  // 第 1 条行内不得回退到自由文本口径
+  eq('🟠P1-新：第 1 条行内不含「错误串含 fatal(host)」旧口径', 'no-free-text-criterion',
+    /错误串含\s*`?fatal\(host\)/.test(row1) ? 'free-text-criterion-present' : 'no-free-text-criterion');
+
+  // --- 定位断言（🟡P2-新：段落级 includes 被第二处同句命中即逃逸） ---
+  const lineOf = (predicate) => section.split('\n').find(predicate) ?? '';
+  // 口径句必须与判据表**同一段落**（表格上方紧随的那一行），并写全两件事：
+  // ① 只读结构化字段与 check 名；② errors[] 任何判据不读。段落级 includes 会被
+  // 别处的同句命中而逃逸，故这里**按行定位**断言。
+  const secLines = section.split('\n');
+  const tableIdx = secLines.findIndex((line) => /^\|\s*优先级\s*\|/.test(line));
+  // 取表格上方**最近的非空行**作为口径行（允许中间空行，但必须紧邻表格、不得被别的段落顶替）
+  const calibLine = tableIdx > 0 ? [...secLines.slice(0, tableIdx)].reverse().find((line) => line.trim() !== '') ?? '' : '';
+  eq('🟡P2-新：判据表口径行（紧邻表头之上，定位断言）写明只读结构化字段与 check 名', true,
+    calibLine.includes('只读结构化字段') && calibLine.includes('check 名'));
+  eq('🟡P2-新：判据表口径行（定位断言）写明 errors[] 任何判据不读', true,
+    calibLine.includes('errors[]') && calibLine.includes('任何判据不读'));
+  const factLine = lineOf((line) => /唯一事实源/.test(line) && /src\/harness\/contract\.mjs/.test(line));
+  eq('🟡P2-新：唯一事实源声明在**同一行**给出（定位断言，防删句逃逸）', true,
+    factLine.includes('src/harness/contract.mjs') && factLine.includes('唯一事实源'));
+  // 纪律条目正文可能跨行（`>` 续行），按条目聚合后再做**条内**断言，
+  // 避免「段落里别处出现同句」把断言架空。
+  const discText = {};
+  {
+    let cur = null;
+    for (const raw of disc.split('\n')) {
+      const m = /^>\s*([1-4])\.\s(.*)$/.exec(raw);
+      if (m) { cur = m[1]; discText[cur] = m[2]; continue; }
+      const cont = /^>\s?(.*)$/.exec(raw);
+      if (cur && cont) discText[cur] += ' ' + cont[1];
+    }
+  }
+  eq('纪律①（定位：该条行内）写明 errors[] 不参与判据', true,
+    (discText['1'] ?? '').includes('errors[]') && (discText['1'] ?? '').includes('任何判据不读'));
+  eq('纪律②（定位：该条行内）写明硬证据优先于漂移相关性', true,
+    (discText['2'] ?? '').includes('PLUGIN_HARD_EVIDENCE') && /优先于/.test(discText['2'] ?? ''));
+  eq('纪律③（定位：该条行内）写明漂移字段与失败 check 一一对应', true,
+    (discText['3'] ?? '').includes('一一对应'));
+  eq('纪律④（定位：该条行内）写明唯一事实源 contract.mjs', true,
+    (discText['4'] ?? '').includes('src/harness/contract.mjs') && (discText['4'] ?? '').includes('唯一事实源'));
+  // 2b 行必须在 3 行之前的**文档理由**也要在（防「改了顺序、理由段说谎」）
+  const whyLine = lineOf((line) => /2b 为什么必须在 3 之前/.test(line));
+  eq('2b 行序理由段存在且写明「在 3 之前」', true, whyLine.length > 0);
 }
 
 // ---- 8. 装配器：宿主/环境侧失败必须落结构化字段（离线缺缓存路径，无网可跑） ----
