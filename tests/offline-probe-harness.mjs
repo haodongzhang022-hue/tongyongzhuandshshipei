@@ -148,10 +148,12 @@ export async function runOfflineProbeWithSources(options) {
     };
     result.probeExit = { status: probeRun.status ?? null, signal: probeRun.signal ?? null };
     result.durationMs = Date.now() - startedAt;
-    // 🔴-R3：与**生产路径**同构——把宿主侧 fd3 能力实测一并交给解释器（缺它则依赖它的判据不启用）
+    // 🔴-R3（**并集**）：与生产路径同构——把**宿主侧观测**（本台 stdio[3] 是 pipe ⇒ 给了 fd3）与
+    // **宿主侧 fd3 能力实测**一并交给解释器（缺任一项则依赖它的判据不启用，保守不误报）。
     host.interpretProbeStdout(result, `${probeRun.stdout ?? ''}`, {
       resultFd: `${probeRun.output?.[3] ?? ''}`,
       nonce: nonce.value,
+      resultChannelProvided: true,
       fd3Usable: typeof host.probeFd3Capability === 'function' ? host.probeFd3Capability() : null,
       fd3Provided: true,
     });
@@ -234,6 +236,9 @@ export function runOfflineProbe(options) {
     interpretProbeStdout(result, stdout, {
       resultFd,
       nonce: stdinUnreadable ? null : nonce.value,
+      // `resultChannelProvided` = 宿主侧观测：本台的 stdio[3] 在 `noResultChannel` 时才是 `'ignore'`
+      // ⇒ 那才是**真**降级；其余形态都算「宿主给了 fd3」。
+      resultChannelProvided: !noResultChannel,
       // 🔴-R3：宿主侧 fd3 能力**实测**（与生产路径同构）——通道形态的判据不得只信探针自报。
       fd3Usable: probeFd3Capability(),
       // `noResultChannel` 形态**故意**不给 fd3（`stdio[3] = 'ignore'`）⇒ 探针自报降级是**事实**，

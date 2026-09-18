@@ -479,10 +479,13 @@ try {
       channels: [report],
       summary: { total: 1, passed: 0, failed: 1, upstreamDrift: [], pluginRegression: [report.channel], unknown: [], verdict: report.summary?.verdict ?? 'RED' },
     });
-    eq('🔴-R3③（真宿主·报告层）：自报降级 ⇒ 风险描述点明「自报与事实矛盾」', true,
-      (secondary.risks[0]?.description ?? '').includes('自报与事实矛盾'));
+    // ⚠️ 不能只看 `risks[0]`：本形态同时命中「通道被重定向」与「自报降级」两条风险
+    // （🔴-R3 并集后 `resultChannel=fd3-redirected` 会**先**落一条 HIGH）⇒ 必须按**内容**查找，
+    // 否则断言会随风险排序漂移（假红/假绿都可能）。
+    const degradeRisk = (secondary.risks ?? []).find((r) => (r.description ?? '').includes('自报与事实矛盾'));
+    eq('🔴-R3③（真宿主·报告层）：自报降级 ⇒ 有风险描述点明「自报与事实矛盾」', true, Boolean(degradeRisk));
     eq('🔴-R3③（真宿主·报告层）：规避动作指向**插件侧**（不是「修环境」）', true,
-      (secondary.risks[0]?.mitigation ?? '').includes('插件侧'));
+      (degradeRisk?.mitigation ?? '').includes('插件侧'));
   }
 
   console.log('  [8f] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');
@@ -553,6 +556,35 @@ try {
     eq('批 1.5 通道可见化（真宿主）：正常路径 resultChannel=fd3', 'fd3', healthyChannel.resultChannel);
     eq('批 1.5 通道可见化（真宿主）：正常路径未降级 + 归因 PASS', 'false|PASS',
       `${healthyChannel.resultChannelDegraded}|${healthyChannel.attribution}`);
+  }
+
+  // ---- 11i. 🔴-R3 §三（真宿主）：**自报降级**甩锅上游 + 形态可见化 ----
+  // 与 [8h]（R3′ 重定向 + 压退出码）**同一根因的两个出口**，但**判据分支不同**：
+  // [8h] 走「宿主侧观测 vs 自称 fd3 矛盾」；本段走**降级分支**（自称 `stdout-degraded`）
+  // 与**形态可见化**（`fd3-redirected` + 二级信息）。两条各自独立可回退即红（见 [9.14] 变异自证）。
+  console.log('  [8i] 🔴-R3 §三：自报降级甩锅上游 + 形态可见化（真宿主）');
+  {
+    // §三 同源形态：同一手法把伪造报告标成 `stdout-degraded` + 删掉早探测快照 + 伪造 `hostFatal[]`。
+    // 收口前实测 **AMBER / UPSTREAM_DRIFT**（把「插件关掉通道」讲成「环境没有 fd3」，甩锅上游）。
+    const degrade = verify(path.join(ROOT, 'tests/fixtures', 'plugin-channel-degrade-forge-plugin.mjs'), 'demo_echo');
+    const degradeFailed = (degrade.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3 §三（真宿主）：**不得** AMBER / UPSTREAM_DRIFT（收口前实测甩锅上游）', true,
+      degrade.summary?.verdict !== 'AMBER' && degrade.attribution !== 'UPSTREAM_DRIFT');
+    eq('🔴-R3 §三（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${degrade.attribution}|${degrade.summary?.verdict}`);
+    eq('🔴-R3 §三（真宿主）：失败项恰为 plugin.protocol_injection（不采信任何一条）',
+      'plugin.protocol_injection', degradeFailed.join(','));
+    eq('🔴-R3 §三（真宿主）：伪造的 hostFatal[] 被丢弃（hostFatal 为空）', 0, (degrade.hostFatal ?? []).length);
+    eq('🔴-R3 §三（真宿主）：完成位 false + ok 不得为真', 'false|false',
+      `${degrade.runCompleted}|${degrade.ok === true}`);
+    eq('🔴-R3 §三（真宿主）：通道形态可见化为 fd3-redirected（宿主侧观测结论，非探针自报）',
+      'fd3-redirected', degrade.resultChannel);
+    eq('🔴-R3 §三（真宿主）：**不得**标成降级（降级 = 宿主没给 fd3，两者归因不同）', false,
+      degrade.resultChannelDegraded === true);
+    // 反向护栏：健康插件在同一次运行里仍 17/17 + 通道形态仍是 `fd3`（防过度修正）
+    const healthyChannel = verify(path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('🔴-R3 §三 反向护栏（真宿主）：健康插件仍 PASS / 17 项 / resultChannel=fd3 / 未降级', 'PASS|17|fd3|false',
+      `${healthyChannel.attribution}|${(healthyChannel.checks ?? []).length}|${healthyChannel.resultChannel}|${healthyChannel.resultChannelDegraded}`);
   }
 
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----

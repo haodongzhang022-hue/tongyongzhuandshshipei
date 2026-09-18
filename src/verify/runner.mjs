@@ -82,6 +82,9 @@ export function verifyChannel(options) {
     resultChannel: probe.resultChannel ?? null,
     resultChannelDegraded: probe.resultChannelDegraded === true,
     resultChannelAtStart: probe.resultChannelAtStart ?? null,
+    // 🔴-R3 §三：「报告**自称**降级」这一成因（与「真环境限制」相反）——报告层据此分开说，
+    // 否则人会把「插件篡改通道」读成「环境没有 fd3」（收口前实测：AMBER / UPSTREAM_DRIFT）。
+    resultChannelDegradeClaimed: probe.resultChannelDegradeClaimed === true,
     // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
     probePhase: probe.phase ?? null,
     probeExit: probe.probeExit ?? null,

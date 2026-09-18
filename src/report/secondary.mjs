@@ -8,6 +8,8 @@
  * @module dsh-adapt-hub/report/secondary
  */
 
+import { RESULT_CHANNEL_FD3_REDIRECTED } from '../harness/contract.mjs';
+
 const LAMP = { pass: '✅', fail: '❌', warn: '⚠️', skip: '⏭️' };
 
 /**
@@ -42,6 +44,31 @@ export function buildSecondary(report) {
         mitigation: tampered
           ? '插件侧问题：不要关闭 / 重定向探针的结果通道（fd3），也不要伪造报告里的 resultChannel 字段'
           : '修环境（容器 / Windows 需支持 fd3）或改用支持独立 fd 的执行方式；降级运行**不得**作为放行依据',
+        hostFatal: channel.hostFatal ?? [],
+        errors: channel.errors ?? [],
+      });
+    }
+    // 🔴-R3 通道**被重定向**（宿主侧观测结论，非探针自报）：与「降级」**必须区分**——
+    // 降级 = 宿主没给 fd3（环境限制，归因上游）；重定向 = 宿主给了 fd3、却被插件换掉（归因插件）。
+    // 独立成一条风险，保证这件事不会被淹没在别的失败原因里。
+    if (channel.resultChannel === RESULT_CHANNEL_FD3_REDIRECTED) {
+      risks.push({
+        severity: 'HIGH',
+        channel: channel.channel,
+        attribution: channel.attribution,
+        description: channel.resultChannelDegradeClaimed === true
+          // 🔴-R3 §三（**同源**成因）：报告**自称**降级，而宿主侧观测/实测说明 fd3 **可用**
+          // ⇒ 自报与事实矛盾（不是环境限制）⇒ 报告层必须点明，否则人会把插件篡改读成「修环境」。
+          ? `${channel.label ?? channel.channel} 报告**自称**结果通道降级（\`stdout-degraded\`，即「本环境没有 fd3」），但宿主侧 fd3 **实测可用 / 本次已作为管道提供** ⇒ **自报与事实矛盾** ⇒ 通道是在插件代码运行期间被**关闭/替换**的（判插件侧 \`plugin.protocol_injection\`），本轮结论**不可信**（不得判 PASS）`
+          : `${channel.label ?? channel.channel} 结果通道**被重定向**（\`${channel.resultChannel}\`，**宿主侧观测结论**）：宿主已把 fd3 作为管道交给探针，fd3 却为空、stdout 上出现匹配 nonce 的结果行 ⇒ 探针写进的是插件的文件，本轮结果**整体不可信**（不采信任何一条）`,
+        reasons: [
+          `resultChannel=${channel.resultChannel}`,
+          `resultChannelAtStart=${channel.resultChannelAtStart ?? 'null'}`,
+          '判据：宿主侧观测（probeSpawnOptions().stdio[3] === \'pipe\'）与报告自称互相矛盾 ⇒ plugin.protocol_injection',
+        ],
+        mitigation: channel.resultChannelDegradeClaimed === true
+          ? '**插件侧**问题：不要关闭 / 重定向探针的结果通道（fd3），也不要伪造报告里的 resultChannel 字段；**不得**把本形态当成环境降级（降级 = 宿主没给 fd3）'
+          : '查插件（或其依赖）是否关闭/替换了探针的结果 fd（closeSync(3) / 重定向 fd3）；**不得**把本形态当成环境降级（降级 = 宿主没给 fd3）',
         hostFatal: channel.hostFatal ?? [],
         errors: channel.errors ?? [],
       });
@@ -91,6 +118,10 @@ export function buildSecondary(report) {
       // 结果通道形态（批 1.5 / 🔴-R2）：'fd3' | 'stdout-degraded'；降级 ⇒ 结论不可信。
       resultChannel: channel.resultChannel ?? null,
       resultChannelDegraded: channel.resultChannelDegraded === true,
+      // 🔴-R3：通道**被重定向**（宿主侧观测结论）——与降级分开可见，两者归因不同。
+      resultChannelRedirected: channel.resultChannel === RESULT_CHANNEL_FD3_REDIRECTED,
+      // 「报告**自称**降级」这一成因（🔴-R3 §三）：与「真环境限制」相反 ⇒ 报告层分开说。
+      resultChannelDegradeClaimed: channel.resultChannelDegradeClaimed === true,
       failedChecks: (channel.checks ?? []).filter((c) => c.status === 'fail').map((c) => ({ name: c.name, detail: c.detail })),
       // nonce 带外通道形态（stdin / 其它）——R26 的口径可见性（排障时看得到「nonce 走哪条通道」）
       probeNonceChannel: channel.probeNonceChannel ?? null,
@@ -135,7 +166,11 @@ export function toMarkdown(secondary) {
   lines.push('|---|---|---|---|---|---|---|');
   for (const channel of secondary.channels) {
     const skipped = channel.checksSkipped ? `（跳过 ${channel.checksSkipped}）` : '';
-    const degraded = channel.resultChannelDegraded ? `（⚠️ 通道降级：${channel.resultChannel}）` : '';
+    const degraded = channel.resultChannelDegraded
+      ? `（⚠️ 通道降级：${channel.resultChannel}）`
+      : channel.resultChannel === RESULT_CHANNEL_FD3_REDIRECTED
+        ? '（⚠️ 结果通道**被重定向**：fd3-redirected）'
+        : '';
     lines.push(
       `| ${channel.lamp} ${channel.label ?? channel.channel} | ${channel.line} | ${channel.status} | ${channel.attribution} | ${channel.flavor ?? '-'} | ${channel.checksPassed}/${channel.checksTotal}${skipped} | ${channel.durationMs}ms${degraded} |`,
     );

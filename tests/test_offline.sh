@@ -727,10 +727,11 @@ process.env.DSH_CHANNEL_REDIRECT_MODE = "all";
 const fixedAll = snap(runOfflineProbe({ pluginPath: fixture, expectedTools: ["demo_echo"] }));
 process.env.DSH_CHANNEL_REDIRECT_MODE = "no-squelch";
 const fixedNoSquelch = snap(runOfflineProbe({ pluginPath: fixture, expectedTools: ["demo_echo"] }));
-// ② 变异 A：关掉**宿主侧通道观测** ⇒ R3′ 形态复现假绿（证明这条腿是唯一兜底）
+// ② 变异 A：把**整条交叉校验**关掉（主判据 + 辅判据一起，= 收口前的口径）
+// ⇒ R3′ 形态复现假绿（证明这条腿是唯一的拦截点）。
 const mutatedHost = hostSrc.replace(
-  "if (claimedChannel === RESULT_CHANNEL_FD3 && !isolated && matchingOnStdout.length > 0) {",
-  "if (false && claimedChannel === RESULT_CHANNEL_FD3 && !isolated && matchingOnStdout.length > 0) {");
+  "if (!isolated && matchingOnStdout.length > 0 && (channelProvidedByHost || claimedChannel === RESULT_CHANNEL_FD3)) {",
+  "if (false) {");
 process.env.DSH_CHANNEL_REDIRECT_MODE = "all";
 const offAll = snap(await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ["demo_echo"], hostSource: mutatedHost }));
 // ③ 变异 A 下**不压退出码**的形态仍由退出码交叉兜住（两条腿互相独立）
@@ -739,10 +740,23 @@ const offNoSquelch = snap(await runOfflineProbeWithSources({ pluginPath: fixture
 // ③b 形态 C（🔴-R3 附带 / 评审「下一步要求 ③」）：**自报降级 ⇒ 甩锅上游**（宿主侧 fd3 能力实测）
 process.env.DSH_CHANNEL_REDIRECT_MODE = "degrade-claim";
 const fixedDegradeClaim = snap(runOfflineProbe({ pluginPath: fixture, expectedTools: ["demo_echo"] }));
-// 变异 B：只关掉「自报降级 vs 宿主侧实测」这条判据（与变异 A 的落点不同 ⇒ 两条腿各自独立可证伪）
-const mutatedDegrade = hostSrc.replace(
-  "if (result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {",
-  "if (false && result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {");
+// 变异 B′：**只**关「自报降级」分支的三条判据（能力实测 / 宿主侧观测 / 「早探测可写 → 收尾不可写」）
+// —— 主判据仍在 ⇒ 该形态仍被主判据兜住（**防御纵深**：两条独立证据链，删一处不放行）。
+const mutatedDegradeOnly = hostSrc
+  .replace(
+    "if (result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {",
+    "if (false && result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {")
+  .replace(
+    "if (result.resultChannelDegraded && options.resultChannelProvided === true) {",
+    "if (false && result.resultChannelDegraded && options.resultChannelProvided === true) {")
+  .replace(
+    "const channelTampered = closedByPlugin || channelProvidedByHost;",
+    "const channelTampered = false;");
+const offDegradeClaimMainOff = snap(await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ["demo_echo"], hostSource: mutatedDegradeOnly }));
+// 变异 B：**回退即红**——把主判据 + 降级分支**全部**退回（= 收口前的口径）⇒ 必须复现「甩锅上游」。
+const mutatedDegrade = mutatedDegradeOnly.replace(
+  "if (!isolated && matchingOnStdout.length > 0 && (channelProvidedByHost || claimedChannel === RESULT_CHANNEL_FD3)) {",
+  "if (false) {");
 const offDegradeClaim = snap(await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ["demo_echo"], hostSource: mutatedDegrade }));
 delete process.env.DSH_CHANNEL_REDIRECT_MODE;
 // ③c 反向护栏：**真**降级（回归台故意不给 fd3）仍按环境限制处理，不得误判篡改
@@ -762,7 +776,7 @@ const capVal = cap();
 const healthy = runOfflineProbe({ pluginPath: path.join(ROOT, "tests/fixtures/demo-plugin.mjs"), expectedTools: ["demo_echo", "demo_status"] });
 console.log(JSON.stringify({
   fd3Capability: capVal,
-  fixedAll, fixedNoSquelch, offAll, offNoSquelch, fixedDegradeClaim, offDegradeClaim,
+  fixedAll, fixedNoSquelch, offAll, offNoSquelch, fixedDegradeClaim, offDegradeClaim, offDegradeClaimMainOff,
   realDegrade: { attribution: realDegrade.attribution, hostFatal: realDegrade.result.hostFatal.length, tampered: realDegrade.result.checks.some((c) => c.name === "plugin.protocol_injection") },
   synthFake, synthReal, synthLegacy,
   healthy: {
@@ -793,7 +807,8 @@ assert "🔴-R3③ 判据级：真降级仍落 hostFatal（AMBER 不放行）" "
 assert "🔴-R3③ 判据级：未传新选项（老装配器 / 合成输入）⇒ 判据不启用（向后兼容）" "false" "$(k21 synthLegacy '.fails.includes("plugin.protocol_injection")')"
 assert "🔴-R3③ 行为（自报降级甩锅）：归因**不得** UPSTREAM_DRIFT" "PLUGIN_REGRESSION" "$(k21 fixedDegradeClaim '.attribution')"
 assert "🔴-R3③ 行为（自报降级甩锅）：hostFatal 为空 + 判 plugin.protocol_injection" "0|true" "$(k21 fixedDegradeClaim '.hostFatal+"|"+c.fails.includes("plugin.protocol_injection")')"
-assert "🔴-R3③ 变异回退（关掉宿主侧观测）：**复现甩锅上游**（UPSTREAM_DRIFT / AMBER）" "UPSTREAM_DRIFT" "$(k21 offDegradeClaim '.attribution')"
+assert "🔴-R3③ 变异回退（三条判据全退回）：**复现甩锅上游**（UPSTREAM_DRIFT / AMBER）" "UPSTREAM_DRIFT" "$(k21 offDegradeClaim '.attribution')"
+assert "🔴-R3③ 防御纵深：只关降级分支 ⇒ 仍被**主判据**兜住（判 plugin.protocol_injection / 不放行）" "true|false" "$(k21 offDegradeClaimMainOff '.fails.includes("plugin.protocol_injection")+"|"+c.ok')"
 assert "🔴-R3③ 变异回退：此时 hostFatal 非空（责任被推给环境）" "true" "$(k21 offDegradeClaim '.hostFatal > 0')"
 assert "🔴-R3③ 反向护栏：**真**降级（离线台故意不给 fd3）仍判 UPSTREAM_DRIFT + hostFatal 非空 + 不误判篡改" "UPSTREAM_DRIFT|1|false" "$(k21 realDegrade '.attribution+"|"+r.realDegrade.hostFatal+"|"+r.realDegrade.tampered')"
 assert "🔴-R3③ 宿主侧 fd3 能力实测可用（本环境；判据的前提）" "true" "$(echo "$REDIRECT_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{console.log(JSON.parse(d).fd3Capability)})")"
@@ -806,6 +821,81 @@ assert "🔴-R3′ 夹具：真的从重定向文件里读回探针的**真报�
 assert "🔴-R3′ 夹具：真的把伪造绿卡写进 stdout" "yes" "$(grep -q 'writeSync(1,' "$REDIRECT_FIXTURE" && echo yes || echo no)"
 assert "🔴-R3′ 夹具：真的压退出码（R3′ 相对 R3 的唯一增量）" "yes" "$(grep -q 'process.exitCode = 0' "$REDIRECT_FIXTURE" && echo yes || echo no)"
 assert "🔴-R3′ 夹具：真缺陷（多注册 demo_extra ⇒ registry.exact 应红）" "yes" "$(grep -q 'demo_extra' "$REDIRECT_FIXTURE" && echo yes || echo no)"
+
+echo "  [22] 🔴-R3：结果通道**被重定向**（交叉校验）+ §三 同源形态（自报降级甩锅上游）"
+# 为什么单列（评审复评 🔴-R3，**放行级假绿**）：插件 `closeSync(3)` + `openSync(sink,'w')`
+# **抢占 fd 号 3** ⇒ 探针的 `writeSync(3, …)` 写进**插件的文件**（写成功 ⇒ 自报 `fd3`，对重定向
+# 一无所知）；宿主侧那条 pipe 于是为空 ⇒ 装配器回落 stdout ⇒ 插件在 exit 钩子里读回真报告、
+# 取 nonce、向 stdout 写**带正确 nonce** 的绿卡 ⇒ 收口前实测 **GREEN / PASS（放行）**。
+#
+# 本段是**离线合成输入**那一半（真宿主夹具那一半见闸门 `tests/gate_plugin_side.sh` 与
+# `tests/test_e2e_regression.mjs` [8h]）：直接把「宿主侧观测 + stdout/结果通道文本」喂给
+# 装配器的**真实实现**，断言判据本身；再用**变异回退**证明「删该判据即红」。
+R3_OUT="$("$NODE_BIN" --input-type=module -e '
+import { readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import path from "node:path";
+import { interpretProbeStdout } from "'"$ROOT"'/src/harness/host.mjs";
+import { attributeFailure } from "'"$ROOT"'/src/verify/runner.mjs";
+import { createProbeNonce, probeResultPrefix } from "'"$ROOT"'/src/harness/contract.mjs";
+import { runOfflineProbe, runOfflineProbeWithSources } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+const ROOT = "'"$ROOT"'";
+const channel = { label: "stable", line: "0.1.5" };
+const nonce = createProbeNonce(randomBytes).value;
+const payload = (extra = {}) => JSON.stringify({
+  checks: [{ name: "host.tools_ready", status: "pass" }], errors: [], hostFatal: [],
+  ok: true, runCompleted: true, phase: "plugin-integration", resultChannel: "fd3", ...extra,
+});
+const fresh = () => ({ checks: [], errors: [], hostFatal: [], phase: "host-assembly" });
+const probeOf = (r) => ({
+  fails: r.checks.map((c) => c.name + ":" + c.status), ok: r.ok === true, completed: r.runCompleted,
+  hostFatal: r.hostFatal.length, attribution: attributeFailure(r, channel, "stable"), resultChannel: r.resultChannel,
+});
+// ① 正向（宿主给了 fd3 却为空 + stdout 有匹配 nonce 行）⇒ 判重定向
+const fwd = fresh();
+interpretProbeStdout(fwd, probeResultPrefix(nonce) + payload() + "\n", { resultFd: "", nonce, resultChannelProvided: true });
+// ② 反向护栏（宿主**真的**没给 fd3 + 自称降级）⇒ 真降级，不得误判篡改
+const rev = fresh();
+interpretProbeStdout(rev, probeResultPrefix(nonce) + payload({ resultChannel: "stdout-degraded" }) + "\n", { resultFd: "", nonce, resultChannelProvided: false });
+// ③ §三（宿主给了 fd3 却自报降级 + 伪造 hostFatal）⇒ 判篡改、不甩锅
+const deg = fresh();
+interpretProbeStdout(deg, probeResultPrefix(nonce) + payload({ resultChannel: "stdout-degraded", resultChannelAtStart: undefined, hostFatal: ["上游契约变更（伪造）"] }) + "\n", { resultFd: "", nonce, resultChannelProvided: true });
+// ④ 正常路径（fd3 有内容 / stdout 只有日志）⇒ 不得误判
+const okp = fresh();
+interpretProbeStdout(okp, "__DSH_PROBE_PHASE__plugin-integration\n日志\n", { resultFd: probeResultPrefix(nonce) + payload() + "\n", nonce, resultChannelProvided: true });
+// ⑤ 真宿主夹具（离线台 = 真 spawn + 假宿主 + 装配器真实实现）
+const fRedir = runOfflineProbe({ pluginPath: path.join(ROOT, "tests/fixtures/plugin-channel-redirect-plugin.mjs"), expectedTools: ["demo_echo"] });
+const fDeg = runOfflineProbe({ pluginPath: path.join(ROOT, "tests/fixtures/plugin-channel-degrade-forge-plugin.mjs"), expectedTools: ["demo_echo"] });
+// ⑥ 变异回退（**删该判据即红**）：把交叉校验整条关掉 ⇒ 重定向形态必须复现假绿
+const hostSrc = readFileSync(path.join(ROOT, "src/harness/host.mjs"), "utf8");
+const mutated = hostSrc.replace(
+  "if (!isolated && matchingOnStdout.length > 0 && (channelProvidedByHost || claimedChannel === RESULT_CHANNEL_FD3)) {",
+  "if (false) {",
+);
+const mutProbeOf = (r) => ({ ok: r.result.ok === true, pass: r.result.checks.filter((c) => c.status === "pass").length, attribution: r.attribution });
+const mutatedRun = mutProbeOf(await runOfflineProbeWithSources({ pluginPath: path.join(ROOT, "tests/fixtures/plugin-channel-redirect-plugin.mjs"), expectedTools: ["demo_echo"], hostSource: mutated }));
+console.log(JSON.stringify({
+  fwd: probeOf(fwd), rev: probeOf(rev), deg: probeOf(deg), okp: probeOf(okp),
+  fixtureRedirect: { attribution: fRedir.attribution, ok: fRedir.result.ok === true, fails: fRedir.result.checks.map((c) => c.name + ":" + c.status), hostFatal: fRedir.result.hostFatal.length, completed: fRedir.result.runCompleted, resultChannel: fRedir.result.resultChannel },
+  fixtureDegrade: { attribution: fDeg.attribution, ok: fDeg.result.ok === true, fails: fDeg.result.checks.map((c) => c.name + ":" + c.status), hostFatal: fDeg.result.hostFatal.length, completed: fDeg.result.runCompleted },
+  mutation: { changed: mutated !== hostSrc, run: mutatedRun },
+}));
+')"
+k22() { echo "$R3_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);console.log(eval('r$1'))})"; }
+assert "🔴-R3 合成输入（正向）：宿主已给 fd3 却为空 + stdout 有匹配 nonce 行 ⇒ 判 plugin.protocol_injection" "plugin.protocol_injection:fail" "$(k22 '.fwd.fails.join(",")')"
+assert "🔴-R3 合成输入（正向）：不采信任何一条（只剩篡改证据）+ 不放行" "false|false" "$(k22 '.fwd.ok+"|"+r.fwd.completed')"
+assert "🔴-R3 合成输入（正向）：hostFatal 为空（不甩锅上游）" "0" "$(k22 '.fwd.hostFatal')"
+assert "🔴-R3 合成输入（正向）：归因 PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(k22 '.fwd.attribution')"
+assert "🔴-R3 合成输入（正向）：通道形态可见化为 fd3-redirected" "fd3-redirected" "$(k22 '.fwd.resultChannel')"
+assert "🔴-R3 反向护栏：宿主**真的**没给 fd3 + 自称降级 ⇒ 真降级不误伤（不判篡改）" "false" "$(k22 '.rev.fails.some((x) => x.startsWith("plugin.protocol_injection"))')"
+assert "🔴-R3 反向护栏：真降级仍落宿主/环境侧（hostFatal 非空 ⇒ AMBER 不放行）" "UPSTREAM_DRIFT|true" "$(k22 '.rev.attribution+"|"+(r.rev.hostFatal>0)')"
+assert "🔴-R3 §三（同源）：宿主给了 fd3 却自报降级 ⇒ 判篡改（收口前实测甩锅上游）" "plugin.protocol_injection:fail|PLUGIN_REGRESSION|0" "$(k22 '.deg.fails.join(",")+"|"+r.deg.attribution+"|"+r.deg.hostFatal')"
+assert "🔴-R3 反向护栏：正常路径（fd3 有内容 / stdout 只有日志）不误判" "host.tools_ready:pass|true" "$(k22 '.okp.fails.join(",")+"|"+r.okp.ok')"
+assert "🔴-R3 真宿主夹具（离线台）：重定向 ⇒ PLUGIN_REGRESSION / 不放行 / hostFatal=0 / 完成位 false" "PLUGIN_REGRESSION|false|0|false" "$(k22 '.fixtureRedirect.attribution+"|"+r.fixtureRedirect.ok+"|"+r.fixtureRedirect.hostFatal+"|"+r.fixtureRedirect.completed')"
+assert "🔴-R3 真宿主夹具（离线台）：§三 同源形态 ⇒ PLUGIN_REGRESSION / 不放行 / hostFatal=0" "PLUGIN_REGRESSION|false|0|false" "$(k22 '.fixtureDegrade.attribution+"|"+r.fixtureDegrade.ok+"|"+r.fixtureDegrade.hostFatal+"|"+r.fixtureDegrade.completed')"
+assert "🔴-R3 变异自证：变异确实改动了源码（否则下面的断言空转）" "true" "$(k22 '.mutation.changed')"
+assert "🔴-R3 变异回退（**删该判据即红**）：关掉交叉校验 ⇒ 重定向形态复现假绿（ok=true）" "true" "$(k22 '.mutation.run.ok')"
+assert "🔴-R3 变异回退：复现的绿卡里 17 项全 pass（判据是唯一拦截点）" "17" "$(k22 '.mutation.run.pass')"
 
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
