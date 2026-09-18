@@ -69,6 +69,8 @@ main:
         - name: plugin-error-not-host-signal
           script: |
             # 🔴-D / 🔴 必修-2/3 闸门：插件侧错误**不得**进判据字段 hostFatal[]。
+            # ⚠️ 口径前提（v0.1.9b 收窄，评审复评 H1）：以「探针进程内防线未被插件干预」为前提——
+            #    插件可 setUncaughtExceptionCaptureCallback() 静音防线（放行级假绿），见 docs/RISKS.md R22/R23。
             # 四条出口（同步 / 异步 / 进程 exit / run() 被拖住）+ 不可捕获边界（SIGKILL）
             # + **防过度修正**（健康插件仍须 17/17 GREEN）。
             #

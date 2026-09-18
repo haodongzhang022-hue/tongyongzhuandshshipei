@@ -1,5 +1,6 @@
 /**
- * 负例插件：**插件抢占进程级异常捕获回调**（评审复评 H1 的原始复现：**放行级假绿**）。
+ * 负例插件：**插件抢占进程级异常捕获回调**（评审复评 H1 的原始复现：**放行级假绿**，
+ * 风险行见 `docs/RISKS.md` R22 / R23）。
  *
  * Node 语义（H1 的机理）：`process.setUncaughtExceptionCaptureCallback(cb)` 一旦被设置，
  * `uncaughtException` **监听器不再被调用**（官方语义：capture callback 存在时监听器被停用）。

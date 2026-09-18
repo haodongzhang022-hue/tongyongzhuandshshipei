@@ -99,6 +99,15 @@ export const HOST_FATAL_PREFIX = 'fatal(host)';
  * 有信标（插件代码运行期间）→ 插件侧 check `plugin.abnormal_termination`；无信标（宿主装配段）
  * → 落 `hostFatal[]` → `UPSTREAM_DRIFT`/AMBER（**不放行**，人须确认）。
  * 该边界**显式声明**在 `docs/RISKS.md` R21 与 `docs/ADAPTER_GUIDE.md`，不是漏修。
+ *
+ * ⚠️ **第二类例外（v0.1.9b 收窄，评审复评 H1，既存活口）**：上句的前提是「探针的进程内防线**有效**」。
+ * 插件可**单方面关闭**该防线——`process.setUncaughtExceptionCaptureCallback()` 会**停用**
+ * `uncaughtException` 监听器（Node 语义），`removeAllListeners('uncaughtException')` 可直接撤销。
+ * 实测：装了 captureCallback 的插件在 `apply()` 后抛错 → 探针防线静音 → `run()` 仍正常收尾 →
+ * 整轮 **GREEN / PASS / 17 项**（**放行级假绿**，比 AMBER 更危险）。故：
+ * **不得**把本不变量写成「永远 / 永不」这类**绝对口径**，也不得据此对外宣称「插件侧错误永不进该字段」。
+ * 准确口径 =「**在探针进程内防线未被插件干预的前提下**，插件侧错误不进该字段」。
+ * 见 `docs/RISKS.md` R22（放行级假绿）/ R23（防线可被插件撤销或静音）；v0.1.9 修法 A。
  */
 export const HOST_FATAL_FIELD = 'hostFatal';
 
