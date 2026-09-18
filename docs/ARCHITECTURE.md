@@ -2,7 +2,7 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.2.3`（module `adapt-hub`；v0.1.9d/v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；v0.2.1：信任边界写成显式前提（R26）+ R24 反向反证 + 结构性重做一页方案；v0.2.2：nonce 通道改 **stdin**（env/argv 可被 `/proc/self/environ` 反读）；**v0.2.3（批 1.5）：可达性口径更正 + 通道可见化（降级不放行）+ §3 反例固化 + exit 钩子台账 + 🔴-A 探针无 nonce 硬崩收口（R30）+ R29 立项（批 2 在办）**）
+> 版本：`dsh-adapt-hub v0.2.3`（module `adapt-hub`；v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；v0.2.1：信任边界写成显式前提（R26）+ 结构性重做一页方案；v0.2.2：nonce 通道改 **stdin**（env/argv 可被 `/proc/self/environ` 反读）；**v0.2.3（批 1.5 + 评审复评并集）：可达性口径更正 + 通道可见化（降级不放行）+ §3 反例固化 + exit 钩子台账 + 🔴-A 探针无 nonce 硬崩收口（R30）+ 🔴 必修-4 同族假绿收口（加载期捕获 `JSON.stringify` + 退出码交叉 `plugin.exit_code_mismatch`，R29）+ 条件项守卫扩面；批 2 在办**）
 
 ---
 
@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 153 项 + 归因离线回归 456 项 + 发布面自检 43 项 ✅   归因端到端回归 156 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
+离线单测 163 项 + 归因离线回归 495 项 + 发布面自检 43 项 ✅   归因端到端回归 163 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
 ```
 
 ---
@@ -192,9 +192,9 @@ tongyongzhuandshshipei/
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 153 项离线单测（无网可跑；含 [13] verdict 优先级 / [14] 漂移相关性表唯一事实源 / [15] watch 影响面 / [16] 🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 / [17] 🔴-1 占死事件循环有界返回 / [18] nonce 侧信道 + v0.1.9d 三形态 / [19] 批 1.5 通道可见化+降级不放行+§3 反例+exit 台账）
-│   ├── test_attribution.mjs           # 456 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + 🔴 四条出口/完成位 [9.9] + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9] + [9.10]-[9.12] R28/R26/R24）
-│   ├── test_e2e_regression.mjs        # 156 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D + 🔴 必修-2/3 四条出口复现 + [8d]-[8g] 侧信道/R28/R26/R24/§3 反例，含 verdict 与完成位断言）
+│   ├── test_offline.sh                # 163 项离线单测（无网可跑；含 [13] verdict 优先级 / [14] 漂移相关性表唯一事实源 / [15] watch 影响面 / [16] 🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 / [17] 🔴-1 占死事件循环有界返回 / [18] nonce 侧信道 + v0.1.9d 三形态 / [19] 批 1.5 通道可见化+降级不放行+§3 反例+exit 台账 / [20] 🔴 必修-4 同族假绿）
+│   ├── test_attribution.mjs           # 495 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + 🔴 四条出口/完成位 [9.9] + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9] + [9.10]-[9.13] R28/R26/R24/🔴 必修-4）
+│   ├── test_e2e_regression.mjs        # 163 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D + 🔴 必修-2/3 四条出口复现 + [8d]-[8g] 侧信道/R28/R26/R24/§3 反例/🔴 必修-4，含 verdict 与完成位断言）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
 │   └── fixtures/{demo,broken,plugin-side-throw,plugin-registry-throw,plugin-async-throw,plugin-async-reject}-plugin.mjs
@@ -275,7 +275,7 @@ export function apply(ctx) {
 > 边界：探针是**有限时长验收**，只在收尾前给已排队的微任务/宏任务一个 50ms 排空窗口；
 > 更晚的延迟抛错发生在探针退出之后，不属本防线范围。
 
-> **另有 8 项条件检查**（不计入 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`，
+> **另有 9 项条件检查**（不计入 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`，
 > 其项数由 `tests/test_exports.mjs` 断言与文档声明一致）：
 >
 > **条件检查项（不计入 17 项）**：`plugin.unexpected_exception`（① 同步）/ `plugin.async_uncaught_exception`
@@ -283,7 +283,8 @@ export function apply(ctx) {
 > `plugin.abnormal_termination`（不可捕获终止，由装配器按相位信标落）/
 > `plugin.process_defense_tampered`（⑤ 进程内防线被插件干预：静音 / 撤销 / **顶替** / **出口③ `exit` 钩子被摘**，探针收尾四重自检）/
 > `plugin.protocol_injection`（⑥ 结果通道被注入伪造结果 / **被插件关闭**，装配器结构不变量 + 通道隔离）/
-> `plugin.probe_result_forged`（🆕 侧信道：输出面出现无 nonce 的伪造报告行）——唯一事实源 =
+> `plugin.probe_result_forged`（🆕 侧信道：输出面出现无 nonce 的伪造报告行）/
+> `plugin.exit_code_mismatch`（🔴 必修-4 退出码交叉：报告自称通过但退出码非 0 ⇒ 两个独立产物矛盾）——唯一事实源 =
 > `src/harness/contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS`；
 > 「17 项 ∪ 条件项 == 三张 check 表并集」与「`PROBE_CHECK_ORDER` == 探针实际输出顺序」由
 > `tests/test_attribution.mjs` [9.8e] 断言（漂移即红）；四条出口 + 完成位另有 [9.9] 一整段。
@@ -379,7 +380,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 153 项 + 归因离线回归 456 项 + 发布面自检 43 项 + 归因端到端回归 156 项 + 负例拦下（含漂移窗口）+ 插件侧闸门 23 项（16 负例 + R24 六条 + 防过度修正） | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 163 项 + 归因离线回归 495 项 + 发布面自检 43 项 + 归因端到端回归 163 项 + 负例拦下（含漂移窗口）+ 插件侧闸门 24 项（17 负例 + R24 六条 + 防过度修正） | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |

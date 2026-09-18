@@ -654,6 +654,54 @@ assert "段落编号唯一（重复编号 = 索引不可用，回退即红）" "
 SECTION_18="$(grep -cE '^echo "  \[18\]' "$ROOT/tests/test_offline.sh")"
 assert "文档声称的 [18] 段**真实存在**（曾指向不存在的产物 = 文档撒谎）" "1" "$SECTION_18"
 
+echo "  [20] 🔴 必修-4 同族假绿（猴子补丁 JSON.stringify：加载期捕获 + 退出码交叉）"
+# 为什么必须有（评审复评 🔴 必修-4）：R26 的 nonce 侧信道挡「反读凭据 + 冒用协议」，
+# 但探针与插件**同进程** ⇒ 插件还能改**序列化函数本身**。实测（v0.2.2 tip）子进程 exit status=1
+# 而报告 ok=true / 17 项全 pass ⇒ 失败被吞、绿卡被采信。收口两条**并集**（各自可独立回退即红）。
+STRINGIFY_OUT="$("$NODE_BIN" --input-type=module -e '
+import path from "node:path";
+import { runOfflineProbe, runOfflineProbeWithSources } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+import { readFileSync } from "node:fs";
+const ROOT = "'"$ROOT"'";
+const fixture = path.join(ROOT, "tests/fixtures/plugin-stringify-tamper-plugin.mjs");
+const probeSrc = readFileSync(path.join(ROOT, "src/harness/probe-template.mjs"), "utf8");
+const hostSrc = readFileSync(path.join(ROOT, "src/harness/host.mjs"), "utf8");
+const probeOf = (r) => {
+  const fails = r.result.checks.filter((c) => c.status === "fail").map((c) => c.name);
+  return { attribution: r.attribution, ok: r.result.ok === true, hostFatal: r.result.hostFatal.length,
+    completed: r.result.runCompleted, fails, exitStatus: r.exit.status, exitSignal: r.exit.signal };
+};
+// ① 生产口径（两条防线都在）
+const fixed = probeOf(runOfflineProbe({ pluginPath: fixture, expectedTools: ["demo_echo"] }));
+// ② 变异 A：探针退回「每次取全局 JSON.stringify」⇒ 报告被替换，由**退出码交叉**兜住
+const mutatedProbe = probeSrc.replace("const STRINGIFY = JSON.stringify;", "const STRINGIFY = (v) => JSON.stringify(v);");
+const mutatedA = probeOf(await runOfflineProbeWithSources({ probeSource: mutatedProbe, pluginPath: fixture, expectedTools: ["demo_echo"] }));
+// ③ 变异 B：关掉装配器退出码交叉 ⇒ 由**探针加载期捕获**独立兜住
+const mutatedHost = hostSrc.replace("if (payload.ok === true && exitAbnormal) {", "if (false && payload.ok === true && exitAbnormal) {");
+const mutatedB = probeOf(await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ["demo_echo"], hostSource: mutatedHost }));
+// ④ 双回退（残留边界，写进文档，不当承诺）：两条都关 ⇒ 复现「绿卡被采信」
+const bothOff = probeOf(await runOfflineProbeWithSources({ probeSource: mutatedProbe, pluginPath: fixture, expectedTools: ["demo_echo"], hostSource: mutatedHost }));
+// ⑤ 反向护栏：健康插件在同参数下仍 17/17（防过度修正）
+const healthy = runOfflineProbe({ pluginPath: path.join(ROOT, "tests/fixtures/demo-plugin.mjs"), expectedTools: ["demo_echo", "demo_status"] });
+console.log(JSON.stringify({
+  fixed, mutatedA, mutatedB, bothOff,
+  healthy: { pass: healthy.result.checks.filter((c) => c.status === "pass").length,
+    fails: healthy.result.checks.filter((c) => c.status === "fail").length,
+    completed: healthy.result.runCompleted, hostFatal: healthy.result.hostFatal.length, ok: healthy.result.ok === true },
+}));
+')"
+k20() { echo "$STRINGIFY_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);const c=r['$1'];console.log(eval('c$2'))})"; }
+assert "🔴-4 生产口径：真缺陷 registry.exact 仍被判失败（绿卡不得掩盖它）" "true" "$(k20 fixed '.fails.includes("registry.exact")')"
+assert "🔴-4 生产口径：归因 PLUGIN_REGRESSION + hostFatal 为空 + 不放行" "PLUGIN_REGRESSION|0|false" "$(k20 fixed '.attribution+"|"+c.hostFatal+"|"+c.ok')"
+assert "🔴-4 生产口径：探针自己判了失败（退出码 1 被装配器记录下来）" "1" "$(k20 fixed '.exitStatus')"
+assert "🔴-4 变异回退 A（退回全局序列化）：不得假绿" "false" "$(k20 mutatedA '.ok')"
+assert "🔴-4 变异回退 A：由**退出码交叉**兜住（plugin.exit_code_mismatch）" "true" "$(k20 mutatedA '.fails.includes("plugin.exit_code_mismatch")')"
+assert "🔴-4 变异回退 A：归因仍 PLUGIN_REGRESSION（不放行）" "PLUGIN_REGRESSION" "$(k20 mutatedA '.attribution')"
+assert "🔴-4 变异回退 B（关掉退出码交叉）：不得假绿（探针侧捕获独立兜住）" "false" "$(k20 mutatedB '.ok')"
+assert "🔴-4 变异回退 B：真缺陷 registry.exact 仍被判失败" "true" "$(k20 mutatedB '.fails.includes("registry.exact")')"
+assert "🔴-4 双回退（残留边界）：复现「绿卡被采信」（两条防线都关 ⇒ ok=true）——口径不得越权承诺" "true" "$(k20 bothOff '.ok')"
+assert "🔴-4 反向护栏：健康插件同参数下仍 17/17 全绿 + 跑完" "17|0|true|0" "$(k20 healthy '.pass+"|"+c.fails+"|"+c.completed+"|"+c.hostFatal')"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

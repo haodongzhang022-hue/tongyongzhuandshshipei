@@ -211,7 +211,7 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
-**另有 8 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
+**另有 9 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
 
 | 条件检查 | 出口 | 触发场景 | 归因 |
 |---|---|---|---|
@@ -223,6 +223,7 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 | `plugin.process_defense_tampered` | ⑤ 防线被静音 / 被顶替 / 出口钩子被摘 | 插件抢占 `setUncaughtExceptionCaptureCallback`（真实形态：Sentry / APM / 错误上报库）、摘掉 `uncaughtException` 监听器，或**用自己的回调顶替**探针的 ⇒ 探针兜底被**静音**、后台抛错不可见、完成位仍真 → **假绿放行**；**另含摘掉出口③ 的 `exit` 钩子**（批 1.5：钩子具名登记 + 身份检查覆盖 `'exit'`，此前**不可判定**）。探针收尾**四重**自检（API 调用台账 + **身份检查** + 独占 API 检测 + 行为级 canary；**不得**用 `has()\|\|listenerCount>0`——插件顶替后该式**假阳性**）判本项 | `PLUGIN_REGRESSION` |
 | `plugin.protocol_injection` | ⑥ 结果通道被注入 / 被关闭 | 插件向探针的**结果通道**写入伪造结果（抢首位 / 多结果行 / 在结果走独立通道时仍写 stdout），或**在插件代码运行期间把 fd3 关掉/替换**（早探测可写 → 收尾不可写）⇒ 真报告被顶替 → 装配器 `interpretProbeStdout()` 判本项（结构不变量 + 通道隔离，**防放行级假绿**） | `PLUGIN_REGRESSION` |
 | `plugin.probe_result_forged` | 🆕 侧信道 | 探针输出面里出现**无 nonce / nonce 不匹配**的结构化结果行（插件自造绿卡 / 甩锅上游）；由**装配器**判定（与 ⑥ 是**两条独立证据链**） | `PLUGIN_REGRESSION` |
+| `plugin.exit_code_mismatch` | 🔴 必修-4 退出码交叉 | 报告自称通过（`ok=true`）但探针**进程退出码非 0**（或带终止信号）⇒ **两个独立产物互相矛盾**即篡改（退出码由探针内存算出、不经序列化；报告字节可被插件的 `JSON.stringify` 替换）⇒ 由**装配器**判定（与探针侧「加载期捕获引用」是**两道并集**） | `PLUGIN_REGRESSION` |
 
 
 **为什么四条出口都要兜**（本中台被返工最多的一条线）：插件侧错误逃出探针 `run()` 的调用栈有
@@ -310,7 +311,9 @@ captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收�
 | 显式前提 | 本中台的归因防线以「**插件为可信代码**（非恶意）」为**显式前提**（`docs/RISKS.md` R26）。越出该前提时，防线退化为**尽力而为**。⇒ 本中台是**验收**工具，**不是沙箱**；**不得**在缺少该前提时宣称「报告可信」 |
 | nonce 带外通道 | 宿主每次运行生成**随机** nonce，经 **stdin** 下发（探针读完即 `close(0)`；**不进 argv / env** ⇒ 不落 `/proc/self/environ`、不出现在 `ps` 里）；探针输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行** |
 | 判定 | 出现裸 `__DSH_PROBE__`（无 nonce / 不匹配）⇒ 判**伪造**：落插件侧 check `plugin.probe_result_forged`，`ok` 必为 false（**不放行**） |
-| 残留边界 | 同进程同 uid 下，**恶意**插件仍可篡改**其它**全局（猴子补丁 `JSON.stringify` / 直接读探针内存）后伪造——**该形态已实测为「放行级假绿」（R29）**；nonce **不经** env / argv 下发（那两条读取面已实测收窄）。根治需**进程隔离**（结构性重做，**批 2 已立项在办**，见 R29）——本项**不越权承诺**。一页方案见 [`docs/REDO-PROPOSAL.md`](REDO-PROPOSAL.md) |
+| 加载期捕获引用（🔴 必修-4，v0.2.3） | 探针在**模块加载期**捕获 `JSON.stringify` 引用（`const STRINGIFY = JSON.stringify`）且**只用**捕获值 ⇒ 插件在 `apply()` 里猴子补丁 `JSON.stringify` **不被探针采用**（实测：`plugin-stringify-tamper-plugin` 由「绿卡被采信」变为「真缺陷照常判出」） |
+| 退出码交叉（🔴 必修-4，v0.2.3） | 装配器无条件记录探针退出实况；**报告自称 `ok=true` 而退出码非 0**（或带终止信号）⇒ 内部矛盾 ⇒ 判插件侧 `plugin.exit_code_mismatch`、不放行。两个独立产物（退出码不经序列化 / 报告字节可被替换）互相矛盾即证据 |
+| 残留边界 | 同进程同 uid 下，**恶意**插件仍可篡改**其它**全局 / 直接读探针内存 / **同时**改退出码（`process.exitCode`）后伪造——`JSON.stringify` 这一形态已由上面的「加载期捕获 + 退出码交叉」收口（R29），但**逐点补不可穷尽**；nonce **不经** env / argv 下发（那两条读取面已实测收窄）。根治需**进程隔离**（结构性重做，**批 2 已立项在办**，见 R29）——本项**不越权承诺**。一页方案见 [`docs/REDO-PROPOSAL.md`](REDO-PROPOSAL.md) |
 
 > 结论（给接入方）：**不要**在 `apply()` 里往 stdout 写探针协议行（`__DSH_PROBE__` / `__DSH_PROBE_PHASE__`）。
 > 正常插件不需要关心 nonce——它是宿主与探针之间的带外协议，对插件透明。

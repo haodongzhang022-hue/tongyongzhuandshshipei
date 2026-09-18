@@ -112,8 +112,27 @@ import {
   recordProbeRunIncomplete,
 } from './contract.mjs';
 
+// ---- 🔴 必修-4：**加载期捕获**可被插件猴子补丁的全局引用（探针只用捕获值） ----
+// 为什么必须有：探针与插件**同进程**，插件在 `apply()` 里改 `JSON.stringify` 是**一行**的事，
+// 而探针原先在写出报告时才取**全局** `JSON.stringify` ⇒ 序列化函数可被替换：
+// 实测（夹具 `plugin-stringify-tamper-plugin`）把 `JSON.stringify` 换成「把 checks 全改 pass、
+// errors/hostFatal 清空、ok/runCompleted 置真」后，子进程 `exit status=1`（探针自己判了失败），
+// 但报告里 `ok=true / 17 项全 pass` ⇒ **失败被吞、绿卡被采信**（与 R26 的 nonce 反读**同族**：
+// 同进程 + 共用输出面，只是换了个全局）。
+//
+// 纪律（三条）：
+// 1. **在任何插件代码之前**捕获（本段位于文件顶部，早于 `import(pluginPath)` 与 `apply()`）；
+// 2. 探针后续**只**用捕获值（`STRINGIFY(...)` / `PARSE(...)`），不再取全局；
+// 3. 捕获是**引用级**的：猴子补丁改的是 `JSON.stringify` 这个属性，捕获值仍指向原实现。
+//
+// 边界（显式声明，不越权承诺）：本层挡的是「替换序列化函数」这一类；同进程同 uid 下插件仍可
+// 篡改**其它**全局 / 直接读探针内存 ⇒ 根治仍需**进程级**隔离（见 `docs/REDO-PROPOSAL.md` 批 2）。
+// 第二道防线见装配器的**退出码交叉**校验（`host.mjs` 的 interpretProbeStdout）。
+const STRINGIFY = JSON.stringify;
+const PARSE = JSON.parse;
+
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
-const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
+const expectedTools = PARSE(expectedToolsJson ?? '[]');
 
 // ---- nonce 带外通道（侧信道收口；**经 stdin**，不经 env / argv） ----
 // 宿主每次运行生成随机 nonce，作为**子进程 stdin 的字节流**传进来（见 host.mjs 的
@@ -506,7 +525,7 @@ function emit() {
   // （`apply()` 里 process.exit(0) → 剩余检查是 skip 不是 fail → 只看 errors 就 GREEN）。
   out.ok = runCompleted && out.errors.length === 0;
   // 结果行前缀 = 带 nonce 形式（宿主只认它；无 nonce 时退化为裸 marker）。
-  const payload = `${resultPrefix}${JSON.stringify(out)}\n`;
+  const payload = `${resultPrefix}${STRINGIFY(out)}\n`;
   // R26：结果走**专用通道**（fd3 优先），stdout 只留日志 ⇒「stdout 里出现结果行」= 篡改证据。
   writeResult(payload);
 }
@@ -609,7 +628,7 @@ async function run() {
 
   const flattened = hub.normalizeSchema({ type: 'object', properties: { a: { type: 'json' } } });
   const flattenOk = hub.collectSchemaViolations(flattened).length === 0;
-  check('compat.schema_flatten', flattenOk, flattenOk ? `schema 压平后无违规：${JSON.stringify(flattened)}` : `schema 压平后仍有违规：${JSON.stringify(flattened)}`);
+  check('compat.schema_flatten', flattenOk, flattenOk ? `schema 压平后无违规：${STRINGIFY(flattened)}` : `schema 压平后仍有违规：${STRINGIFY(flattened)}`);
 
   // ---- 5. 集成路径：插件 import / apply（**插件侧**失败 → check，绝不 fatal） ----
   // 🔴-D：相位切到「插件集成」——此后逃到顶层 catch 的异常一律落**插件侧 check**，
@@ -654,7 +673,7 @@ async function run() {
     skipAll(SKIP_AFTER_REGISTRY, '工具清单不可枚举');
     return;
   }
-  const registryExact = JSON.stringify(actual) === JSON.stringify(want);
+  const registryExact = STRINGIFY(actual) === STRINGIFY(want);
   check('registry.exact', registryExact, registryExact ? `工具清单精确匹配（${actual.join(',')}）` : `期望 ${want.join(',')} / 实得 ${actual.join(',')}`);
 
   // ---- 7. 真实 dispatch：execute → output.schema 校验 → render 投影 ----
@@ -670,7 +689,7 @@ async function run() {
     skip('dispatch.abort_semantics', 'dispatch 未成功，跳过');
     return;
   }
-  const dispatchDetail = JSON.stringify(dispatched.content)?.slice(0, 200);
+  const dispatchDetail = STRINGIFY(dispatched.content)?.slice(0, 200);
   check(
     'dispatch.execute_ok',
     dispatched.isError !== true,
@@ -700,7 +719,7 @@ async function run() {
     cancelled.isError === true,
     cancelled.isError === true
       ? '取消语义生效（已中止调用被拒绝）'
-      : `取消语义失效：已中止的调用仍返回成功：${JSON.stringify(cancelled.content)?.slice(0, 160)}`,
+      : `取消语义失效：已中止的调用仍返回成功：${STRINGIFY(cancelled.content)?.slice(0, 160)}`,
   );
 
   // ---- 9. 插件 definitions（**插件侧**失败 → check，绝不 fatal） ----
@@ -731,7 +750,7 @@ async function run() {
     const expectedDisposers = definitions.length - lifecycle.reservedRejected.length;
     check('lifecycle.disposer_count', lifecycle.disposers.length === expectedDisposers, lifecycle.disposers.length === expectedDisposers ? lifecycle.disposers.length + '/' + expectedDisposers + '（全部可注册定义均产出 disposer）' : lifecycle.disposers.length + '/' + expectedDisposers + '（数量不符）');
     const before = tools2.schemas().map((s) => s.name).sort();
-    const lifecycleRegistered = JSON.stringify(before) === JSON.stringify([...expectedTools].sort());
+    const lifecycleRegistered = STRINGIFY(before) === STRINGIFY([...expectedTools].sort());
     check('lifecycle.registered', lifecycleRegistered, lifecycleRegistered ? `独立上下文注册成功（${before.join(',')}）` : `独立上下文注册不符：${before.join(',')}`);
     lifecycle.disposers.forEach((dispose) => dispose());
     const after = tools2.schemas().map((s) => s.name);

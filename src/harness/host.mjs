@@ -16,6 +16,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symli
 import { createHash, randomBytes } from 'node:crypto';
 import {
   PLUGIN_ABNORMAL_TERMINATION_CHECK,
+  PLUGIN_EXIT_CODE_MISMATCH_CHECK,
   PLUGIN_PROBE_FORGED_RESULT_CHECK,
   PLUGIN_PROTOCOL_INJECTION_CHECK,
   PROBE_NONCE_STDIN_CHANNEL,
@@ -295,8 +296,14 @@ export function runHostProbe(options) {
       resultFd = `${probeRun.output?.[3] ?? ''}`;
       // 超时（`ETIMEDOUT`）时 `spawnSync` **不抛异常**：它把实况放在 `error` / `signal` 上。
       // 与旧 `execFileSync` 路径保持同一形状（`probeExit` + 一条 errors 日志），供断言与排障。
-      if (probeRun.error || probeRun.signal) {
-        result.probeExit = { status: probeRun.status ?? null, signal: probeRun.signal ?? null };
+      //
+      // 🔴 必修-4（评审复评）：`probeExit` 必须**无条件**记录，不能只在 `error || signal` 时赋值。
+      // 旧实现下「探针正常退出但退出码非 0」（= 探针自己判了失败）**根本不进报告** ⇒
+      // 装配器**无法**做「退出码 ↔ 报告」交叉校验 ⇒ 插件猴子补丁 `JSON.stringify` 伪造绿卡时
+      // 没有任何信号可对（实测：`exit status=1` 而报告 `ok=true`，全绿放行）。
+      // 现在无条件落 `probeExit`（`status` / `signal`），交叉校验在 `interpretProbeStdout()`。
+      result.probeExit = { status: probeRun.status ?? null, signal: probeRun.signal ?? null };
+      if (probeRun.error || probeRun.signal || (probeRun.status !== null && probeRun.status !== 0)) {
         result.errors.push(`探针非零退出（status=${probeRun.status ?? 'null'}${probeRun.signal ? `, signal=${probeRun.signal}` : ''}${probeRun.error?.code ? `, error=${probeRun.error.code}` : ''}）`);
       }
     } catch (error) {
@@ -333,6 +340,9 @@ export function runHostProbe(options) {
  * @returns {string[]} 命中的结果行（原样，含前缀）
  */
 export function collectProbeResultLines(text) {
+  // ⚠️ 用唯一事实源常量 `PROBE_RESULT_MARKER`，**不得**写裸字面量 `'__DSH_PROBE__'`：
+  // 评审 🟡 点名——裸字面量在改名时**静默失配**（标记改了、这里没改 ⇒ 一条结果行都收不到 ⇒
+  // 归因退化成「探针未输出结构化结果」，而源码守卫扫不到）。由离线 [9.11g] 源码守卫钉住。
   return String(text ?? '')
     .split('\n')
     .filter((line) => line.startsWith(PROBE_RESULT_MARKER));
@@ -489,6 +499,34 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   // nonce 伪造证据**在报告解析之后**落 check（payload.checks 已就位）：
   // 本轮报告不可信 ⇒ `result.ok` 必为 false（errors 非空），且报告里看得见伪造项。
   if (forgedEvidence) result.checks.push(forgedEvidence);
+  // ---- 🔴 必修-4：退出码交叉校验（两个独立产物互相矛盾即篡改） ----
+  // 为什么需要（与 nonce 防线**同族**）：nonce 挡的是「冒用探针的输出协议」，但探针与插件
+  // **同进程**，插件还能改**序列化函数**本身（猴子补丁 `JSON.stringify`）把失败项改成 pass、
+  // 把 `errors` / `hostFatal` 清空、把 `ok` 置真——那时 nonce 前缀**照样匹配**，报告是伪造的。
+  // 本仓实测（夹具 `plugin-stringify-tamper-plugin`）：子进程 `exit status=1`（探针自己判了失败）
+  // 而报告 `ok=true / 17 项全 pass` ⇒ 失败被吞、绿卡被采信。
+  //
+  // 判据的不对称性：**退出码**由探针内存算出（`finish()` 的 `runCompleted && !syncThrew &&
+  // !failureHandled && errors.length === 0`，**不经序列化**）；**报告**是 `STRINGIFY(out)` 写出的字节。
+  // 正常运行时两者必然一致（ok=true ⇒ 无失败 ⇒ 退出码 0）⇒ 矛盾即篡改证据。
+  //
+  // ⚠️ 边界（不越权承诺）：能同时篡改**退出码**（`process.exitCode` / 替换 `process.exit`）的插件
+  // 仍可绕过本项——那属**进程级**对抗，根治需进程隔离（见 `docs/REDO-PROPOSAL.md` 批 2）。
+  // 与探针侧「加载期捕获引用」是**两道并集**，不是单一不变量。
+  // 无 `probeExit`（老装配器 / 离线合成输入 / 直接调用本函数）时**不判**（保守，不制造假红）。
+  {
+    const exit = result.probeExit ?? null;
+    const exitAbnormal = Boolean(exit) && ((exit.status !== null && exit.status !== undefined && exit.status !== 0) || Boolean(exit.signal));
+    if (payload.ok === true && exitAbnormal) {
+      result.checks.push({
+        name: PLUGIN_EXIT_CODE_MISMATCH_CHECK,
+        status: 'fail',
+        detail: `报告自称通过（ok=true）但探针进程退出异常（status=${exit.status ?? 'null'}${exit.signal ? `, signal=${exit.signal}` : ''}）——退出码由探针内存算出、不经序列化，报告字节可被插件替换 ⇒ 本轮报告被篡改，不可信`,
+      });
+      result.errors.push(`${PLUGIN_EXIT_CODE_MISMATCH_CHECK}: 报告自称通过但退出码非 0（退出码交叉校验失败，本轮结果不可信）`);
+    }
+  }
+
   // ---- 批 1.5（🔴-R2）：结果通道**可见化** + 降级**不得放行** ----
   // 探针在报告里回报 `resultChannel`（'fd3' | 'stdout-degraded'）。老探针 / 无该字段时按
   // 「结果通道是否真的用上了」推断（`isolated` = fd3 有内容）。
@@ -518,7 +556,8 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
       pushHostFatal(result, `结果通道 fd3 在本环境不可用（早探测即失败）⇒ 结构化结果降级走 stdout（${RESULT_CHANNEL_STDOUT_DEGRADED}）：stdout 上的结果行不再具备篡改证据能力，本轮结论不可信（不放行，人须确认）`);
     }
   }
-  // 完成位 + **降级**：任一不满足即不得判 PASS（假绿比 AMBER 更危险）。
+  // 完成位 + **降级** + **退出码交叉**：任一不满足即不得判 PASS（假绿比 AMBER 更危险）。
+  // 退出码交叉（🔴 必修-4）把矛盾写进 errors[]（见上），故这里的 errors.length 检查已覆盖它。
   result.ok = result.runCompleted && payload.ok === true && result.errors.length === 0 && !result.resultChannelDegraded;
   return result;
 }

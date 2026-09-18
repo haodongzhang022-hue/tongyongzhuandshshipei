@@ -347,6 +347,36 @@ export const PLUGIN_PROTOCOL_INJECTION_CHECK = 'plugin.protocol_injection';
 export const PLUGIN_PROBE_FORGED_RESULT_CHECK = 'plugin.probe_result_forged';
 
 /**
+ * 「探针**报告自称通过**，但探针进程**退出码非 0**」在插件侧的落点 check 名。
+ *
+ * ## 为什么必须有它（🔴 必修-4，与 {@link PLUGIN_PROBE_FORGED_RESULT_CHECK} **同族**）
+ * 前一条（nonce）挡的是「冒用探针的输出协议」；但探针与插件**同进程**，插件还能改**序列化函数**
+ * 本身（猴子补丁 `JSON.stringify`）——把失败项改成 pass、把 `errors` / `hostFatal` 清空、
+ * 把 `ok` / `runCompleted` 置真。那时**报告**是伪造的，而 nonce 校验**照样通过**（前缀没变）。
+ * 本仓实测（夹具 `plugin-stringify-tamper-plugin`，v0.2.2 tip）：子进程 `exit status=1`
+ * （探针**自己**判了失败），但报告 `ok=true / 17 项全 pass` ⇒ **失败被吞、绿卡被采信**。
+ *
+ * ## 判据（**交叉校验**：两个独立产物互相矛盾即篡改）
+ * 探针的**退出码**与**报告内容**由两条不同的路径产生：
+ * - 退出码 = 探针内存里 `runCompleted && !syncThrew && !failureHandled && out.errors.length === 0`
+ *   （`finish()` 计算，**不经序列化**）；
+ * - 报告 = `STRINGIFY(out)` 写出的字节。
+ * 正常运行时两者**必然一致**：`ok=true` ⇒ 无失败 ⇒ 退出码 0。故
+ * 「`payload.ok === true` **且** 退出码非 0（或有终止信号）」= **内部矛盾** = 报告被篡改
+ * （或退出码被篡改）⇒ 本轮不可信、不放行。
+ *
+ * ## 为什么是最低成本且正好兜住本形态
+ * 它**不需要**任何新的带外凭据、不依赖探针进程内防线（防线本身也在同进程内），
+ * 只利用「退出码是探针自己算的、序列化是插件可写的」这一**不对称**。
+ *
+ * ⚠️ 边界（与 {@link HOST_FATAL_FIELD} 的收窄一致，不越权承诺）：能同时篡改**退出码**与报告的
+ * 插件仍可绕过本项（`process.exitCode = 0` 或替换 `process.exit`）——那属**进程级**对抗，
+ * 根治需进程隔离（见 `docs/REDO-PROPOSAL.md` 批 2）。本项与「加载期捕获引用」是**两道并集**，
+ * 不是单一不变量。
+ */
+export const PLUGIN_EXIT_CODE_MISMATCH_CHECK = 'plugin.exit_code_mismatch';
+
+/**
  * 进程级异常归属路由（**唯一事实源**，探针的进程级兜底与离线回归共用）。
  *
  * 语义与 {@link probeFailureRoute} **完全一致**（按相位、未知相位保守判插件侧），
@@ -585,6 +615,10 @@ export const PLUGIN_SIDE_CHECKS = [
   // 与 `plugin.protocol_injection` 的分工：那条判「结果行条数/通道异常」（结构不变量），
   // 本条判「有人冒用探针的输出协议」（nonce 不匹配）——两条证据链互相独立。
   'plugin.probe_result_forged',
+  // 🔴 必修-4（同族放行级假绿）：探针报告自称通过（ok=true）但进程**退出码非 0** ⇒ 内部矛盾
+  // （退出码由探针内存算、不经序列化；报告字节可被插件的序列化函数替换）⇒ 判篡改、不放行。
+  // 由**装配器**在解释报告时交叉校验（探针看不到自己的退出码，装配器才看得到）。
+  'plugin.exit_code_mismatch',
 ];
 
 /**
@@ -595,14 +629,15 @@ export const PLUGIN_SIDE_CHECKS = [
  * 为什么单独成表：`PROBE_CHECK_ORDER` 与「条件项」必须能互相推出，
  * 否则「17 项」的口径会随新增条件项悄悄变成 18 项而无人发现。
  *
- * **八项**条件检查，各占一项（**条数由本表长度决定**，文档里的「另有 N 项」由
+ * **九项**条件检查，各占一项（**条数由本表长度决定**，文档里的「另有 N 项」由
  * `tests/test_exports.mjs` [2b'''] 反推，改一处漏一处即红）：
  * 同步异常（`plugin.unexpected_exception`）/ 异步异常（`plugin.async_uncaught_exception`）/
  * 进程 exit（`plugin.early_exit`）/ `run()` 被拖住（`plugin.run_incomplete`）/
  * 不可捕获终止（`plugin.abnormal_termination`，由装配器按相位信标归因）/
  * 进程内防线被插件干预（`plugin.process_defense_tampered`）/
  * 结果通道被插件注入伪造结果（`plugin.protocol_injection`，由装配器判）/
- * 结果通道出现伪造结构化结果（`plugin.probe_result_forged`，nonce 不匹配，由装配器判）。
+ * 结果通道出现伪造结构化结果（`plugin.probe_result_forged`，nonce 不匹配，由装配器判）/
+ * 报告自称通过但探针**退出码非 0**（`plugin.exit_code_mismatch`，退出码交叉校验，由装配器判）。
  */
 export const CONDITIONAL_PROBE_CHECKS = [
   PLUGIN_PROBE_EXCEPTION_CHECK,
@@ -613,6 +648,7 @@ export const CONDITIONAL_PROBE_CHECKS = [
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
   PLUGIN_PROTOCOL_INJECTION_CHECK,
   PLUGIN_PROBE_FORGED_RESULT_CHECK,
+  PLUGIN_EXIT_CODE_MISMATCH_CHECK,
 ];
 
 /**

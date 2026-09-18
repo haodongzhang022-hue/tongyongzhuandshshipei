@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { readFileSync as readText } from 'node:fs';
 import {
   CONDITIONAL_PROBE_CHECKS,
+  PLUGIN_EXIT_CODE_MISMATCH_CHECK,
   CONTRACT_SIDE_CHECKS,
   HOST_SIDE_CHECKS,
   PLUGIN_ABNORMAL_TERMINATION_CHECK,
@@ -64,7 +65,7 @@ import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '.
 import { channelFingerprint, collectProbeResultLines, interpretProbeStdout, loadChannels, probeSpawnOptions, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
 import { randomBytes } from 'node:crypto';
 // R24/R28 的**行为级**断言（同步死循环收口）用离线探针回归台：假宿主 + 真实探针 + 真实装配器实现
-import { runOfflineProbe } from './offline-probe-harness.mjs';
+import { runOfflineProbe, runOfflineProbeWithSources } from './offline-probe-harness.mjs';
 // 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
 import { codeOnly, stripComments } from './source-scan.mjs';
 import { DRIFT_FIELDS, DRIFT_IMPACT, classifyDrift, diffReservedNames, triageUpstream } from '../src/triage/index.mjs';
@@ -1157,6 +1158,18 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
   eq('R26：落点 check 已登记进 CONDITIONAL_PROBE_CHECKS（条件项计数随之 +1）', true,
     CONDITIONAL_PROBE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
 
+
+  // 9.11g 🟡（评审复评）：装配器**不得**用裸结果标记字面量做前缀匹配 ——
+  // 裸字面量在改名时**静默失配**（标记改了、匹配处没改 ⇒ 一条结果行都收不到 ⇒ 归因退化成
+  // 「探针未输出结构化结果」），而源码守卫扫不到。唯一事实源 = PROBE_RESULT_MARKER。
+  {
+    const hostCodeForMarker = codeOnly(readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8'));
+    eq('🟡 源码守卫：装配器不写裸结果标记字面量（改用 PROBE_RESULT_MARKER，改名即静默失配）', false,
+      /__DSH_PROBE__/.test(hostCodeForMarker));
+    eq('🟡 源码守卫：collectProbeResultLines 用唯一事实源常量做前缀匹配', true,
+      /startsWith\(PROBE_RESULT_MARKER\)/.test(hostCodeForMarker));
+  }
+
   {
     const mkPayload = (ok = true) => JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok, runCompleted: true, phase: 'plugin-integration' });
     const nonce = createProbeNonce(randomBytes).value;
@@ -1422,8 +1435,8 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     ['R26', '协议注入 → 放行级假绿（结果通道被注入伪造报告）'],
     ['R27', '口径守卫同义绕过 + 只守了错的命题'],
     ['R28', '修法 A 自检判据不可判定（has()||listenerCount>0 假阳性）'],
-    // v0.2.3（评审复评 §三）：两条新活口必须留痕（「已知活口不得静默」）
-    ['R29', '全局改写（猴子补丁 JSON.stringify）→ 放行级假绿（R26 同族，逐点补不可穷尽）'],
+    // v0.2.3（评审复评）：三条新发现必须留痕（「已知活口不得静默」）
+    ['R29', '🔴 必修-4 同族假绿：JSON.stringify 未冻结 ⇒ 猴子补丁序列化函数伪造绿卡'],
     ['R30', '探针无 nonce 路径硬崩 → 甩锅上游（PROBE_RESULT_MARKER 未 import）'],
   ]) {
     eq(`口径守卫：RISKS 记录 ${id}（${label}）`, true, new RegExp(`\\|\\s*${id}\\s*\\|`).test(risks));
@@ -1433,6 +1446,7 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     ['plugin-defense-tamper-plugin.mjs', /removeAllListeners\('uncaughtException'\)/, 'R28 防线被顶替'],
     ['plugin-sync-loop-plugin.mjs', /Date\.now\(\) \+ 3000/, 'R24 同步死循环'],
     ['plugin-forged-result-plugin.mjs', /__DSH_PROBE__/, 'R26 侧信道（nonce 伪造绿卡）'],
+    ['plugin-stringify-tamper-plugin.mjs', /JSON\.stringify = function/, '🔴 必修-4 同族假绿（猴子补丁序列化函数）'],
   ]) {
     const src = readText(path.join(ROOT, 'tests/fixtures', fixture), 'utf8');
     eq(`口径守卫：${label} 夹具存在且真的复现该形态`, true, marker.test(src));
@@ -1624,6 +1638,119 @@ console.log('  [14] 信任边界显式前提 + 结构性重做一页方案');
     /probeSpawnOptions\(/.test(readText(path.join(ROOT, 'tests/offline-probe-harness.mjs'), 'utf8')));
   eq('R24：有界占死夹具存在（供反向反证：SIGTERM 下超时形同虚设）', true,
     /BUSY_MS/.test(readText(path.join(ROOT, 'tests/fixtures/plugin-busy-loop-hang-plugin.mjs'), 'utf8')));
+}
+
+// ---- 9.13. 🔴 必修-4：同族**放行级假绿**（猴子补丁 JSON.stringify 伪造绿卡） ----
+// 为什么单列（评审复评 🔴 必修-4）：R26 的 nonce 侧信道挡的是「反读凭据 + 冒用输出协议」，
+// 但探针与插件**同进程** ⇒ 插件还能改**序列化函数本身**：把 checks 全改 pass、清空
+// errors/hostFatal、把 ok 置真。那时 nonce 前缀**照样匹配**（前缀不经过序列化）⇒ 一张完美绿卡。
+// 本仓实测（v0.2.2 tip，夹具 plugin-stringify-tamper-plugin）：子进程 exit status=1（探针自己判了失败）
+// 而报告 ok=true / 17 项全 pass ⇒ **失败被吞、绿卡被采信**。与 🔴-3 **同族**（同进程 + 共用输出面）。
+//
+// 两条收口（**并集**，各自独立可回退即红）：
+//   A. **探针加载期捕获引用**：\`const STRINGIFY = JSON.stringify\`（在任何插件代码之前）且**只用**捕获值；
+//   B. **装配器退出码交叉**：报告自称 ok=true 而探针进程退出码非 0 ⇒ 内部矛盾 ⇒ 判篡改（不放行）。
+// 两个独立产物（退出码由探针内存算出、不经序列化；报告字节可被替换）互相矛盾即证据。
+console.log('  [9.13] 🔴 必修-4 同族假绿：猴子补丁 JSON.stringify（加载期捕获 + 退出码交叉）');
+{
+  const probeSrcForFrozen = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+  const probeCodeFrozen = codeOnly(probeSrcForFrozen);
+  // A-1 源码守卫：加载期捕获（且必须**早于**首次使用——TDZ 顺序是实测踩过的坑）
+  eq('🔴-4 源码守卫：探针在加载期捕获 JSON.stringify 引用（const STRINGIFY = JSON.stringify）', true,
+    /const STRINGIFY = JSON\.stringify;/.test(probeCodeFrozen));
+  eq('🔴-4 源码守卫：捕获点早于首次使用（TDZ：捕获块必须在 expectedTools 解析之前）', true,
+    probeSrcForFrozen.indexOf('const STRINGIFY = JSON.stringify;') < probeSrcForFrozen.indexOf('const expectedTools = PARSE('));
+  // A-2 源码守卫：写出报告的路径**只用捕获值**（回退成裸 JSON.stringify 即红——那正是本形态的成因）
+  eq('🔴-4 源码守卫：结果序列化只用捕获值（回退成裸 JSON.stringify 即红）', true,
+    /const payload = `\$\{resultPrefix\}\$\{STRINGIFY\(out\)\}\\n`;/.test(probeSrcForFrozen));
+  eq('🔴-4 源码守卫：探针代码里不再有裸 JSON.stringify(out)（别名回退即红）', false,
+    /JSON\.stringify\(out\)/.test(probeCodeFrozen));
+  // B-1 源码守卫：装配器无条件记录 probeExit（旧实现只在 error||signal 时赋值 ⇒ 正常非零退出不记录）
+  const hostSrcForCross = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
+  eq('🔴-4 源码守卫：装配器**无条件**记录 probeExit（不再只在 error||signal 时赋值）', true,
+    /result\.probeExit = \{ status: probeRun\.status \?\? null, signal: probeRun\.signal \?\? null \};/.test(hostSrcForCross));
+  eq('🔴-4 源码守卫：装配器做退出码交叉校验（ok=true + 退出码非 0 ⇒ 判篡改）', true,
+    /payload\.ok === true && exitAbnormal/.test(codeOnly(hostSrcForCross)));
+  eq('🔴-4 落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
+    PLUGIN_SIDE_CHECKS.includes(PLUGIN_EXIT_CODE_MISMATCH_CHECK));
+  eq('🔴-4 落点 check 已登记进 CONDITIONAL_PROBE_CHECKS（条件项计数随之 +1）', true,
+    CONDITIONAL_PROBE_CHECKS.includes(PLUGIN_EXIT_CODE_MISMATCH_CHECK));
+
+  // 行为级 A：真协议跑夹具 ⇒ 必须 RED / 判插件侧 / 真缺陷仍被抓（**不得**被绿卡掩盖）
+  {
+    const r = runOfflineProbe({
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-stringify-tamper-plugin.mjs'),
+      expectedTools: ['demo_echo'],
+    });
+    const failed = r.result.checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-4 行为（加载期捕获）：补丁不生效 ⇒ 真缺陷 registry.exact 仍被判失败', true, failed.includes('registry.exact'));
+    eq('🔴-4 行为：归因 PLUGIN_REGRESSION（不甩锅上游）', 'PLUGIN_REGRESSION', r.attribution);
+    eq('🔴-4 行为：hostFatal 为空（插件侧错误不进判据字段）', 0, r.result.hostFatal.length);
+    eq('🔴-4 行为：**不得**判通过（ok=false）', false, r.result.ok === true);
+    eq('🔴-4 行为：探针自己判了失败（退出码非 0，且被装配器记录下来）', 1, r.exit.status);
+    eq('🔴-4 行为：补丁形态下**不**出现退出码矛盾（探针报告本身就是真的）', false,
+      failed.includes(PLUGIN_EXIT_CODE_MISMATCH_CHECK));
+  }
+
+  // 行为级 B（**退出码交叉**的独立证据）：合成「报告自称 ok=true + 退出码非 0」⇒ 必须判篡改
+  {
+    const goodPayload = { checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true };
+    const mk = (probeExit) => {
+      const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly', runCompleted: false, probeExit };
+      interpretProbeStdout(r, `__DSH_PROBE__${JSON.stringify(goodPayload)}\n`);
+      return r;
+    };
+    const mism = mk({ status: 1, signal: null });
+    eq('🔴-4 退出码交叉：ok=true + 退出码 1 ⇒ 落 plugin.exit_code_mismatch', PLUGIN_EXIT_CODE_MISMATCH_CHECK, mism.checks.at(-1)?.name);
+    eq('🔴-4 退出码交叉：矛盾 ⇒ ok=false（不放行）', false, mism.ok);
+    eq('🔴-4 退出码交叉：矛盾 ⇒ hostFatal 仍为空（不甩锅上游）', 0, mism.hostFatal.length);
+    eq('🔴-4 退出码交叉：矛盾 ⇒ 归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION', attributeFailure(mism, channel, 'dev'));
+    eq('🔴-4 退出码交叉：信号终止（SIGKILL）+ ok=true 同样判篡改', PLUGIN_EXIT_CODE_MISMATCH_CHECK,
+      mk({ status: null, signal: 'SIGKILL' }).checks.at(-1)?.name);
+    // 反向护栏（防过度修正）：退出码 0 / 无 probeExit 时**不得**误判
+    eq('🔴-4 反向护栏：退出码 0 + ok=true 不误判（正常路径零影响）', false,
+      mk({ status: 0, signal: null }).checks.some((c) => c.name === PLUGIN_EXIT_CODE_MISMATCH_CHECK));
+    eq('🔴-4 反向护栏：无 probeExit（老装配器 / 合成输入）不误判（保守，不制造假红）', false,
+      mk(null).checks.some((c) => c.name === PLUGIN_EXIT_CODE_MISMATCH_CHECK));
+    eq('🔴-4 反向护栏：退出码 0 时 ok=true 仍成立（不误伤正常通过）', true, mk({ status: 0, signal: null }).ok);
+  }
+
+  // 变异回退（**回退即红**，两条防线各自独立成立）
+  {
+    const plugin = path.join(ROOT, 'tests/fixtures', 'plugin-stringify-tamper-plugin.mjs');
+    // A 变异：把捕获值改回「每次取全局」（= 评审点名的回退形态）⇒ 夹具的报告被替换；
+    // 此时**退出码交叉**必须兜住（判 plugin.exit_code_mismatch，仍 RED、不放行）。
+    const mutatedA = probeSrcForFrozen
+      .replace('const STRINGIFY = JSON.stringify;', 'const STRINGIFY = (v) => JSON.stringify(v);')
+      .replace('const PARSE = JSON.parse;', 'const PARSE = (v) => JSON.parse(v);');
+    eq('🔴-4 变异自证：A 变异（退回全局序列化）确实改动了源码', true, mutatedA !== probeSrcForFrozen);
+    const rA = await runOfflineProbeWithSources({ probeSource: mutatedA, pluginPath: plugin, expectedTools: ['demo_echo'] });
+    const failedA = rA.result.checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-4 变异回退：A 回退后**不得**假绿（ok=false）', false, rA.result.ok === true);
+    eq('🔴-4 变异回退：A 回退后由**退出码交叉**兜住（plugin.exit_code_mismatch）', true,
+      failedA.includes(PLUGIN_EXIT_CODE_MISMATCH_CHECK));
+    eq('🔴-4 变异回退：A 回退后归因仍 PLUGIN_REGRESSION（不放行）', 'PLUGIN_REGRESSION', rA.attribution);
+    // B 变异：把装配器的交叉校验关掉（探针侧捕获仍在）⇒ 夹具的补丁不生效 ⇒ 真缺陷仍被判出。
+    const mutatedHostB = hostSrcForCross.replace('if (payload.ok === true && exitAbnormal) {', 'if (false && payload.ok === true && exitAbnormal) {');
+    eq('🔴-4 变异自证：B 变异（关掉退出码交叉）确实改动了源码', true, mutatedHostB !== hostSrcForCross);
+    const rB = await runOfflineProbeWithSources({ pluginPath: plugin, expectedTools: ['demo_echo'], hostSource: mutatedHostB });
+    const failedB = rB.result.checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-4 变异回退：B 回退后仍**不得**假绿（探针侧加载期捕获独立兜住）', false, rB.result.ok === true);
+    eq('🔴-4 变异回退：B 回退后真缺陷 registry.exact 仍被判失败', true, failedB.includes('registry.exact'));
+  }
+
+  // 夹具自检：新夹具必须真的复现该形态（否则上面的行为断言空转）
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-stringify-tamper-plugin.mjs'), 'utf8');
+    eq('🔴-4 夹具：真的猴子补丁 JSON.stringify（否则断言空转）', true, /JSON\.stringify = function/.test(src));
+    eq('🔴-4 夹具：补丁把 checks 全改 pass 且把 ok / runCompleted 置真（伪造绿卡）', true,
+      /status: 'pass'/.test(src) && /ok: true/.test(src) && /runCompleted: true/.test(src));
+    eq('🔴-4 夹具：真缺陷（多注册工具 ⇒ registry.exact 必 fail）', true, /demo_extra/.test(src));
+    eq('🔴-4 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+    eq('🔴-4 夹具：声明期望的工具清单（供闸门/回归取用）', true, /export const expectedTools = \['demo_echo'\]/.test(src));
+    eq('🔴-4 夹具：自述口径不越权（残留边界指向进程隔离）', true,
+      src.includes('进程隔离') && src.includes('REDO-PROPOSAL'));
+  }
 }
 
 console.log();

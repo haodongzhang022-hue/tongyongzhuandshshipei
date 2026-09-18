@@ -24,7 +24,7 @@ import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { interpretProbeStdout, probeSpawnOptions } from '../src/harness/host.mjs';
 import { PROBE_PHASE, createProbeNonce } from '../src/harness/contract.mjs';
@@ -81,6 +81,84 @@ export default function ToolRuntime(ctx) { ctx.provide('tools', new FakeToolRunt
 };
 
 /**
+ * 造一个最小假宿主目录（三个包）并把探针 + 契约拷贝进去。
+ *
+ * 抽出来的理由：{@link runOfflineProbe} 与 {@link runOfflineProbeWithSources} 共用同一份
+ * 「假宿主面 + 拷贝方式」，避免两处各自漂移（回归台与生产路径不同构 = 防线留在 CI 之外）。
+ *
+ * @param {string} work 工作目录
+ * @param {string} [probeSource] 探针源码（缺省 = 仓库里的 `probe-template.mjs`）
+ * @returns {void}
+ */
+function materializeWorkDir(work, probeSource) {
+  for (const [name, source] of Object.entries(FAKE_HOST)) {
+    const dir = path.join(work, 'node_modules', name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version: '0.0.0-fake', type: 'module', main: 'index.mjs', exports: { '.': './index.mjs' } }));
+    writeFileSync(path.join(dir, 'index.mjs'), source);
+  }
+  if (typeof probeSource === 'string') writeFileSync(path.join(work, 'probe.mjs'), probeSource);
+  else cpSync(path.join(ROOT, 'src', 'harness', 'probe-template.mjs'), path.join(work, 'probe.mjs'));
+  cpSync(path.join(ROOT, 'src', 'harness', 'contract.mjs'), path.join(work, 'contract.mjs'));
+}
+
+/**
+ * 跑一次离线探针，**允许替换探针 / 装配器的源码**（供「变异回退即红」的反证使用）。
+ *
+ * ## 为什么需要它（🔴 必修-4 的验收要件）
+ * 评审对同族假绿的收口要求是「**回退即红**」——即：把修法改回去，闸门/回归必须**立刻**变红。
+ * 只断言「修法在」是**源码守卫**（必要但不充分）：它证明不了「改回去真的会被抓到」。
+ * 本函数把变异源码真的**跑起来**（探针源码写进临时目录；装配器源码拷进独立目录后
+ * `import()` 同一份实现），于是「变异 ⇒ 行为变化」是可执行断言，而不是注释里的声称。
+ *
+ * 装配器侧为什么能替换：`host.mjs` 只 import `./contract.mjs` 与 node 内建 ⇒ 把两者拷进
+ * 同一临时目录即可动态 import 变异版本（**不**改仓库文件、**不**污染其它用例）。
+ *
+ * @param {object} options 选项（同 {@link runOfflineProbe}，另加下面两项）
+ * @param {string} [options.probeSource] 探针源码（变异版本；缺省 = 仓库实现）
+ * @param {string} [options.hostSource] 装配器源码（变异版本；缺省 = 仓库实现）
+ * @returns {Promise<{result: object, attribution: string, reasons: string[], exit: object}>} 同 {@link runOfflineProbe}
+ */
+export async function runOfflineProbeWithSources(options) {
+  const { pluginPath, expectedTools = [], watchdogMs, timeoutMs = 30_000, probeSource, hostSource } = options;
+  const startedAt = Date.now();
+  const work = mkdtempSync(path.join(tmpdir(), 'dsh-offline-probe-'));
+  const hostDir = mkdtempSync(path.join(tmpdir(), 'dsh-offline-host-'));
+  try {
+    materializeWorkDir(work, probeSource);
+    // 装配器：默认用仓库实现；给了 hostSource 就拷一份变异版（连带 contract.mjs）后动态 import。
+    let host = { interpretProbeStdout, probeSpawnOptions };
+    if (typeof hostSource === 'string') {
+      writeFileSync(path.join(hostDir, 'host.mjs'), hostSource);
+      cpSync(path.join(ROOT, 'src', 'harness', 'contract.mjs'), path.join(hostDir, 'contract.mjs'));
+      host = await import(pathToFileURL(path.join(hostDir, 'host.mjs')).href);
+    }
+    const nonce = createProbeNonce(randomBytes);
+    const probeOptions = host.probeSpawnOptions({ hubRoot: ROOT, pluginPath, expectedTools, timeoutMs, nonce });
+    const probeRun = spawnSync('node', probeOptions.args, {
+      ...probeOptions,
+      cwd: work,
+      stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
+    });
+    const result = {
+      channel: 'stable', ok: false, profile: null, checks: [], errors: [], hostFatal: [],
+      contract: {}, probes: [], runCompleted: false, probeExit: null, phase: PROBE_PHASE.HOST_ASSEMBLY,
+      install: 'fake-host', cacheHit: false, durationMs: 0,
+    };
+    result.probeExit = { status: probeRun.status ?? null, signal: probeRun.signal ?? null };
+    result.durationMs = Date.now() - startedAt;
+    host.interpretProbeStdout(result, `${probeRun.stdout ?? ''}`, { resultFd: `${probeRun.output?.[3] ?? ''}`, nonce: nonce.value });
+    const channel = loadChannels(ROOT).channels.stable;
+    const detail = attributionDetail(result, channel, 'stable');
+    return { result, attribution: detail.attribution, reasons: detail.reasons, exit: result.probeExit, stdout: `${probeRun.stdout ?? ''}`, resultFd: `${probeRun.output?.[3] ?? ''}`, stderr: `${probeRun.stderr ?? ''}` };
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+    rmSync(hostDir, { recursive: true, force: true });
+  }
+}
+
+/**
  * 跑一次**离线**探针。
  *
  * @param {object} options 选项
@@ -104,16 +182,8 @@ export function runOfflineProbe(options) {
   const startedAt = Date.now();
   const work = mkdtempSync(path.join(tmpdir(), 'dsh-offline-probe-'));
   try {
-    // 1. 造假宿主
-    for (const [name, source] of Object.entries(FAKE_HOST)) {
-      const dir = path.join(work, 'node_modules', name);
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version: '0.0.0-fake', type: 'module', main: 'index.mjs', exports: { '.': './index.mjs' } }));
-      writeFileSync(path.join(dir, 'index.mjs'), source);
-    }
-    // 2. 拷探针（与装配器同一份拷贝方式：probe.mjs + contract.mjs）
-    cpSync(path.join(ROOT, 'src', 'harness', 'probe-template.mjs'), path.join(work, 'probe.mjs'));
-    cpSync(path.join(ROOT, 'src', 'harness', 'contract.mjs'), path.join(work, 'contract.mjs'));
+    // 1+2. 造假宿主 + 拷探针（与装配器同一份拷贝方式：probe.mjs + contract.mjs）
+    materializeWorkDir(work);
 
     // 3. 跑探针（子进程；非零退出是预期路径之一，stdout / 结果通道仍要拿回来）
     //

@@ -35,6 +35,10 @@
  *    更糟的是「顺手加个 exit 钩子但**不带完成位**」→ 剩余检查是 `skip` 不是 `fail` → **假绿**。
  *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.early_exit` /
  *    `plugin.run_incomplete`、`runCompleted = false`（**未跑完绝不给 ok**）、已跑完的 pass 项保留。
+ * 9e. **🔴 必修-4（同族放行级假绿）**：插件猴子补丁 `JSON.stringify` 把失败项改成 pass、清空
+ *    `errors` / `hostFatal`、把 `ok` 置真 ⇒ 报告字节被替换（nonce 前缀照样匹配）。收口 =
+ *    探针**加载期捕获引用**（修法 A）+ 装配器**退出码交叉**（修法 B，`plugin.exit_code_mismatch`）。
+ *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、真缺陷 `registry.exact` 仍被判出。
  * 9d. **不可捕获终止（SIGKILL）**：探针来不及写报告，装配器按**相位信标**归因 →
  *    `plugin.abnormal_termination`（插件侧）/ `hostFatal = []`；无信标则仍走 `hostFatal[]`（真漂移不丢）。
  *
@@ -406,6 +410,25 @@ try {
   // 为什么单列（评审复评 R24）：默认 `timeoutMs=600s` 下 3s 同步循环会正常跑完（那本身不是缺陷），
   // 本形态只在**有界 timeout** 下成立 ⇒ 用 `runHostProbe({ timeoutMs: 1000 })` 直接断言：
   // 收口时间、`probeExit.signal`、归因落点、`hostFatal` 为空。
+  // ---- 11g. 🔴 必修-4（真宿主）：猴子补丁 JSON.stringify 伪造绿卡 ----
+  // 为什么必须真宿主也跑：修法 A 的「加载期捕获」依赖**探针模块加载顺序**（捕获必须早于插件
+  // import / apply），而离线回归台用的是**同一个探针文件**但假宿主——真宿主能覆盖「真 ToolRuntime
+  // 装配下的时机差异」；修法 B（退出码交叉）依赖装配器**真的** spawn 子进程并读到退出码。
+  // 两条都是**放行级假绿**，必须双跑（离线 [9.13] + 本段）。
+  console.log('  [8g] 🔴 必修-4：猴子补丁 JSON.stringify 伪造绿卡（加载期捕获 + 退出码交叉，真宿主）');
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-stringify-tamper-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-4（真宿主）：归因 PLUGIN_REGRESSION（不甩锅上游）', 'PLUGIN_REGRESSION', report.attribution);
+    eq('🔴-4（真宿主）：verdict=RED（**绝不放行**）', 'RED', report.summary?.verdict);
+    eq('🔴-4（真宿主）：hostFatal 为空（插件侧错误不进判据字段）', 0, (report.hostFatal ?? []).length);
+    eq('🔴-4（真宿主）：真缺陷 registry.exact 仍被判失败（绿卡没掩盖它）', true, failed.includes('registry.exact'));
+    eq('🔴-4（真宿主）：ok 不得为真（假绿防线）', false, report.ok === true);
+    eq('🔴-4（真宿主）：探针退出实况被**无条件**记录（退出码 1 ⇒ 交叉校验可用）', 1, report.probeExit?.status ?? null);
+    eq('🔴-4（真宿主）：报告为真 ⇒ 不出现退出码矛盾（防线不误伤真报告）', false,
+      failed.includes('plugin.exit_code_mismatch'));
+  }
+
   console.log('  [8f] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');
   {
     const registry = loadChannels(ROOT);
