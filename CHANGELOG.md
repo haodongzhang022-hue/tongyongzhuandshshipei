@@ -1,5 +1,35 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.1.9b · 口径收窄 + 风险显式化 + 口径守卫（本轮，**非行为改动**）
+
+> 起因：评审复评 @ `c8965b9` 的裁定——**最高优先项不是写代码，是收窄文档**：
+> 中台的核心价值主张是「归因可信」，**文档撒谎的代价 > 代码有洞**。
+> 复评实测 **H1 放行级假绿**（`setUncaughtExceptionCaptureCallback` 静音探针防线 → `GREEN` 放行）
+> 直接推翻 v0.1.7 / v0.1.8 的对外主张「插件侧错误**永远**不进 `hostFatal[]`」。
+> 本补丁**只改口径与风险记录 + 加守卫**，**不动行为**（代码修复留 v0.1.9 修法 A/B/D）。
+
+| # | 处置 | 落点 |
+|---|---|---|
+| 1 | **不变量措辞收窄**：`插件侧错误**永远**不进 hostFatal[]` → `**在探针进程内防线未被插件干预的前提下**，插件侧错误不进 hostFatal[]`（**不得**再写「永远 / 永不」） | `src/harness/contract.mjs`（`HOST_FATAL_FIELD` JSDoc，唯一事实源）· `docs/RISKS.md` R19 · `docs/ARCHITECTURE.md` §4.2 ③ · `docs/ADAPTER_GUIDE.md` · `README.md` · `.cnb.yml` 注释 · 3 份夹具注释 · `tests/test_e2e_regression.mjs` · `CHANGELOG`（v0.1.7/v0.1.9 历史口径**就地更正**，不删历史） |
+| 2 | **补 4 条风险行（含本轮新实测）**：R22 **H1 放行级假绿**（HIGH）· R23 探针进程内防线可被插件单方面撤销 / 静音 · R24 **宿主 `execFileSync(timeout)` 对「同步死循环」插件失效**（本轮新发现，见下）· R25「排空窗口之外的延迟抛错 → 该插件判 GREEN」的**后果**（复评 §六 要求写明） | `docs/RISKS.md` |
+| 3 | **新增口径守卫**（`tests/test_attribution.mjs` **[11]**，19 条）：8 份文档 / 源码 / 闸门脚本出现「插件侧错误永远 / 永不进 hostFatal」**绝对口径**即**红**（说明性更正行豁免，但必须同时引用收窄前提）；并断言 RISKS 记录 R22–R25、H1 夹具存在且自述指向 v0.1.9 | 离线回归 [11] |
+| 4 | **固化 H1 复现夹具** `tests/fixtures/plugin-capture-callback-plugin.mjs`（一行 `setUncaughtExceptionCaptureCallback` + 后台抛错）——**当前形态判 GREEN**，作为 v0.1.9 修法 A 的验收资产；**不进 CI 闸门**（进了就是红，那正是 H1 未修的证明） | 夹具 + [11] 三条断言 |
+
+**本轮新发现（复评 §二 之外，已实测）**：
+
+- **[MEDIUM] R24 · 宿主 `execFileSync(timeout)` 对「同步死循环」插件失效**：探针的看门狗与信号处理器都是**事件循环**上的回调，插件 `apply()` 同步死循环占满事件循环后**两者都不执行**；而探针为出口③装了 `SIGTERM`/`SIGINT` 处理器 → Node 默认终止行为被禁用 → **宿主杀不掉探针**。实测：`apply` 同步循环 30s + `runHostProbe(timeoutMs=5000)` → 实际耗时 **30.3s**（不是 5s），且 `hostFatal` 非空 / `checks=1`；`while(true)` 形态下宿主**永久挂死**（外层 45s timeout 命中）。
+- **R25 边界实测**：健康插件 + `setTimeout` 抛错 —— 30 / 100 / 150 / 200 / 250 ms → `RED`（`plugin.async_uncaught_exception`，`hostFatal=0`）；**300 ms / 2000 ms → `GREEN / PASS / 17 项`**（该插件判**通过**）。故**不得**按「50ms 窗口」字面承诺边界。
+- **H1 复核（当前 tip 仍复现）**：`plugin-capture-callback-plugin` 连跑 3 次 → `GREEN / PASS / 17 项 / hostFatal=0 / completed=true`；H1 的 SIGKILL 变体（captureCallback + `kill -9`）仍被相位信标正确归因插件侧（`plugin.abnormal_termination`）——**说明信标路径不受 H1 影响，H1 只影响出口②**。
+- **H3 复核（当前 tip）**：伪造 marker（含伪造 `runCompleted: true` + 17 项全绿）+ 真违规 → `verdict=UNKNOWN`（不放行），但**归因未落到插件侧**（评审 H3 的「协议注入」仍在：装配器 `find(startsWith)` 取第一条）。**既存，v0.1.9 修法 D**。
+
+**自测（全绿）**：离线单测 103/103 · 归因离线回归 **296/296**（[11] 新增 19 条）· 发布面自检 33/33 · 真宿主端到端回归 124/124 · 闸门 `tests/gate_plugin_side.sh` 8/8。
+
+**范围口径（按评审 §四 表）**：
+
+- v0.1.9（本版）：可合并，**不宣称清零**；措辞已收窄。
+- v0.1.9 后续：**H1（放行级假绿）→ H2 → H3 → 🟡-1 正则盲区**；**H1 未修完，不变量不得对外宣称**。
+- 设 **CP2 暂停点**：修完由评审复评后才可恢复「插件侧错误永不进该字段」的措辞。
+
 ## v0.1.9 — 🔴 必修-1/2/3 收口：**完成位** + 进程 exit 出口 + `run()` 被拖住（四条出口逐条闭合）
 
 > 承接 v0.1.8（异步异常兜底）。评审 @ `c8965b9` 判 `disposition = fix_bug`（**第 6 次回转 = 硬上限**）：
@@ -28,7 +58,7 @@
 
 | # | 问题 | 处置 |
 |---|---|---|
-| 🟡-1 | **口径自订不变量与实现不符**：`contract.mjs` / `docs/ADAPTER_GUIDE.md` 写「插件侧错误**永不**进 `hostFatal[]`」，但探针**未**覆盖全部退出路径（③④ 未闭合）⇒ 文案在说谎 | 二选一 → **选「覆盖全路径 → 保留」**：四条可捕获出口全部闭合 + 不可捕获边界显式声明并给证据化归因。文案**收窄为准确口径**（「插件侧错误**不得**进该字段；探针**可捕获**的全部逃逸形态都落插件侧 check，唯一例外是不可捕获的进程级终止，按信标归因」），`contract.mjs` 与指南同步 |
+| 🟡-1 | **口径自订不变量与实现不符**：`contract.mjs` / `docs/ADAPTER_GUIDE.md` 写「插件侧错误**永不**进 `hostFatal[]`」，但探针**未**覆盖全部退出路径（③④ 未闭合）⇒ 文案在说谎 | 二选一 → **选「覆盖全路径 → 保留」**：四条可捕获出口全部闭合 + 不可捕获边界显式声明并给证据化归因。文案**收窄为准确口径**（「插件侧错误**不得**进该字段；探针**可捕获**的全部逃逸形态都落插件侧 check，唯一例外是不可捕获的进程级终止，按信标归因」），`contract.mjs` 与指南同步。<br>⚠️ **v0.1.9b 二次收窄（评审复评 H1）**：上句仍**不完整**——还有一类例外是「插件**主动干预**探针进程内防线」（`setUncaughtExceptionCaptureCallback` 静音监听器 / `removeAllListeners` 撤销），此时整轮判 GREEN **放行**。准确口径 =「**在探针进程内防线未被插件干预的前提下**」；**不得**写「永远 / 永不」。见 `docs/RISKS.md` R22/R23 |
 
 ### 🟢 优化（顺手）
 
@@ -57,10 +87,11 @@
 ### 测试项数
 
 - `tests/test_offline.sh`：85 → **103 项**（新增 [16] 四条出口 18 条；[14] 改派生不增减）
-- `tests/test_attribution.mjs`：209 → **277 项**（新增 [9.9] 四条出口 + 完成位 65 条）
+- `tests/test_attribution.mjs`：209 → 277 项（新增 [9.9] 四条出口 + 完成位 65 条）→ **296 项**（v0.1.9b 新增 [11] 口径守卫 19 条）
 - `tests/test_e2e_regression.mjs`：92 → **124 项**（新增 [8c] 三条出口 × 10 + 假绿反证 2）
 - `tests/test_exports.mjs`：28 → **33 项**（新增 [2b'''] 文档条件项计数 = 事实源长度 5 条）
 - 新增夹具：`tests/fixtures/plugin-exit-plugin.mjs`、`tests/fixtures/plugin-hang-plugin.mjs`、`tests/fixtures/plugin-sigkill-plugin.mjs`
+- v0.1.9b 新增夹具：`tests/fixtures/plugin-capture-callback-plugin.mjs`（H1 复现；**当前判 GREEN**，v0.1.9 修法 A 后必须 RED；不进 CI 闸门）
 - 新增脚本：`tests/gate_plugin_side.sh`（闸门唯一事实源）、`tests/offline-probe-harness.mjs`（离线探针回归台）
 - `tests/test_hub.sh`：新增第 4b 步（插件侧闸门，含防过度修正）
 - `.cnb.yml`：push / PR 的 `plugin-error-not-host-signal` 改为**共用** `tests/gate_plugin_side.sh`（夹具 4 → 7 份 + 健康插件防过度修正断言）
@@ -134,6 +165,9 @@
 
 ## v0.1.7 — 🔴-D 收口：`hostFatal[]` 写入端分相位（插件侧异常永不进判据字段）+ P2-9 / P2-10
 
+> ⚠️ **v0.1.9b 更正**：标题里的「永不进判据字段」是**当时的自述**，现已被复评实测推翻（H1 放行级假绿）。
+> 当前有效口径见 v0.1.9b 小节与 `docs/RISKS.md` R19/R22/R23。
+
 > 承接 v0.1.5（复测清单闭环）/ v0.1.6（文档守卫加固）。
 > 评审 @ `f995979` 判 `disposition = fix_bug`：🔴-D 未清零——同一失效族**仍有活口**，
 > 但活口从「判据读取端」搬到了「**写入端**」。
@@ -142,7 +176,7 @@
 
 | # | 问题 | 修复 | 回归防线 |
 |---|---|---|---|
-| 🔴-D | **探针顶层兜底把插件侧异常写进 `hostFatal[]`**（判据唯一事实字段）。探针有两条「读插件侧数据」的路径不在 try 内：`tools.schemas().map(...)`（第 6 段）与 `definitions.map((d) => d?.name)`（第 11 段）。插件写错代码（类实例未初始化字段 / 抛错 getter）→ 异常逃出 `run()` → 顶层 `catch` 一律 `pushHostFatal()` → 判据 1 命中 → `UPSTREAM_DRIFT`/AMBER，且判据 1 **优先于**判据 5 → 插件侧已失败的 check 被整条盖掉。违反本 PR 自订不变量「插件侧错误**永远**不进该字段」 | ① **相位化兜底**：探针声明执行相位（`host-assembly` / `plugin-integration`），顶层兜底按相位归因——宿主装配相位 → `hostFatal[]`，插件集成相位 → **插件侧 check** `plugin.unexpected_exception`（已登记 `PLUGIN_SIDE_CHECKS`）；未知相位**保守判插件侧**；② **插件数据读取加护栏**：`tools.schemas()` → `registry.exact`、`definitions.map()` → `guard.reserved_rejected`（异常均落插件侧 check，并 `skipAll` 后续未验项）；③ 归属路由唯一事实源 `contract.mjs` 的 `PROBE_PHASE` / `probeFailureRoute()` / `recordProbeException()`（探针与离线回归共用同一份）；④ 相位随报告透出（`probePhase`），排障看得见异常归属依据 | **离线** [9] 20 条（相位路由 / 写入端不变量 / 反向护栏 / 源码守卫）；**真宿主** [8] 18 条 ×2 夹具（`plugin-side-throw-plugin.mjs` / `plugin-registry-throw-plugin.mjs` → `PLUGIN_REGRESSION`/RED **且 `hostFatal.length === 0`**、`hostFatal` 不含夹具路径与 `at ` 帧、插件侧 stack 仍留在 `errors` 日志）；**反向** 真宿主 [9] 3 条（离线缺缓存仍判漂移、`hostFatal` 非空、`probePhase=host-assembly`） |
+| 🔴-D | **探针顶层兜底把插件侧异常写进 `hostFatal[]`**（判据唯一事实字段）。探针有两条「读插件侧数据」的路径不在 try 内：`tools.schemas().map(...)`（第 6 段）与 `definitions.map((d) => d?.name)`（第 11 段）。插件写错代码（类实例未初始化字段 / 抛错 getter）→ 异常逃出 `run()` → 顶层 `catch` 一律 `pushHostFatal()` → 判据 1 命中 → `UPSTREAM_DRIFT`/AMBER，且判据 1 **优先于**判据 5 → 插件侧已失败的 check 被整条盖掉。违反本 PR 自订不变量「插件侧错误**永远**不进该字段」（⚠️ v0.1.9b 更正：绝对口径不成立，已收窄） | ① **相位化兜底**：探针声明执行相位（`host-assembly` / `plugin-integration`），顶层兜底按相位归因——宿主装配相位 → `hostFatal[]`，插件集成相位 → **插件侧 check** `plugin.unexpected_exception`（已登记 `PLUGIN_SIDE_CHECKS`）；未知相位**保守判插件侧**；② **插件数据读取加护栏**：`tools.schemas()` → `registry.exact`、`definitions.map()` → `guard.reserved_rejected`（异常均落插件侧 check，并 `skipAll` 后续未验项）；③ 归属路由唯一事实源 `contract.mjs` 的 `PROBE_PHASE` / `probeFailureRoute()` / `recordProbeException()`（探针与离线回归共用同一份）；④ 相位随报告透出（`probePhase`），排障看得见异常归属依据 | **离线** [9] 20 条（相位路由 / 写入端不变量 / 反向护栏 / 源码守卫）；**真宿主** [8] 18 条 ×2 夹具（`plugin-side-throw-plugin.mjs` / `plugin-registry-throw-plugin.mjs` → `PLUGIN_REGRESSION`/RED **且 `hostFatal.length === 0`**、`hostFatal` 不含夹具路径与 `at ` 帧、插件侧 stack 仍留在 `errors` 日志）；**反向** 真宿主 [9] 3 条（离线缺缓存仍判漂移、`hostFatal` 非空、`probePhase=host-assembly`） |
 
 ### 🟡 建议（同批修）
 

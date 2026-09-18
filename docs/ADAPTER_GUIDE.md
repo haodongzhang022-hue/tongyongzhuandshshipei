@@ -224,6 +224,12 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 `ok` 必须同时要求「跑完」与「无失败」，否则出口 ③ 的中途报告会**假绿**
 （`apply()` 里 `process.exit(0)` → 剩余检查是 `skip` 不是 `fail` → 看起来「全绿」，比 AMBER 更危险）。
 
+**口径前提（v0.1.9b 收窄，评审复评 H1）**：上表「插件侧一律落 check」以「探针进程内防线**有效**」为前提。
+插件可**单方面关闭**该防线——`process.setUncaughtExceptionCaptureCallback()` **停用** `uncaughtException`
+监听器（Node 语义）、`removeAllListeners('uncaughtException')` 直接撤销。实测（一行夹具）：装了
+captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收尾 → 整轮 **GREEN / PASS / 17 项**（**放行级假绿**）。
+故**不得**把该不变量写成「永远 / 永不」绝对口径。见 `docs/RISKS.md` R22/R23（v0.1.9 修法 A）。
+
 **边界（显式声明，不静默）**：
 1. **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort` / stdout 被破坏）：探针来不及写报告。
    装配器按**相位信标** `__DSH_PROBE_PHASE__` 归因——有信标（插件代码运行期间）→ 插件侧 check

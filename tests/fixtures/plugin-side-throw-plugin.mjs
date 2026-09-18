@@ -6,7 +6,7 @@
  *
  * 期望行为（🔴-D 修复后）：
  * - 归因 `PLUGIN_REGRESSION`（插件 bug，不是上游变了），`verdict = RED`（不放行）；
- * - `hostFatal[]` **必须为空**（插件侧错误永远不进判据字段——`contract.mjs` 的不变量）；
+ * - `hostFatal[]` **必须为空**（插件侧错误不进判据字段——`contract.mjs` 的不变量，**前提：探针进程内防线未被插件干预**）；
  * - 失败项必须是**插件侧 check**（`guard.reserved_rejected` / `registry.exact` /
  *   `plugin.unexpected_exception`），不得是宿主侧 check。
  *

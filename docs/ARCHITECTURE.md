@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 103 项 + 归因离线回归 277 项 + 发布面自检 33 项 ✅   归因端到端回归 124 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
+离线单测 103 项 + 归因离线回归 296 项 + 发布面自检 33 项 ✅   归因端到端回归 124 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
 ```
 
 ---
@@ -193,7 +193,7 @@ tongyongzhuandshshipei/
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
 │   ├── test_offline.sh                # 103 项离线单测（无网可跑；含 [14] 漂移相关性表唯一事实源 / [15] watch 影响面 / [16] 🔴 四条出口离线探针回归）
-│   ├── test_attribution.mjs           # 277 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + 🔴 四条出口/完成位 [9.9] + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9]）
+│   ├── test_attribution.mjs           # 296 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + 🔴 四条出口/完成位 [9.9] + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9]）
 │   ├── test_e2e_regression.mjs        # 124 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D + 🔴 必修-2/3 四条出口复现，含 verdict 与完成位断言）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
@@ -295,6 +295,12 @@ export function apply(ctx) {
 > `emit()` 的 `ok = runCompleted && errors.length === 0`——否则出口 ③ 的中途报告会**假绿**
 > （未跑到的检查是 `skip` 不是 `fail`）。
 >
+> ⚠️ **口径前提（v0.1.9b 收窄，评审复评 H1）**：上表的「插件侧一律落 check」以「探针进程内防线**有效**」为前提。
+> 插件可**单方面关闭**该防线：`process.setUncaughtExceptionCaptureCallback()` **停用** `uncaughtException`
+> 监听器（Node 语义）；`removeAllListeners('uncaughtException')` 直接撤销。实测（一行夹具）：
+> 装了 captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收尾 → 整轮 **GREEN / PASS / 17 项**
+> （**放行级假绿**）。故本文件**不得**把该不变量写成「永远 / 永不」绝对口径。见 `docs/RISKS.md` R22/R23，v0.1.9 修法 A。
+>
 > **边界（显式声明，不静默）**：**不可捕获**终止（`SIGKILL` / OOM / 原生 `abort` / stdout 被破坏）
 > 探针来不及写报告，由装配器按**相位信标** `__DSH_PROBE_PHASE__` 归因——有信标（插件代码运行期间）
 > → 插件侧 check `plugin.abnormal_termination`；无信标（宿主装配段）→ `hostFatal[]`（真上游信号不丢）。
@@ -363,7 +369,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 103 项 + 归因离线回归 277 项 + 发布面自检 33 项 + 归因端到端回归 124 项 + 负例拦下（含漂移窗口）+ 插件侧闸门 8/8 | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 103 项 + 归因离线回归 296 项 + 发布面自检 33 项 + 归因端到端回归 124 项 + 负例拦下（含漂移窗口）+ 插件侧闸门 8/8 | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |

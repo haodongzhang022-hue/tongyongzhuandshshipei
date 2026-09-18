@@ -13,7 +13,7 @@
  *
  * 期望行为（修复后）：
  * - 归因 `PLUGIN_REGRESSION`、`verdict = RED`（不放行）；
- * - `hostFatal[]` **必须为空**（插件侧错误永远不进判据字段——`contract.mjs` 的不变量）；
+ * - `hostFatal[]` **必须为空**（插件侧错误不进判据字段——`contract.mjs` 的不变量，**前提：探针进程内防线未被插件干预**）；
  * - 失败项是插件侧 check `plugin.async_uncaught_exception`（已登记 `PLUGIN_SIDE_CHECKS`）；
  * - 已跑完的 check **全部保留**，未跑到的按规范顺序标 `skip`（报告形态与正常失败一致）；
  * - `probePhase = plugin-integration`（异常归属依据，可排障）。

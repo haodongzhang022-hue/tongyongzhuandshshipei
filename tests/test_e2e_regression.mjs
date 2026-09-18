@@ -259,7 +259,8 @@ try {
     const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
     eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
     eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
-    // 核心不变量（🔴-D）：插件侧错误**永远**不进判据字段 hostFatal[]
+    // 核心不变量（🔴-D，v0.1.9b 口径收窄）：**在探针进程内防线未被插件干预的前提下**，插件侧错误不进 hostFatal[]
+    // （绝对口径「永不进」已被评审复评 H1 推翻：见 docs/RISKS.md R22/R23）
     eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
     // 失败项必须是插件侧 check（不得是宿主侧）
     const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
@@ -285,7 +286,7 @@ try {
     const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
     eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
     eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
-    // 核心不变量（🔴-D）：插件侧错误**永远**不进判据字段 hostFatal[]
+    // 核心不变量（🔴-D，v0.1.9b 口径收窄）：**在探针进程内防线未被插件干预的前提下**，插件侧错误不进 hostFatal[]
     eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
     // 报告完整性：旧缺陷下 checks 归零（整份报告消失）——这是本条活口比同步版更狠的地方
     const checks = report.checks ?? [];
@@ -329,7 +330,7 @@ try {
     const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
     eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
     eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
-    // 核心不变量（🔴-D）：插件侧错误**永远**不进判据字段 hostFatal[]
+    // 核心不变量（🔴-D，v0.1.9b 口径收窄）：**在探针进程内防线未被插件干预的前提下**，插件侧错误不进 hostFatal[]
     eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
     eq(`${label}（失败项含 ${expectedCheck}）`, true, failed.includes(expectedCheck));
     // 完成位（🔴 必修-1）：未跑完的运行**不得**判通过（假绿比 AMBER 更危险）

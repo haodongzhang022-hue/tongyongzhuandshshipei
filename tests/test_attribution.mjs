@@ -686,7 +686,7 @@ console.log('  [9.8] 🔴-D 异步活口（进程级兜底 + 双路径不变量�
   const asyncOut = { checks: [], errors: [], hostFatal: [] };
   const asyncRouted = recordProbeAsyncException(asyncOut, PROBE_PHASE.PLUGIN_INTEGRATION, asyncStack);
   eq('🔴-D 异步：插件集成相位的异步异常 → 落插件侧 check', PLUGIN_ASYNC_EXCEPTION_CHECK, asyncOut.checks[0]?.name);
-  eq('🔴-D 异步：hostFatal[] 为空（不变量：插件侧错误永不进判据字段）', 0, asyncOut.hostFatal.length);
+  eq('🔴-D 异步：hostFatal[] 为空（不变量：插件侧错误不进判据字段——前提：防线未被插件干预）', 0, asyncOut.hostFatal.length);
   eq('🔴-D 异步：归因 PLUGIN_REGRESSION（不甩锅上游）', 'PLUGIN_REGRESSION',
     attributeFailure({ ...asyncOut, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
   eq('🔴-D 异步：相位写进结构化结果（排障依据）', PROBE_PHASE.PLUGIN_INTEGRATION, asyncOut.phase);
@@ -772,7 +772,7 @@ console.log('  [9.9] 🔴 四条出口 + 完成位（进程 exit / run() 被拖�
     const target = { checks: [], errors: [], hostFatal: [] };
     const routed = record(target, PROBE_PHASE.PLUGIN_INTEGRATION, 'at file:///tmp/plugin-exit/plugin.mjs:12:3');
     eq(`🔴 出口（${label}）：落插件侧 check ${check}`, check, target.checks[0]?.name);
-    eq(`🔴 出口（${label}）：hostFatal[] 为空（不变量：插件侧错误永不进判据字段）`, 0, target.hostFatal.length);
+    eq(`🔴 出口（${label}）：hostFatal[] 为空（不变量：插件侧错误不进判据字段——前提：防线未被插件干预）`, 0, target.hostFatal.length);
     eq(`🔴 出口（${label}）：归因 PLUGIN_REGRESSION（不甩锅上游）`, 'PLUGIN_REGRESSION',
       attributeFailure({ ...target, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
     eq(`🔴 出口（${label}）：相位写进结构化结果（排障依据）`, PROBE_PHASE.PLUGIN_INTEGRATION, target.phase);
@@ -955,6 +955,69 @@ console.log('  [10] P2-10 判据源码守卫加固（别名绕过也拦得住）
   eq('P2-10：仅 errors 文本含 fatal(host)、hostFatal 为空 → 不判漂移', 'PLUGIN_REGRESSION',
     attributeFailure(probeOf(['fatal(host): 文本不算结构化信号'], [failCheck('registry.exact')]), channel, 'dev'));
 }
+
+// ---- 11. 口径守卫：文档/源码**不得**把「插件侧错误不进 hostFatal[]」写成绝对口径 ----
+// 为什么单独守（评审复评 H1）：v0.1.7/v0.1.8 曾把该不变量写成「插件侧错误**永远**不进 hostFatal[]」
+// 并对**外**宣称；而 H1（`setUncaughtExceptionCaptureCallback` 静音探针防线 → GREEN 放行）直接推翻它。
+// 中台的核心主张是「归因可信」——**文档撒谎的代价 > 代码有洞**。故：绝对口径回流即红。
+console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1 推翻的绝对口径）');
+{
+  // 允许的**收窄口径**关键词：出现它即视为已收窄（本守卫只拦绝对化措辞）。
+  const NARROW = '防线未被插件干预';
+  // 绝对口径写法：`插件侧…永远/永不…hostFatal`（同句内），且**不含**收窄前提。
+  const ABSOLUTE = /插件侧[^。；\n]{0,40}(永远|永不)[^。；\n]{0,40}hostFatal/;
+  const DOC_FILES = [
+    'src/harness/contract.mjs',
+    'src/harness/probe-template.mjs',
+    'docs/RISKS.md',
+    'docs/ARCHITECTURE.md',
+    'docs/ADAPTER_GUIDE.md',
+    'README.md',
+    '.cnb.yml',
+    'tests/gate_plugin_side.sh',
+  ];
+  for (const file of DOC_FILES) {
+    const src = readText(path.join(ROOT, file), 'utf8');
+    // 逐行判：**说明性**行（纠正历史口径 / 明确禁止）不算违规，但必须同时出现收窄前提或否定词。
+    const offenders = src.split('\n').filter((line) => {
+      if (!ABSOLUTE.test(line)) return false;
+      const explanatory = line.includes(NARROW) || /不得|已收窄|不成立|已作废|更正|推翻|口径收窄/.test(line);
+      return !explanatory;
+    });
+    eq(`口径守卫：${file} 无「插件侧错误永远/永不进 hostFatal」绝对口径`, [], offenders.map((l) => l.slice(0, 90)));
+  }
+  // 收窄口径必须真的落在唯一事实源（`contract.mjs` 的 HOST_FATAL_FIELD JSDoc）里
+  const contractSrc = readText(path.join(ROOT, 'src/harness/contract.mjs'), 'utf8');
+  eq('口径守卫：contract.mjs 的 HOST_FATAL_FIELD JSDoc 显式声明收窄前提', true, contractSrc.includes(NARROW));
+  // 反向：RISKS 必须记录 H1 这一族风险（删掉即红——「已知活口不得静默」）
+  const risks = readText(path.join(ROOT, 'docs/RISKS.md'), 'utf8');
+  for (const [id, label] of [
+    ['R22', 'H1 放行级假绿（captureCallback 静音防线）'],
+    ['R23', '探针进程内防线可被插件单方面撤销/静音'],
+    ['R24', '宿主 execFileSync(timeout) 对同步死循环失效'],
+    ['R25', '延迟抛错（排空窗口之外）→ 该插件判 GREEN 的后果'],
+  ]) {
+    eq(`口径守卫：RISKS 记录 ${id}（${label}）`, true, new RegExp(`\\|\\s*${id}\\s*\\|`).test(risks));
+  }
+  // H1 复现夹具必须固化在仓库里（v0.1.9 修法 A 的验收资产；删掉即红 = 「已知活口不得静默消失」）
+  const h1Fixture = readText(path.join(ROOT, 'tests/fixtures/plugin-capture-callback-plugin.mjs'), 'utf8');
+  eq('口径守卫：H1 复现夹具存在且用一行 captureCallback 复现', true,
+    /setUncaughtExceptionCaptureCallback\(/.test(h1Fixture));
+  eq('口径守卫：H1 夹具自述指向 R22 / v0.1.9 必修（不得静默）', true,
+    h1Fixture.includes('R22') && h1Fixture.includes('v0.1.9'));
+  eq('口径守卫：H1 夹具声明「当前判 GREEN、v0.1.9 修法 A 后必须 RED」', true,
+    h1Fixture.includes('GREEN') && h1Fixture.includes('PLUGIN_REGRESSION'));
+  // 守卫自证：绝对口径样例必须被抓到，收窄口径样例不得误报
+  for (const [label, sample] of Object.entries({
+    '原 v0.1.7/v0.1.8 口径': '插件侧错误**永远**不进该字段 hostFatal[]（插件侧一律落 check）。',
+    '同义改写': '插件侧错误永不进 hostFatal[]。',
+  })) {
+    eq(`口径守卫自证：${label} 被抓到`, true, ABSOLUTE.test(sample) && !sample.includes(NARROW));
+  }
+  eq('口径守卫自证：收窄口径不误报', false,
+    ABSOLUTE.test('在探针进程内防线未被插件干预的前提下，插件侧错误不进 hostFatal[]'));
+}
+
 console.log();
 console.log(`▶ 归因与契约采集离线回归结果：PASS=${pass} FAIL=${fail}`);
 process.exit(fail === 0 ? 0 : 1);
