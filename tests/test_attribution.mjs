@@ -1753,6 +1753,87 @@ console.log('  [9.13] 🔴 必修-4 同族假绿：猴子补丁 JSON.stringify�
   }
 }
 
+
+// ---- 9.14. R26 残留边界②（**fail-open**）：fd3 隔离在「探针未 emit」时回退信任 stdout ----
+// 为什么单列（评审复评 §四，本轮实测）：结果通道隔离的判定依据是「**fd3 有没有内容**」
+// （`isolated = channelText.trim().length > 0`），而**不是**「探针**是否**报告过」。于是：
+//   · 探针**正常 emit** → fd3 有内容 → `isolated=true` → 插件多出来的那条行 = 篡改证据 → RED；
+//   · 探针**来不及 emit**（插件摘 `exit` 钩子 + `exit(0)` 抢在探针之前）→ fd3 为空 →
+//     `isolated=false` → **回退信任 stdout** ⇒ 带**正确 nonce** 的伪造行成为**唯一** marker
+//     ⇒ 无 `injectionEvidence` ⇒ **被采信（ok=true）**。
+// ⇒ **通道选择不是关键**（伪造写 fd3 与写 stdout **等价**，两形态同判）；**「探针是否来得及 emit」才是关键**。
+// ⇒ 当前**唯一**有效的那条腿是 **nonce 保密性**（stdin 下发 ⇒ 经 env / argv 拿不到）；一旦插件经
+//   **其它同进程手段**拿到 nonce（R29），本形态即**重新变绿**。根治 = 批 2「独立 fd 且**永不回退 stdout**」。
+//
+// ⚠️ 本段的定位：**把现状固化为可执行断言**，而不是宣称它已被收口。
+//   · 批 2 落地（fd3 为空 ⇒ 判「无报告 / 不可信」）后，本段的 `FAIL_OPEN_KNOWN` 断言**必须翻面**
+//     （改断言为「不得被采信」）——**修好即红**，强制文档与判据同步。
+console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回退信任 stdout');
+{
+  // 批 2 落地后把这里改成 false 并**翻面断言**（见上方注释）。本常量是「已知边界」的显式锚点。
+  const FAIL_OPEN_KNOWN = true;
+  const mkPayload = () => JSON.stringify({
+    checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [],
+    ok: true, runCompleted: true, phase: 'plugin-integration', resultChannel: 'fd3',
+  });
+  const nonce = createProbeNonce(randomBytes).value;
+  const forgedLine = `${probeResultPrefix(nonce)}${mkPayload()}\n`;
+  const run = (stdout, resultFd) => {
+    const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly', runCompleted: false };
+    interpretProbeStdout(r, stdout, { resultFd, nonce });
+    return r;
+  };
+
+  // ① 形态 C：伪造写 **fd3**、探针**来不及 emit** ⇒ 当前被采信（**已知边界**，批 2 必修）
+  {
+    const r = run('', forgedLine);
+    eq('R26 残留②（fail-open·形态 C）：伪造写 fd3 + 探针未 emit ⇒ 当前**被采信**（批 2 必修：不得回退）',
+      true, r.ok === true);
+    eq('R26 残留②：形态 C 无任何篡改证据（`checks` 里只有伪造项）', 0,
+      r.checks.filter((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK).length);
+  }
+  // ② 形态 D：伪造写 **stdout**、探针**来不及 emit** ⇒ **同样**被采信
+  //    ⇒ 证明「写对通道」不是使能条件（评审复评 §二-② 的实测结论）
+  {
+    const r = run(forgedLine, '');
+    eq('R26 残留②（fail-open·形态 D）：伪造写 **stdout** + 探针未 emit ⇒ **同样**被采信',
+      true, r.ok === true);
+    eq('R26 残留②：C/D 两形态**同判**（⇒ 通道选择不是关键，写对 fd3 不是使能条件）', true,
+      run('', forgedLine).ok === run(forgedLine, '').ok);
+  }
+  // ③ 对照（防线**生效**形态）：探针 emit（fd3 有真报告）+ stdout 出现伪造行 ⇒ 判篡改、不放行
+  {
+    const r = run(forgedLine, forgedLine);
+    eq('R26 残留② 对照：探针**有** emit（fd3 有内容）⇒ 结构不变量命中 ⇒ 判 plugin.protocol_injection', true,
+      r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('R26 残留② 对照：命中即不放行（ok=false / 完成位 false）', 'false|false', `${r.ok}|${r.runCompleted}`);
+  }
+  // ④ 机理源码守卫：隔离判定必须仍是「fd3 有没有内容」（回退逻辑的**成因**；批 2 会改这一行）
+  {
+    const hostCode = codeOnly(readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8'));
+    eq('R26 残留② 源码守卫：隔离判定 = 「fd3 有没有内容」（`isolated` 由通道文本长度推出）', true,
+      /isolated = channelText\.trim\(\)\.length > 0/.test(hostCode));
+    eq('R26 残留② 源码守卫：`markers` 在通道为空时**回退 stdout**（fail-open 的落点，批 2 改此处）', true,
+      /markers = isolated \? matchingOnChannel : matchingOnStdout/.test(hostCode));
+  }
+  // ⑤ 「已知边界不得静默」：RISKS / REDO-PROPOSAL 必须登记该边界，且写明批 2 的首要目标
+  {
+    const risks = readText(path.join(ROOT, 'docs/RISKS.md'), 'utf8');
+    const r26Row = risks.split('\n').find((line) => /^\|\s*R26\s*\|/.test(line)) ?? '';
+    eq('R26 残留②：RISKS R26 行写明 fail-open（探针未 emit 时回退信任 stdout）', true,
+      r26Row.includes('fail-open') && r26Row.includes('回退信任 stdout'));
+    eq('R26 残留②：RISKS 写明使能条件 =「探针是否来得及 emit」（而非「写对通道」）', true,
+      r26Row.includes('通道选择不是关键') && r26Row.includes('来得及 emit'));
+    eq('R26 残留②：RISKS 写明当前唯一有效的是 nonce 保密性 + 批 2 首要目标（永不回退 stdout）', true,
+      r26Row.includes('nonce 保密性') && r26Row.includes('永不回退 stdout'));
+    const redo = readText(path.join(ROOT, 'docs/REDO-PROPOSAL.md'), 'utf8');
+    eq('R26 残留②：REDO-PROPOSAL 批 2 立项说明含「独立 fd 且永不回退 stdout」（首要目标）', true,
+      redo.includes('永不回退 stdout') && redo.includes('首要目标'));
+    eq('R26 残留②：REDO-PROPOSAL 形态表登记 fail-open 形态（⑤b）', true, redo.includes('| ⑤b |'));
+  }
+  eq('R26 残留②：本段为「已知边界」的显式锚点（批 2 落地后必须翻面为「不得被采信」）', true, FAIL_OPEN_KNOWN);
+}
+
 console.log();
 console.log(`▶ 归因与契约采集离线回归结果：PASS=${pass} FAIL=${fail}`);
 process.exit(fail === 0 ? 0 : 1);

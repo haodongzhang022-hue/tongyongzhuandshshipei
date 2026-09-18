@@ -1,3 +1,54 @@
+## v0.2.4 · R26 残留边界②（fail-open）登记 + 批 2 首要目标并入
+
+> 承接 v0.2.3。本版由**评审复评 §三/§四**驱动，**只做登记与断言固化，不改判据、不动架构**。
+> 结论：评审的更正**成立、已采信**；其 §四 的结构性观察（fail-open）**并入批 2 立项说明与 R26 登记**。
+> 两条**均不阻断放行**（评审原话）。
+
+### 一、采信评审的更正（我 §一 表格的表述已更正）
+
+| 项 | 内容 |
+|---|---|
+| 评审更正成立 | `e381d52` **不是「反读即绿」**；仓内夹具（写 stdout、**不**摘 exit）在 `e381d52` 上确为 **RED**。我原先把「反读 + 摘 exit」简写成一行，**表述不准确**——已更正 |
+| 我的 §二 措辞也需更正 | 我写「必须**写对通道 fd3**」——**实测不必**。本仓实测：伪造写 **stdout** + 摘 exit 同样被采信（见下） |
+| **真正的使能条件** | **「让探针来不及写自己的报告」**（摘 `exit` 钩子 + `exit(0)` ⇒ 探针 `emit()` 永不执行）⇒ **通道选择不是关键**，**「探针是否来得及 emit」才是关键** |
+
+### 二、R26 残留边界②（fail-open）—— 本轮实测，已登记
+
+| 项 | 内容 |
+|---|---|
+| 机理（读 `host.mjs` 确认） | `const isolated = channelText.trim().length > 0;` ⇒ `markers = isolated ? matchingOnChannel : matchingOnStdout`。隔离判定是「**fd3 有没有内容**」，**不是**「探针**是否**报告过」 |
+| 后果 | 探针**来不及 emit**（被 `exit(0)` 截断）⇒ fd3 为空 ⇒ **回退信任 stdout** ⇒ 带**正确 nonce** 的伪造行成为**唯一** marker ⇒ 无 `injectionEvidence` ⇒ **被采信（`ok=true`）** |
+| 实测（本仓，`node` 直调 `interpretProbeStdout`） | 形态 C（伪造写 fd3 + 探针沉默）⇒ `ok=true`；形态 D（伪造写 stdout + 探针沉默）⇒ `ok=true`（**同判**）；对照 A（伪造写 stdout + 探针 emit）⇒ `plugin.protocol_injection` / `ok=false` |
+| 定性 | **当前防护实际是「单腿站立」**：唯一有效的是 **nonce 保密性**（stdin 下发 ⇒ 经 env / argv 拿不到）；**通道隔离在探针未 emit 时 fail-open**。一旦插件经**其它同进程手段**（猴子补丁 / 读内存，见 R29）拿到 nonce，C/D 形态**立刻重新变绿** |
+| 处置（本轮） | ① `docs/RISKS.md` **R26 残留边界②** 写明（含「使能条件 = 探针是否来得及 emit」与「批 2 首要目标 = 永不回退 stdout」）；② `docs/REDO-PROPOSAL.md` 立项说明并入**首要目标** + 形态表登记 **⑤b**；③ 离线 `test_attribution.mjs` **[9.14]**（14 条）把**现状固化为可执行断言**——批 2 修好即红，强制同步 |
+| **不做什么**（显式声明，不越权） | **不改判据**（改判据属批 2 范围：需「独立 fd 且**永不回退 stdout**」，要动架构）；**不阻断放行** |
+
+### 三、评审 §三 的分行判据（已转「架构·测试」，接力卡见 PR #2 评论）
+
+| 断言 | 期望 |
+|---|---|
+| 仓内 `plugin-nonce-reverse-read-plugin` @ `e381d52` | **RED**（`plugin.protocol_injection`）——**不是** GREEN |
+| 仓内同夹具 @ `0ac4ab6` | RED（`plugin.probe_result_forged`） |
+| 「反读 + 摘 exit + `exit(0)`」@ `e381d52` | **GREEN**（这才是那条假绿，A/B 用它才拿得到对照） |
+| 同形态 @ `0ac4ab6` | RED（`plugin.abnormal_termination`，`hostFatal=[]`） |
+
+> ⚠️ **不要用「仓内夹具 @ `e381d52`」做 GREEN 对照**——会拿不到 GREEN 而误判防线失效。
+
+### 四、测试项数（本版）
+
+- 离线单测 163 项（`tests/test_offline.sh`：**不变**，本版不动探针与判据）
+- 归因离线回归 509 项（`tests/test_attribution.mjs`：495 → 509；新增 [9.14] R26 残留② fail-open 现状固化 14 条）
+- 归因端到端回归 163 项（`tests/test_e2e_regression.mjs`：**不变**，本版不动判据）
+- 发布面自检 43 项（`tests/test_exports.mjs`：**不变**）
+- 插件侧闸门 24 项（`tests/gate_plugin_side.sh`：**不变**）
+
+### 五、兼容性与边界
+
+- **无行为变更**：未改任何判据、未改探针与装配器的判定逻辑；只增文档登记与离线断言。
+- 版本口径：`package.json` / `src/version.mjs` / `docs/ARCHITECTURE.md` 头部 = **0.2.4**。
+
+---
+
 ## v0.2.3 · 批 1.5（复评 🔴-R1/R2 收口）+ 评审复评收口（🔴-A/R30 · 🔴-B 同族假绿收口 · R29 立项）
 
 > 承接 v0.2.2（nonce 通道改 **stdin**）。本版由**两条并行线**的产出**并集**而成，两者均已复核：
@@ -90,7 +141,7 @@
 ### 测试项数（本版 · **并集后的最终值**）
 
 - 离线单测 163 项（`tests/test_offline.sh`：128 → 163；批 1.5 [19] 四项 × 19 条 + 🔴-A [16] 探针端无 nonce 6 条 + 🔴-B [20] 10 条）
-- 归因离线回归 495 项（`tests/test_attribution.mjs`：441 → 495；[9.11f] 可证伪改写 + 口径守卫 + 🔴-A 源码守卫 + [9.13] 🔴-B 段 + [9.11g] 裸字面量守卫）
+- 归因离线回归 509 项（`tests/test_attribution.mjs`：441 → 509；[9.11f] 可证伪改写 + 口径守卫 + 🔴-A 源码守卫 + [9.13] 🔴-B 段 + [9.11g] 裸字面量守卫 + **[9.14] R26 残留② fail-open 现状固化 14 条**）
 - 归因端到端回归 163 项（`tests/test_e2e_regression.mjs`：146 → 163；[8g] §3 反例 + 通道可见化 + 🔴-B 真宿主段）
 - 插件侧闸门 24 项（`tests/gate_plugin_side.sh`：21 → 24；负例 15 → **17 份**：+ §3 反例 + exit 钩子 + 猴子补丁序列化）
 - 发布面自检 43 项（`tests/test_exports.mjs`：40 → 43；条件项守卫扩面 + 条件项计数 8 → 9 自动跟随）

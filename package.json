@@ -1,6 +1,6 @@
 {
   "name": "@dongdongxiaozu/dsh-adapt-hub",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "DSH 适配中台：把「插件适配 DSH 生态」的重复劳动固化为可复用能力——版本线探测 / 契约兼容层 / 双通道（稳定版+开发版）验收 / 上游变更侦测。",
   "type": "module",
   "bin": {
