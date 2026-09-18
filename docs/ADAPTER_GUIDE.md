@@ -298,9 +298,9 @@ captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收�
 |---|---|
 | 缺口 | 插件若往 stdout 写一行 `__DSH_PROBE__{...}`，就能**自造一张绿卡**（真实缺陷被掩盖）；写 `hostFatal:[...]` 可把责任甩给上游（判 `UPSTREAM_DRIFT`） |
 | 显式前提 | 本中台的归因防线以「**插件为可信代码**（非恶意）」为**显式前提**（`docs/RISKS.md` R26）。越出该前提时，防线退化为**尽力而为**。⇒ 本中台是**验收**工具，**不是沙箱**；**不得**在缺少该前提时宣称「报告可信」 |
-| nonce 带外通道 | 宿主每次运行生成**随机** nonce 与**随机环境变量名**：名字经 argv（`--probe-nonce-env=NAME`）、值经 env 传入；探针输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行** |
+| nonce 带外通道 | 宿主每次运行生成**随机** nonce，经 **stdin** 下发（探针读完即 `close(0)`；**不进 argv / env** ⇒ 不落 `/proc/self/environ`、不出现在 `ps` 里）；探针输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行** |
 | 判定 | 出现裸 `__DSH_PROBE__`（无 nonce / 不匹配）⇒ 判**伪造**：落插件侧 check `plugin.probe_result_forged`，`ok` 必为 false（**不放行**） |
-| 残留边界 | **恶意**插件仍可读自己的 argv/env 拿到 nonce 后伪造。根治需**进程隔离 / 独立 fd 作真·带外通道**（结构性重做，待人拍板）——本项**不越权承诺**。一页方案见 [`docs/REDO-PROPOSAL.md`](REDO-PROPOSAL.md) |
+| 残留边界 | 同进程同 uid 下，**恶意**插件仍可篡改**其它**全局（猴子补丁 `JSON.stringify` / 直接读探针内存）后伪造；nonce **不经** env / argv 下发（那两条读取面已实测收窄）。根治需**进程隔离**（结构性重做，待人拍板）——本项**不越权承诺**。一页方案见 [`docs/REDO-PROPOSAL.md`](REDO-PROPOSAL.md) |
 
 > 结论（给接入方）：**不要**在 `apply()` 里往 stdout 写探针协议行（`__DSH_PROBE__` / `__DSH_PROBE_PHASE__`）。
 > 正常插件不需要关心 nonce——它是宿主与探针之间的带外协议，对插件透明。

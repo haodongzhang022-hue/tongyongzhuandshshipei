@@ -91,7 +91,7 @@
  *
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
-import { writeSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import {
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
@@ -100,7 +100,7 @@ import {
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
-  probeNonceEnvNameFromArgv,
+  PROBE_NONCE_STDIN_CHANNEL,
   probeResultPrefix,
   collectContract,
   pushHostFatal,
@@ -122,9 +122,16 @@ const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
 // 纪律：读到后**立刻**从 `process.env` 删除（缩小插件侧的可见窗口）；
 // 缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
 // 但宿主侧会按「无 nonce ⇒ 不可信」处理（见 host.mjs 的 interpretProbeStdout）。
-const nonceEnvName = probeNonceEnvNameFromArgv(process.argv.slice(2));
-const nonceValue = nonceEnvName ? (process.env[nonceEnvName] ?? null) : null;
-if (nonceEnvName) { try { delete process.env[nonceEnvName]; } catch { /* 删除失败不阻断（见 RISKS R26 残留边界） */ } }
+const nonceValue = (() => {
+  try {
+    const text = readFileSync(0, 'utf8');
+    // 读完**立刻** close：否则插件（或它的依赖）可以从 fd 0 再把 nonce 读一遍。
+    try { process.stdin.destroy?.(); } catch { /* 某些平台无 stdin 对象：忽略 */ }
+    return text.trim() || null;
+  } catch {
+    return null;
+  }
+})();
 /** 本进程结构化结果的前缀：有 nonce 用带 nonce 形式，无则退化为裸 marker。 */
 const resultPrefix = nonceValue ? probeResultPrefix(nonceValue) : PROBE_RESULT_MARKER;
 

@@ -18,7 +18,7 @@ import {
   PLUGIN_ABNORMAL_TERMINATION_CHECK,
   PLUGIN_PROBE_FORGED_RESULT_CHECK,
   PLUGIN_PROTOCOL_INJECTION_CHECK,
-  PROBE_NONCE_ENV_ARG_PREFIX,
+  PROBE_NONCE_STDIN_CHANNEL,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
   PROBE_RESULT_MARKER,
@@ -127,7 +127,7 @@ export const CHILD_KILL_SIGNAL = 'SIGKILL';
  * 「CI 挂死」或「放行级假绿」）。抽成函数后离线单测可直接断言这两个不变量。
  *
  * @param {{hubRoot:string, pluginPath:string, expectedTools:string[], timeoutMs:number,
- *   nonce?:{envName:string, value:string}|null, killSignal?:string}} options 选项
+ *   nonce?:{value:string}|null, killSignal?:string}} options 选项
  *   `killSignal` 仅用于**回归反证**（离线台传 `'SIGTERM'` 复现「超时被探针处理器吞掉 ⇒ 无界」的旧缺陷）；
  *   生产路径**不得**传它——默认值就是 {@link CHILD_KILL_SIGNAL}（源码守卫 [14] 钉住这一点）。
  * @returns {import('node:child_process').SpawnSyncOptionsWithStringEncoding} spawnSync 选项
@@ -145,11 +145,11 @@ export function probeSpawnOptions(options) {
     killSignal,
     // R26：[stdin, stdout, stderr, fd3]；fd3 = 结构化结果专用通道（探针 `writeSync(3, ...)`）。
     // 于是「stdout 里出现结果行」本身就是篡改证据（通道隔离）。
-    stdio: ['ignore', 'pipe', 'inherit', 'pipe'],
-    // nonce 带外通道（侧信道）：名字经 argv 传、值经 env 传（名字也随机 ⇒ 插件不能靠猜名字拿到它）。
-    ...(nonce ? { env: { ...process.env, [nonce.envName]: nonce.value } } : {}),
-    args: ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools),
-      ...(nonce ? [`${PROBE_NONCE_ENV_ARG_PREFIX}${nonce.envName}`] : [])],
+    // stdin = nonce 的**带外通道**（见 `PROBE_NONCE_STDIN_CHANNEL` 的实测依据：env 通道可被
+    // `/proc/self/environ` 反读、argv 通道会出现在 `ps` 里，两者都能让插件伪造出被采信的结果行）。
+    stdio: ['pipe', 'pipe', 'inherit', 'pipe'],
+    ...(nonce ? { input: `${nonce.value}\n` } : { input: '' }),
+    args: ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools)],
   };
 }
 
@@ -268,12 +268,14 @@ export function runHostProbe(options) {
     //    正常路径不受影响：探针自己的 `RUN_WATCHDOG_MS`（20s）先于 `timeoutMs`（600s）触发。
     //
     // R26（复评）**两条防线并集**（互相独立、都要）：
-    // - **nonce 带外通道**（侧信道）：宿主随机 nonce + 随机环境变量名，名字经 argv 传、值经 env 传，
-    //   探针输出带 nonce 前缀 ⇒ 插件伪造裸 marker 被识别为**伪造**（`plugin.probe_result_forged`）；
+    // - **nonce 带外通道**（侧信道）：宿主随机 nonce 经 **stdin** 下发（不进 argv/env ⇒
+    //   不落 `/proc/self/environ`、不出现在 `ps` 里），探针输出带 nonce 前缀 ⇒ 插件伪造
+    //   裸 marker 被识别为**伪造**（`plugin.probe_result_forged`）；
     // - **结果通道隔离**：结构化结果走 **fd3**，stdout 只留日志 ⇒「stdout 里出现结果行」本身
     //   就是篡改证据（`plugin.protocol_injection`）；`spawnSync` 才拿得到 fd3。
     const nonce = createProbeNonce(randomBytes);
-    result.probeNonceEnvName = nonce.envName; // 排障用（值本身**不**落盘，避免泄漏进报告）
+    // 排障用：只记通道形态（值本身**不**落盘，避免泄漏进报告）。
+    result.probeNonceChannel = PROBE_NONCE_STDIN_CHANNEL;
 
     let stdout = '';
     let resultFd = '';

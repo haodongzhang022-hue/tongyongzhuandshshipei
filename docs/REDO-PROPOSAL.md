@@ -12,7 +12,7 @@
 | 项 | 落点 |
 |---|---|
 | 🔴-1 / R24 有界返回 | `host.mjs` 的 `CHILD_KILL_SIGNAL = 'SIGKILL'`（`probeSpawnOptions` + npm 共用）+ 离线 [17] 行为断言与**反向反证** |
-| nonce 带外通道（批 1 第一步） | 宿主随机 nonce + 随机环境变量名；只认带 nonce 的报告；伪造 ⇒ `plugin.probe_result_forged` |
+| nonce 带外通道（批 1 第一步） | 宿主随机 nonce 经 **stdin** 下发（不进 argv / env）；只认带 nonce 的报告；伪造 ⇒ `plugin.probe_result_forged` |
 | 结果通道隔离（批 1 第二步，**已做**） | 结果走 **fd3**（`spawnSync` + `stdio[3]='pipe'`）；stdout 出现结果行即篡改证据 ⇒ `plugin.protocol_injection` |
 | 信任边界**写成显式前提**（Q2） | `docs/RISKS.md` R26 + README / ARCHITECTURE / ADAPTER_GUIDE 限定词 + 离线 [14] 守卫 |
 
@@ -28,7 +28,7 @@
 
 | # | 形态 | 现状 | 类别 |
 |---|---|---|---|
-| ① | 插件打印一条**伪造 marker**（`__DSH_PROBE__{ok:true,...}`） | nonce 带外通道 + fd3 隔离**挡「无意的自我发绿卡」**；恶意插件读自己的 argv/env 仍可拿到 nonce | 信任边界（R26） |
+| ① | 插件打印一条**伪造 marker**（`__DSH_PROBE__{ok:true,...}`） | nonce 带外通道（**stdin**）+ fd3 隔离**挡「无意的自我发绿卡」与「从环境块 / argv 反读」**；同进程同 uid 的其它篡改仍需进程级隔离 | 信任边界（R26） |
 | ② | 插件 `setUncaughtExceptionCaptureCallback()` / `removeAllListeners` 静音探针防线 | 探针**收尾自检**可判定（`plugin.process_defense_tampered`，R28 起用身份检查 + 行为级 canary） | 信任边界 + 侧信道 |
 | ③ | 插件同步占死事件循环 | 宿主 `SIGKILL` **有界**；但看门狗（探针内）**仍排不上** | 侧信道（R24 残留②） |
 | ④ | 插件在探针写报告前 `process.exit(0)`，再自补一条干净报告 | 出口③已闭合（探针自己的 `exit` 钩子记账）；「补报告」由 nonce/fd3 拦 | 信任边界 |
@@ -58,7 +58,7 @@
 | 项 | 内容 |
 |---|---|
 | 机制 | 宿主给探针开**第 4 个 fd**（`stdio: ['ignore','pipe','inherit','pipe']`）；探针把结果写 **fd3**（`writeSync(3, ...)`）。宿主**只信 fd3**，stdout 退化为纯日志 |
-| nonce | 宿主 spawn 前生成随机 nonce（`randomUUID`/`randomBytes` 系），经 env 传；marker 带 nonce，宿主校验逐字一致 |
+| nonce | 宿主 spawn 前生成随机 nonce（`randomUUID`/`randomBytes` 系），经 **stdin** 传（不进 argv / env）；marker 带 nonce，宿主校验逐字一致 |
 | 结构不变量 | 「匹配前缀的结果行 ≥2 条 / 出现在 stdout」即判篡改（`plugin.protocol_injection`），**不采信任何一条** |
 | 残留 | 插件**仍可**：① 读 env 拿 nonce（同进程）；② 写 fd3。⇒ **单独用 A 不足以闭合**，只是提高门槛 |
 | 收益（已兑现） | ① 插件**误写 stdout** 不再污染判据；② 伪造需**主动**读 env + 写 fd3（从「顺手」变「刻意」）；③ 报告完整性不再受插件 stdout 噪声影响 |
@@ -114,7 +114,7 @@ A 已在 v0.2.x 兑现；**剩下的根治工作 = B**。
 | 风险 | 规避 | 回滚 |
 |---|---|---|
 | fd3 在部分 CI 环境不可用（容器 / Windows） | 探针侧**探测** fd3 可用性；不可用则**显式降级**到 stdout 并在报告里标 `stdout-degraded`（**不静默**） | 关掉开关即回退到 stdout 通道 |
-| nonce 经 env 传递被插件读取 | 声明为**已知边界**（同进程下无法防）；nonce 的作用是「**误写**不可伪造」而非「恶意不可伪造」——恶意对抗归批 2 | 同上 |
+| nonce 被插件反读 | **已实测收窄**：env / argv 通道均可被同进程插件反读（`/proc/self/environ` / `ps`）⇒ 改用 **stdin**；残留（同进程读内存 / 猴子补丁全局）声明为**已知边界**，恶意对抗归批 2 | 同上 |
 | 批 2 的 IPC 引入新超时语义 | 先写「协议 + 超时」设计文档再动手；每步留回滚点 | 保留批 1 实现（批 2 是叠加，不是替换） |
 
 ---

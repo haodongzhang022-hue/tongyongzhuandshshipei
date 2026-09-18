@@ -87,37 +87,43 @@ export const PROBE_PHASE_BEACON_PREFIX = '__DSH_PROBE_PHASE__';
  * （{@link probeResultPrefix}）：宿主每次运行生成**随机** nonce，只认带该 nonce 的行。
  *
  * 为什么「随机」而不是固定名：固定名（如 `__DSH_PROBE__`）等于没设防——插件照抄即可。
- * nonce 的**环境变量名**也是随机的（见 {@link PROBE_NONCE_ENV_ARG_PREFIX}），
- * 故插件不能靠猜名字拿到它。
+ * nonce 经**带外通道（stdin）**下发（见 {@link PROBE_NONCE_STDIN_CHANNEL}），
+ * **不进 argv / env** ⇒ 不落 `/proc/self/environ`，也不出现在 `ps` 里。
  */
 export const PROBE_RESULT_MARKER = '__DSH_PROBE__';
 
 /**
- * 宿主 → 探针传递 nonce 的 **argv 参数前缀**（值为**随机生成的环境变量名**）。
+ * 宿主 → 探针传递 nonce 的**带外通道：stdin**（本实现的通道形态）。
  *
- * 协议（🆕 侧信道收口）：
- * 1. 宿主生成两个随机量：环境变量名 `NAME`（如 `DSH_NONCE_9f3c…`）与 nonce 值 `VALUE`；
- * 2. 宿主以 `--probe-nonce-env=NAME` 传给探针，并把 `NAME=VALUE` 放进探针的**环境变量**；
- * 3. 探针启动时按 argv 取 `NAME`、读 `process.env[NAME]` 得 `VALUE`，之后**立刻**从环境里删除；
+ * 协议（侧信道收口）：
+ * 1. 宿主生成一个随机 nonce `VALUE`（`randomBytes(16).toString('hex')`）；
+ * 2. 宿主把 `VALUE + '\n'` 作为子进程的 **stdin** 输入（`stdio[0] = 'pipe'` + `input`）；
+ * 3. 探针启动时 `readFileSync(0, 'utf8')` 读它，**读完立刻 `process.stdin.destroy()`**；
  * 4. 探针输出 `__DSH_PROBE__<VALUE>:{json}`；宿主只认带 `VALUE` 的那一行。
  *
- * 这样「谁是探针」由**宿主掌握的随机量**判定，而不是靠公开的字面量——
- * 插件伪造一个裸 `__DSH_PROBE__{...}` 会被宿主识别为**伪造**（落插件侧 check），
- * 而不是被当成探针的绿卡。残留边界（插件读取自己的 argv 即可拿到 nonce）见
- * `docs/RISKS.md` R26：**插件是可信代码**是显式前提，nonce 挡的是「无意的自我发绿卡」
- * 与「共用 stdout 的误命中」，不是「恶意插件」。
+ * ## 为什么走 stdin 而不是 argv / env（实测依据，不是偏好）
+ * 本仓曾并行落地过一条 **env 通道**（随机环境变量名经 argv 传、值经 env 传，探针读到后
+ * `delete process.env[NAME]`）。**实测该通道可被同进程插件绕过**：`delete` 只改 Node 的
+ * 环境视图，**不**改内核里的进程环境块 —— 插件仍可从 **`/proc/self/environ`** 读回 nonce，
+ * 进而伪造出**会被采信**的结果行（本仓实测：该形态拿到 `GREEN / PASS / 17 项`）。
+ * 同理 argv 通道会出现在 `ps` / `/proc/self/cmdline` 里。
+ * stdin 的字节流**不在**进程环境块、也不在 argv 里，故这两条读取面都不成立。
+ *
+ * ⚠️ 残留边界（不越权承诺，见 `docs/RISKS.md` R26）：stdin 挡的是「从环境块 / argv 反读」；
+ * 探针与插件**同进程、同 uid** 这一结构性事实下，插件仍可篡改**其它**全局
+ * （猴子补丁 `JSON.stringify` / 直接读探针内存）。彻底隔离需**进程级**方案
+ * （独立 fd 通道 / 独立进程签名 / `vm` 隔离 `apply()`）——见 `docs/REDO-PROPOSAL.md`。
  */
-export const PROBE_NONCE_ENV_ARG_PREFIX = '--probe-nonce-env=';
+export const PROBE_NONCE_STDIN_CHANNEL = 'stdin';
 
 /**
- * 生成一次运行的随机 nonce 与承载它的**随机环境变量名**。
+ * 生成一次运行的随机 nonce。
  *
  * @param {() => Buffer} randomBytes `node:crypto` 的 `randomBytes`（注入以便离线单测）
- * @returns {{envName: string, value: string}} 环境变量名（随机）与 nonce 值（随机）
+ * @returns {{value: string}} nonce 值（十六进制）
  */
 export function createProbeNonce(randomBytes) {
-  const hex = (n) => randomBytes(n).toString('hex');
-  return { envName: `DSH_NONCE_${hex(6)}`, value: hex(16) };
+  return { value: randomBytes(16).toString('hex') };
 }
 
 /**
@@ -128,19 +134,6 @@ export function createProbeNonce(randomBytes) {
  */
 export function probeResultPrefix(nonce) {
   return `${PROBE_RESULT_MARKER}${nonce}:`;
-}
-
-/**
- * 从探针 argv 中解析出承载 nonce 的**环境变量名**（无则返回 null）。
- *
- * @param {string[]} argv 探针进程 argv（`process.argv.slice(2)` 亦可）
- * @returns {string|null}
- */
-export function probeNonceEnvNameFromArgv(argv) {
-  const hit = (argv ?? []).find((arg) => typeof arg === 'string' && arg.startsWith(PROBE_NONCE_ENV_ARG_PREFIX));
-  if (!hit) return null;
-  const name = hit.slice(PROBE_NONCE_ENV_ARG_PREFIX.length).trim();
-  return name === '' ? null : name;
 }
 
 /**

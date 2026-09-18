@@ -40,11 +40,13 @@ import {
   PLUGIN_PROTOCOL_INJECTION_CHECK,
   PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_SIDE_CHECKS,
+  PROBE_NONCE_STDIN_CHANNEL,
   PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
   collectContract,
+  createProbeNonce,
   probeAsyncFailureRoute,
   probeFailureRoute,
   probeProcessFailureRoute,
@@ -57,6 +59,7 @@ import {
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
 import { channelFingerprint, collectProbeResultLines, interpretProbeStdout, loadChannels, probeSpawnOptions, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
+import { randomBytes } from 'node:crypto';
 // R24/R28 的**行为级**断言（同步死循环收口）用离线探针回归台：假宿主 + 真实探针 + 真实装配器实现
 import { runOfflineProbe } from './offline-probe-harness.mjs';
 // 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
@@ -1106,10 +1109,34 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
 
   // 9.11e 宿主侧不变量：探针 spawn 参数必须带 killSignal:SIGKILL（R24）+ fd3 通道（R26-B）
   {
-    const opts = probeSpawnOptions({ hubRoot: ROOT, pluginPath: '/tmp/p.mjs', expectedTools: ['a'], timeoutMs: 1000 });
+    const opts = probeSpawnOptions({ hubRoot: ROOT, pluginPath: '/tmp/p.mjs', expectedTools: ['a'], timeoutMs: 1000, nonce: createProbeNonce(randomBytes) });
     eq('R24 源码守卫：探针 spawn 带 killSignal:SIGKILL（默认 SIGTERM 会被探针出口③ 处理器吞掉）', 'SIGKILL', opts.killSignal);
     eq('R26-B 源码守卫：探针 spawn 开 fd3（stdio 第 4 位为 pipe）', 'pipe', opts.stdio?.[3]);
     eq('R26-B 源码守卫：stdout 仍为 pipe（只留日志；出现结果行即篡改证据）', 'pipe', opts.stdio?.[1]);
+    // R26 **通道形态**守卫（本轮实测）：nonce 必须经 **stdin** 下发，**不得**经 env / argv。
+    // 依据：env 通道即使 `delete process.env[NAME]`，值仍留在 `/proc/self/environ`（同 uid 可读）；
+    // argv 通道出现在 `ps` / `/proc/self/cmdline`。两者都让插件**反读出 nonce** 再伪造带 nonce 的
+    // 结果行 ⇒ 放行级假绿（本仓实测：env 通道下 `plugin-nonce-reverse-read-plugin` 判 GREEN）。
+    eq('R26 源码守卫：探针 spawn 的 stdin 为 pipe（nonce 带外通道，插件无法从 env/argv 反读）', 'pipe', opts.stdio?.[0]);
+    eq('R26 源码守卫：探针 spawn **不**经 env 传 nonce（env 可被 /proc/self/environ 反读）', true,
+      !opts.env || !Object.keys(opts.env).some((k) => k.startsWith('DSH_NONCE')));
+    eq('R26 源码守卫：探针 argv **不**携带 nonce 参数（argv 会出现在 ps / cmdline）', true,
+      !(opts.args ?? []).some((a) => /nonce/i.test(String(a))));
+    eq('R26 源码守卫：nonce 经 `input`（stdin 字节流）下发', true, typeof opts.input === 'string' && opts.input.trim().length > 0);
+    // 探针侧：必须从 fd 0 读、且读完立刻 close（否则插件可从 fd 0 再读一遍）
+    const probeSrcForNonce = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+    eq('R26 源码守卫：探针从 fd 0 读 nonce', true, /readFileSync\(0, 'utf8'\)/.test(probeSrcForNonce));
+    eq('R26 源码守卫：探针读完 stdin 立刻 destroy（否则插件可从 fd 0 再读一遍）', true,
+      /readFileSync\(0[\s\S]{0,300}process\.stdin\.destroy/.test(probeSrcForNonce));
+    // 反向：contract.mjs **不得**再导出 env 通道 API（回退即红）
+    eq('R26 源码守卫：contract.mjs 不再有 env 通道 API（PROBE_NONCE_ENV_ARG_PREFIX 已移除）', false,
+      /PROBE_NONCE_ENV_ARG_PREFIX/.test(readText(path.join(ROOT, 'src/harness/contract.mjs'), 'utf8')));
+    eq('R26 源码守卫：通道形态常量 = stdin', 'stdin', PROBE_NONCE_STDIN_CHANNEL);
+    // 夹具：反读形态必须真的尝试两条读取面（否则闸门断言空转）
+    const rrSrc = readText(path.join(ROOT, 'tests/fixtures', 'plugin-nonce-reverse-read-plugin.mjs'), 'utf8');
+    eq('R26 夹具：反读形态真的尝试 /proc/self/environ', true, /\/proc\/self\/environ/.test(rrSrc));
+    eq('R26 夹具：反读形态真的尝试 /proc/self/cmdline（argv 面）', true, /\/proc\/self\/cmdline/.test(rrSrc));
+    eq('R26 夹具：用**反读到的 nonce** 伪造带 nonce 的结果行', true, /__DSH_PROBE__\$\{nonce\}:/.test(rrSrc));
     eq('R24 源码守卫：timeout 语义 = 探针硬上限（原样透传）', 1000, opts.timeout);
   }
   eq('R26：落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,

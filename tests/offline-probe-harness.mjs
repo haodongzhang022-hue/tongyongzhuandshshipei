@@ -127,8 +127,10 @@ export function runOfflineProbe(options) {
       cwd: work,
       // 唯一与生产不同的一处：stderr 也接回（生产是 `inherit`，让 CI 日志看得见探针的原始报错）。
       // 回归台若 inherit，负例夹具的 stack 会直接打进测试输出、淹没断言结果。
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-      env: { ...process.env, [nonce.envName]: nonce.value, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
+      stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+      // nonce 走 **stdin**（与生产路径同构：`probeSpawnOptions` 已给 `input`），
+      // 这里只叠加看门狗窗口的环境变量（探针**只许缩短**，见其注释）。
+      env: { ...process.env, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
     });
     stdout = `${probeRun.stdout ?? ''}`;
     resultFd = `${probeRun.output?.[3] ?? ''}`;

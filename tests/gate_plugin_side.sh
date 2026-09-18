@@ -22,6 +22,7 @@
 # | `plugin-capture-callback-plugin` | H1/R22：抢占 `setUncaughtExceptionCaptureCallback` | `plugin.process_defense_tampered` | true |
 # | `plugin-defense-tamper-plugin` | H1/R28：摘掉探针兜底 + 装**自己的**（计数假阳性形态） | `plugin.process_defense_tampered` | true |
 # | `plugin-forged-result-plugin` | R26：伪造裸 marker 绿卡（nonce 侧信道） | `plugin.probe_result_forged` | true |
+# | `plugin-nonce-reverse-read-plugin` | R26：**反读 nonce**（environ/cmdline）再伪造带 nonce 结果行 | `plugin.probe_result_forged` | true |
 # | `plugin-sync-loop-plugin` | R24：`apply()` 内同步死循环（宿主二次终止） | `plugin.abnormal_termination` | **false** |
 # | `demo-plugin`（健康） | —— | 无（必须 GREEN 17/17） | true |
 #
@@ -107,6 +108,12 @@ NEGATIVE_CASES=(
   # nonce 带外通道收口后：伪造行被判 `plugin.probe_result_forged`，**且**真实缺陷
   # （`registry.exact`：注册了多余工具）仍被抓住——绿卡不得掩盖真缺陷。
   "plugin-forged-result-plugin|plugin.probe_result_forged|true|true|registry.exact,plugin.probe_result_forged"
+  # 🆕 **通道形态**复现（本轮新增，与上一份的分工）：上一份伪造的是**裸 marker**（无 nonce）；
+  # 本份**先反读 nonce**（`/proc/self/environ` + `/proc/self/cmdline`）再伪造**带 nonce** 的结果行。
+  # 若 nonce 经 **env / argv** 下发，本形态会拿到 nonce ⇒ **GREEN 放行**（实测：env 通道下确实如此）；
+  # 本实现经 **stdin** 下发 ⇒ 两条读取面都拿不到 ⇒ 判伪造、不放行。
+  # 这是「为什么必须用 stdin」的**可执行证据**（不是注释里的偏好）。
+  "plugin-nonce-reverse-read-plugin|plugin.probe_result_forged|true|true|plugin.probe_result_forged"
   # R26 的**结构级**防线（`plugin.protocol_injection`）在真宿主下**不可达**：探针在**任何插件代码之前**
   # 就把 nonce 从 `process.env` 删除 ⇒ 插件拿不到正确前缀 ⇒「匹配前缀的结果行 ≥2 条 / 出现在 stdout」
   # 无法构造。故该 check **不进闸门**，由离线 [9.11] 用**合成输入**断言（可达性边界见 docs/RISKS.md R26）。

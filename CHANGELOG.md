@@ -77,9 +77,9 @@ SIGTERM **6251ms** / `signal=null`。
 | 项 | 内容 |
 |---|---|
 | 缺口 | 探针与插件**共用 stdout + 同进程**：插件 `process.stdout.write('__DSH_PROBE__{绿卡}')` 即可自我发绿卡（实测：真实缺陷插件 → **GREEN**）；写 `hostFatal:[...]` 可把责任甩给上游（实测 AMBER / `UPSTREAM_DRIFT`）。**base 同样可复现**（既有缺口，见 `docs/RISKS.md` R26） |
-| 协议 | 宿主每次运行生成**随机** nonce 与**随机环境变量名**（`DSH_NONCE_<12 hex>`）：名字经 argv（`--probe-nonce-env=NAME`）、值经 env 传入；探针读到后**立刻**从 `process.env` 删除；输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行** |
+| 协议 | 宿主每次运行生成**随机** nonce，经 **stdin** 下发（探针 `readFileSync(0)` 读完**立刻** `process.stdin.destroy()`）；输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行**。<br>⚠️ **通道形态（本版加固，实测依据）**：本仓曾并行落地 **env 通道**（随机环境变量名经 argv、值经 env 传，探针 `delete process.env[NAME]`）。**实测可被同进程插件反读**——`delete` 只改 Node 视图，内核环境块不变，插件仍能从 **`/proc/self/environ`** 读回 nonce（夹具 `plugin-nonce-reverse-read-plugin` 在 env 通道下判 **GREEN / PASS / 17 项**）；argv 通道同理出现在 `ps`。stdin 不在环境块、不在 argv ⇒ 两条读取面都不成立（同夹具在 stdin 通道下判 RED） |
 | 判定 | 出现裸 `__DSH_PROBE__`（无 nonce / 不匹配）⇒ 判**伪造**：落插件侧 check **`plugin.probe_result_forged`**（登记 `PLUGIN_SIDE_CHECKS` + `CONDITIONAL_PROBE_CHECKS`，条件项 6 → 7），`result.ok` 必为 false |
-| 显式前提 | 「**插件为可信代码**」由 R26 写成**显式前提**（此前是隐式）。nonce 挡的是「无意的自我发绿卡」与「共用 stdout 的误命中」，**不是**「恶意插件」（恶意插件读自己的 argv/env 即可拿到 nonce）——根治需**进程隔离 / 独立 fd**（结构性重做，待人拍板） |
+| 显式前提 | 「**插件为可信代码**」由 R26 写成**显式前提**（此前是隐式）。nonce 挡的是「无意的自我发绿卡」「共用输出面的误命中」「从环境块 / argv 反读」，**不是**「恶意插件」（同进程同 uid 下的一切篡改需进程级隔离）——根治需**进程隔离**（结构性重做，待人拍板，见 `docs/REDO-PROPOSAL.md`） |
 | 回归 | 离线 `test_offline.sh` **[13]**（伪造即判 / 不放行 / 真报告不误伤 / 无 nonce 退化路径 / 名字与值都随机）+ 新夹具 `plugin-forged-result-plugin` → **进闸门**（真宿主失败项集合含 `plugin.probe_result_forged` 且真缺陷 `registry.exact` 仍被抓）+ 真宿主 E2E `[8d]` |
 
 ### 🔴-5 命名口径守卫（合并不得再丢防线）

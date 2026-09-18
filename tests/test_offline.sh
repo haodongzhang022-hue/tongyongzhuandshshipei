@@ -506,7 +506,7 @@ NONCE_OUT="$("$NODE_BIN" --input-type=module -e '
 import { interpretProbeStdout } from "'"$ROOT"'/src/harness/host.mjs";
 import { createProbeNonce, probeResultPrefix, PLUGIN_PROBE_FORGED_RESULT_CHECK } from "'"$ROOT"'/src/harness/contract.mjs";
 import { randomBytes } from "node:crypto";
-const { envName, value } = createProbeNonce(randomBytes);
+const { value } = createProbeNonce(randomBytes);
 const good = { checks: [{ name: "host.tools_ready", status: "pass" }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: "plugin-integration" };
 const forgedLine = "__DSH_PROBE__" + JSON.stringify({ checks: [{ name: "plugin.loaded", status: "pass" }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: "plugin-integration" }) + "\n";
 const realLine = probeResultPrefix(value) + JSON.stringify(good) + "\n";
@@ -523,16 +523,14 @@ console.log([
   a.ok === false,
   a.checks.some((c) => c.name === "host.tools_ready" && c.status === "pass"),
   b.checks.length === 1 && b.ok === true,
-  envName !== n2.envName && value !== n2.value,
-  /^DSH_NONCE_[0-9a-f]{12}$/.test(envName),
+  value !== n2.value,
 ].join("|"));
 ')"
 assert "伪造裸 marker 被判 plugin.probe_result_forged（真缺陷不再被绿卡掩盖）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f1)"
 assert "伪造 ⇒ ok=false（不放行，绝不当成通过）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f2)"
 assert "带 nonce 的真报告仍被正确读取（通道不误伤正常路径）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f3)"
 assert "无 nonce（离线/手工调用）→ 退化为历史行为（认裸 marker）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f4)"
-assert "nonce 值与承载它的环境变量名**都随机**（固定名 = 没设防）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f5)"
-assert "随机环境变量名形状 = DSH_NONCE_<12 hex>" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f6)"
+assert "nonce 值每次随机（固定值 = 没设防）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f5)"
 
 # 端到端：伪造夹具经**真协议**跑（宿主生成 nonce + 探针带 nonce 输出 + 宿主只认带 nonce 行）
 FORGED_OUT="$("$NODE_BIN" --input-type=module -e '
