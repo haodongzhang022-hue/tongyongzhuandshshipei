@@ -40,8 +40,8 @@
 | 二级信息汇报 | `src/report/secondary.mjs` | 代码 | JSON + Markdown 双视图 |
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 76 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🔴-D 相位化兜底、漂移相关性表唯一事实源 [14]、watch 影响面 [15]） |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 165 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9]（无网可跑） |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 80 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🔴-D 相位化兜底、漂移相关性表唯一事实源 [14]、watch 影响面 [15]） |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 169 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9]（无网可跑） |
 | 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 64 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧异常写进判据字段）场景，含 attribution + verdict 双断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 7 步「文档计数防漂移」） |
 | 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + 防线编号自述可检索（28 项） |
