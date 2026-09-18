@@ -1765,6 +1765,11 @@ console.log('  [9.13] 🔴 必修-4 同族假绿：猴子补丁 JSON.stringify�
 // ⇒ 当前**唯一**有效的那条腿是 **nonce 保密性**（stdin 下发 ⇒ 经 env / argv 拿不到）；一旦插件经
 //   **其它同进程手段**拿到 nonce（R29），本形态即**重新变绿**。根治 = 批 2「独立 fd 且**永不回退 stdout**」。
 //
+// ⚠️ **前提（不得省略）**：本段形态 C/D 的输入是「**已知正确 nonce**」的合成结果行——即
+//   它证明的是「**装配器判据在拿到 nonce 时会采信**」，而不是「本仓夹具现在就能拿到 nonce」。
+//   本仓夹具（`plugin-nonce-reverse-read-plugin`）经 env / argv **拿不到** nonce ⇒ 实测仍判
+//   `plugin.probe_result_forged`（RED）。两句话不矛盾：**nonce 保密性是当前唯一有效的腿**（见 R26）。
+//
 // ⚠️ 本段的定位：**把现状固化为可执行断言**，而不是宣称它已被收口。
 //   · 批 2 落地（fd3 为空 ⇒ 判「无报告 / 不可信」）后，本段的 `FAIL_OPEN_KNOWN` 断言**必须翻面**
 //     （改断言为「不得被采信」）——**修好即红**，强制文档与判据同步。
@@ -1787,7 +1792,7 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
   // ① 形态 C：伪造写 **fd3**、探针**来不及 emit** ⇒ 当前被采信（**已知边界**，批 2 必修）
   {
     const r = run('', forgedLine);
-    eq('R26 残留②（fail-open·形态 C）：伪造写 fd3 + 探针未 emit ⇒ 当前**被采信**（批 2 必修：不得回退）',
+    eq('R26 残留②（fail-open·形态 C）：**给定插件已拿到 nonce** + 伪造写 fd3 + 探针未 emit ⇒ 当前**被采信**（批 2 必修：不得回退）',
       true, r.ok === true);
     eq('R26 残留②：形态 C 无任何篡改证据（`checks` 里只有伪造项）', 0,
       r.checks.filter((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK).length);
@@ -1796,7 +1801,7 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
   //    ⇒ 证明「写对通道」不是使能条件（评审复评 §二-② 的实测结论）
   {
     const r = run(forgedLine, '');
-    eq('R26 残留②（fail-open·形态 D）：伪造写 **stdout** + 探针未 emit ⇒ **同样**被采信',
+    eq('R26 残留②（fail-open·形态 D）：**给定已拿到 nonce** + 伪造写 **stdout** + 探针未 emit ⇒ **同样**被采信',
       true, r.ok === true);
     eq('R26 残留②：C/D 两形态**同判**（⇒ 通道选择不是关键，写对 fd3 不是使能条件）', true,
       run('', forgedLine).ok === run(forgedLine, '').ok);
