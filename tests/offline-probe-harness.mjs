@@ -92,11 +92,15 @@ export default function ToolRuntime(ctx) { ctx.provide('tools', new FakeToolRunt
  *   不传 = 生产口径，取自 `probeSpawnOptions` 的 `CHILD_KILL_SIGNAL`）
  * @param {boolean} [options.noResultChannel] **不给探针 fd3**（`stdio[3]='ignore'`）——
  *   复现「结果通道不可用 ⇒ 降级到 stdout」（批 1.5 / 🔴-R2 的回归入口）
+ * @param {boolean} [options.stdinUnreadable] **仅回归反证用**：把探针的 fd 0 设为 `'ignore'`
+ *   （stdin 不可读），复现「无 nonce 路径」——旧缺陷（🔴-A）下探针会因 `PROBE_RESULT_MARKER`
+ *   未 import 而 `ReferenceError` 硬崩、无结构化结果、被归因成 `UPSTREAM_DRIFT`（甩锅上游）。
+ *   生产路径**不得**传它。
  * @returns {{result: object, attribution: string, reasons: string[], exit: {status:number|null, signal:string|null}}}
  *   `result` 是装配器结构（`checks` / `hostFatal` / `runCompleted` / `phase` / `ok` / `resultChannel`）
  */
 export function runOfflineProbe(options) {
-  const { pluginPath, expectedTools = [], watchdogMs, timeoutMs = 30_000, killSignal, noResultChannel = false } = options;
+  const { pluginPath, expectedTools = [], watchdogMs, timeoutMs = 30_000, killSignal, noResultChannel = false, stdinUnreadable = false } = options;
   const startedAt = Date.now();
   const work = mkdtempSync(path.join(tmpdir(), 'dsh-offline-probe-'));
   try {
@@ -129,11 +133,14 @@ export function runOfflineProbe(options) {
       cwd: work,
       // 唯一与生产不同的一处：stderr 也接回（生产是 `inherit`，让 CI 日志看得见探针的原始报错）。
       // 回归台若 inherit，负例夹具的 stack 会直接打进测试输出、淹没断言结果。
-      // `noResultChannel` 时第 4 位为 'ignore'（**不给 fd3**）⇒ 复现「通道降级」形态。
-      stdio: ['pipe', 'pipe', 'pipe', noResultChannel ? 'ignore' : 'pipe'],
+      // 两个形态都是**回归专用**：`noResultChannel` 不给 fd3（复现通道降级）；
+      // `stdinUnreadable` 把 fd 0 设 'ignore'（复现「stdin 不可读 ⇒ 无 nonce」路径）。
+      stdio: [stdinUnreadable ? 'ignore' : 'pipe', 'pipe', 'pipe', noResultChannel ? 'ignore' : 'pipe'],
       // nonce 走 **stdin**（与生产路径同构：`probeSpawnOptions` 已给 `input`），
       // 这里只叠加看门狗窗口的环境变量（探针**只许缩短**，见其注释）。
       env: { ...process.env, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
+      // stdinUnreadable：fd 0 为 'ignore'，不传 input（探针 readFileSync(0) 会抛 ⇒ nonceValue=null）
+      ...(stdinUnreadable ? { input: undefined } : {}),
     });
     stdout = `${probeRun.stdout ?? ''}`;
     resultFd = `${probeRun.output?.[3] ?? ''}`;
@@ -147,7 +154,8 @@ export function runOfflineProbe(options) {
     };
     result.probeExit = exit;
     result.durationMs = Date.now() - startedAt;
-    interpretProbeStdout(result, stdout, { resultFd, nonce: nonce.value });
+    // stdinUnreadable：宿主侧同样按「无 nonce」解释（生产路径不会出现该形态，仅回归反证）
+    interpretProbeStdout(result, stdout, { resultFd, nonce: stdinUnreadable ? null : nonce.value });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');
     return { result, attribution: detail.attribution, reasons: detail.reasons, exit, stdout, resultFd, stderr: `${probeRun.stderr ?? ''}` };

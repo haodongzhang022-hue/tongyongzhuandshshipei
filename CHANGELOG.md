@@ -1,9 +1,14 @@
-# 变更记录（dsh-adapt-hub）
+## v0.2.3 · 批 1.5（复评 🔴-R1/R2 收口）+ 评审复评收口（🔴-A/R30 · R29 立项）
 
-## v0.2.3 · 批 1.5 —— 复评 🔴-R1 / 🔴-R2 收口（可达性口径作废 + 降级不放行 + 反例固化 + exit 台账）
+> 承接 v0.2.2（nonce 通道改 **stdin**）。本版由**两条并行线**的产出**并集**而成，两者均已复核：
+> - **批 1.5**（架构·总师复评裁定，锚点 `e381d52`）：可达性口径作废 + 通道可见化（降级不放行）
+>   + §3 反例固化 + `exit` 台账 + 计数守卫；
+> - **评审复评收口**（锚点 `0ac4ab6`）：🔴-A 探针无 nonce 硬崩（登记 R30）+ 不实缓解措辞
+>   + 条件项守卫扩面 + 🔴-B 登记 R29（批 2 进程隔离由「待拍板」升为在办）。
+> 批 1 状态 = **`in_progress`**；批 2（进程隔离）**未动工**，待 CP2 人批准。
 
-> 承接 v0.2.2（nonce 改走 stdin）。本轮按**架构·总师复评裁定**落地**批 1.5**（8 项，小、可回滚、不动架构）。
-> 批 1 状态由 `done` 改 **`in_progress`**（三处「真宿主不可达」口径作废）；批 2（进程隔离）**待 CP2 人批准**。
+### A · 批 1.5（可达性口径 / 通道可见化 / 反例固化 / exit 台账）
+
 
 ### 🔴-R1 可达性论断被反证 —— 三处「不可达」口径**作废**，判据改**可证伪**
 
@@ -43,11 +48,65 @@
 
 ### 测试项数（本版）
 
-- 离线单测 147 项（`tests/test_offline.sh`：128 → 147；新增 [19] 批 1.5 四项 × 18 条）
-- 归因离线回归 452 项（`tests/test_attribution.mjs`：441 → 452；[9.11f] 可证伪改写 + 口径守卫）
+- 离线单测 153 项（`tests/test_offline.sh`：128 → 153；批 1.5 新增 [19] 四项 × 19 条 + 并行线 [16] 无 nonce 探针端 6 条）
+- 归因离线回归 456 项（`tests/test_attribution.mjs`：441 → 456；[9.11f] 可证伪改写 + 口径守卫 + 并行线 🔴-A 源码守卫）
 - 归因端到端回归 156 项（`tests/test_e2e_regression.mjs`：146 → 156；新增 [8g] §3 反例 + 通道可见化 10 条）
 - 插件侧闸门 23 项（`tests/gate_plugin_side.sh`：21 → 23；负例 15 → **16 份**：+ §3 反例 + exit 钩子）
-- 发布面自检 40 项（`tests/test_exports.mjs`，不变）
+- 发布面自检 43 项（`tests/test_exports.mjs`：40 → 43；条件项守卫扩面）
+
+### B · 评审复评收口（🔴-A / R29 / 措辞与守卫）
+> 承接 v0.2.2（nonce 通道改 **stdin**）。本版由**评审复评**（锚点 `0ac4ab6`）驱动，
+> 逐条回应 §一–§六；**处置 = 清零 🔴**。总师裁定：① 放行对象 = `0ac4ab6`（改锚转测试）；
+> ② 批 2（进程隔离）**由「待拍板」升为在办**（R29 证逐点补不可穷尽）。
+
+### 🔴-A（探针端硬崩 ⇒ 甩锅上游）—— 已收口，登记 R30
+
+| 项 | 内容 |
+|---|---|
+| 缺陷 | `probe-template.mjs` 在无 nonce 分支用 `PROBE_RESULT_MARKER`，但 **import 列表里没有它** ⇒ 任何不带 nonce 的调用（stdin 不可读 / 手工直跑 / 旧宿主 / 版本错配）抛 `ReferenceError` / rc=1 / **无结构化结果、无相位信标** |
+| 后果 | 装配器判 **`UPSTREAM_DRIFT` / `hostFatal[]` 非空** —— 探针**自身**缺陷被报成「上游变了」（本项目定义的最严重失败类，甩锅方是宿主自己） |
+| 修法 | 补 `PROBE_RESULT_MARKER` import（一行） |
+| 防线 | ① **探针端**回归 `test_offline.sh` [16] 补 6 条（无 nonce：rc=0 / 17 项 / 全绿 / `hostFatal` 为空 / 完成位 true / **不得**归因 `UPSTREAM_DRIFT`）——既有 [13] 只测**解释端**，给探针做不到的承诺开了绿灯；② `test_attribution.mjs` 新增**源码守卫**：探针用到的 `contract.mjs` 导出**必须已 import**（按词元判，回退即红，已做反证）；③ 离线回归台新增 `stdinUnreadable` 形态（**仅回归反证用**） |
+
+### 🔴-B（`JSON.stringify` 未捕获）—— 不逐点补，登记 **R29** + 批 2 立项
+
+- 独立复现：同缺陷（多注册 `demo_extra`）对照 = **RED / `fails=[registry.exact]`**；打 `JSON.stringify` 补丁 = **`ok=true` / 17 项全 pass / `hostFatal=0`**（真缺陷被绿卡掩盖）。
+- 定性：与 R26 同族 —— 凭据（nonce）与通道（fd3）只是**加门槛**，同进程可写**任意全局** ⇒ **逐点补不可穷尽**（上轮 `/proc`，本轮 `JSON.stringify`）。
+- 处置：**不逐点补**；登记 **R29（HIGH）**，根治 = `docs/REDO-PROPOSAL.md` **批 2 · 进程隔离**（总师裁定**升为在办**，待人批额度后开工）。
+
+### 不实缓解措辞收口（文档/注释与代码相反）
+
+「读到后立刻从 `process.env` 删除（缩小插件侧可见窗口）」是 **env 通道时代**的措辞，代码早已改读 `readFileSync(0)`。**4 处全部收口**（`probe-template.mjs` / `gate_plugin_side.sh` / `test_attribution.mjs` / `test_e2e_regression.mjs`），并改为陈述**实测依据**（env 可被 `/proc/self/environ` 反读 ⇒ 故用 stdin）。
+
+### 🟡（不阻断，本版一并收）
+
+| 项 | 收口 |
+|---|---|
+| 条件项守卫只覆盖 `ADAPTER_GUIDE` + `INDEX`（`ARCHITECTURE` / `README` 可静默漂移） | 守卫扩到 **`docs/ARCHITECTURE.md` + `README.md`**；且名单匹配改**词元精确**（防 `plugin.probe_result_forgedX` 前缀包含逃逸）。已做三组反证（N 改字 / 名单改名 / README 的 N） |
+| `host.mjs:329` 仍裸 `startsWith('__DSH_PROBE__')` | 改用唯一事实源常量 `PROBE_RESULT_MARKER`（同文件两种写法收口） |
+| `probe-template.mjs` 未使用 import | 移除 `PLUGIN_PROTOCOL_INJECTION_CHECK` / `PROBE_NONCE_STDIN_CHANNEL`（探针侧未用） |
+| 措辞不一致：226 行「三重」vs 84/355「四重」 | 统一为**四重** |
+| `REDO-PROPOSAL.md` §6 承诺 `stdout-degraded` 字段（全仓无该字段） | 按**现状**更正陈述（降级行为已实现；**报告字段未落地**，显式标注） |
+| `probeNonceChannel` 设了但 `runner` 未透传 | `runner.mjs` 透传 + `secondary.mjs` 报告输出该字段 |
+
+### 测试项数（本版）
+
+- `tests/test_offline.sh`：128 → **134 项**（🔴-A 探针端无 nonce 6 条）
+- `tests/test_attribution.mjs`：441 → **445 项**（🔴-A 源码守卫 2 条 + R29/R30 留痕 2 条）
+- `tests/test_exports.mjs`：40 → **43 项**（条件项守卫扩面：ARCHITECTURE + README）
+- `tests/test_e2e_regression.mjs`：**146 项**（不变）
+- `tests/gate_plugin_side.sh`：**21 项**（不变；健康插件 17/17 防过度修正）
+
+### 风险登记（本版）
+
+- **R29（HIGH，新增）**：全局改写（猴子补丁）⇒ 放行级假绿；**批 2 落地前无代码级兜底**（显式暴露，不兜底）。
+- **R30（HIGH，新增，已收口）**：探针无 nonce 路径硬崩 ⇒ 甩锅上游。
+- **R26（保留）**：残留边界补注「该形态已实测，独立登记 R29」。
+
+### 兼容性
+
+- 无行为变更（🔴-A 是修**崩溃路径**；其余为注释/守卫/文档口径）。
+- `probe-template.mjs` 的 import 列表**变短**（移除 2 个未用符号）+ **变长**（补 1 个必需符号）。
 
 ## v0.2.2 · nonce 带外通道改走 **stdin**（env/argv 通道可被同进程插件反读，实测放行级假绿）
 

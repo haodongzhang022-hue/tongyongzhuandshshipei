@@ -85,6 +85,8 @@ export function verifyChannel(options) {
     // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
     probePhase: probe.phase ?? null,
     probeExit: probe.probeExit ?? null,
+    // nonce 带外通道形态（stdin）——探针侧设了就必须透传到报告，否则排障时看不到通道口径
+    probeNonceChannel: probe.probeNonceChannel ?? null,
     install: probe.install,
     cacheHit: probe.cacheHit,
     durationMs: probe.durationMs,

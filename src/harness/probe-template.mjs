@@ -102,7 +102,7 @@ import {
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
-  PROBE_NONCE_STDIN_CHANNEL,
+  PROBE_RESULT_MARKER,
   probeResultPrefix,
   collectContract,
   pushHostFatal,
@@ -121,14 +121,15 @@ const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
 // 前缀带 nonce，宿主也只认带 nonce 的行。这样「谁是探针」由宿主掌握的随机量判定，
 // 而不是靠公开字面量 `__DSH_PROBE__`——插件伪造裸 marker 会被宿主识别为伪造。
 //
-// ⚠️ 为什么**不是** env / argv（实测依据，不是偏好）：本仓曾并行落地 env 通道（随机环境变量名
-// 经 argv 传、值经 env 传，探针读到后 `delete process.env[NAME]`）。**实测可被同进程插件反读**：
-// `delete` 只改 Node 的环境视图，不改内核里的进程环境块 ⇒ 插件从 **`/proc/self/environ`**
-// 读回 nonce，进而伪造出**被采信**的结果行（实测 GREEN / PASS / 17 项）。argv 同理出现在
-// `ps` / `/proc/self/cmdline`。故**删除** env 传值口径与相关 API。
+// ⚠️ 为什么**不是** env / argv（实测依据，见 docs/RISKS.md R26）：本仓曾并行落地 env 通道
+// （随机环境变量名经 argv 传、值经 env 传，探针读到后 `delete process.env[NAME]`）。
+// **实测可被同进程插件反读**：`delete` 只改 Node 的环境视图，不改内核里的进程环境块
+// ⇒ 插件从 **`/proc/self/environ`** 读回 nonce，进而伪造出**被采信**的结果行
+// （实测 GREEN / PASS / 17 项）；argv 同理出现在 `ps` / `/proc/self/cmdline`。
+// stdin 的字节流不在进程环境块、也不在 argv 里 ⇒ 上述两条读取面都不成立。
 //
-// 纪律：读到后**立刻** `destroy()` fd 0（否则插件可从 `/dev/fd/0` 再读一遍——实测 destroy 后
-// 读回空串）。缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
+// 纪律：读完**立刻** `process.stdin.destroy()`（否则插件可从 fd 0 / `/dev/fd/0` 再读一遍——
+// 实测 destroy 后读回空串）。缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
 // 但宿主侧会按「无 nonce ⇒ 不可信」处理（见 host.mjs 的 interpretProbeStdout）。
 const nonceValue = (() => {
   try {
@@ -267,7 +268,7 @@ function writeResult(payload) {
   }
 }
 
-// ---- 进程内防线：wrap API + 收尾三重自检（H1 / R22 / R28）----
+// ---- 进程内防线：wrap API + 收尾四重自检（H1 / R22 / R28）----
 /**
  * 我们自己的两个进程级 handler（**身份检查**的锚点）。
  *

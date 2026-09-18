@@ -335,7 +335,7 @@ export function runHostProbe(options) {
 export function collectProbeResultLines(text) {
   return String(text ?? '')
     .split('\n')
-    .filter((line) => line.startsWith('__DSH_PROBE__'));
+    .filter((line) => line.startsWith(PROBE_RESULT_MARKER));
 }
 
 /**

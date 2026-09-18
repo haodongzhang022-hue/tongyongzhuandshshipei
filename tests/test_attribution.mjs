@@ -58,6 +58,7 @@ import {
   recordProbeException,
   recordProbeRunIncomplete,
 } from '../src/harness/contract.mjs';
+import * as contractNs from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
 import { channelFingerprint, collectProbeResultLines, interpretProbeStdout, loadChannels, probeSpawnOptions, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
@@ -1156,21 +1157,6 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
   eq('R26：落点 check 已登记进 CONDITIONAL_PROBE_CHECKS（条件项计数随之 +1）', true,
     CONDITIONAL_PROBE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
 
-  // 9.11f **可达性：可证伪断言**（复评裁定 ⑤ 收口——上一版这里是**恒真式**，测不到它要守的命题）。
-  //
-  // ## 上一版错在哪（复评 🔴-R1）
-  // 上一版写的是「结构级防线（`plugin.protocol_injection`）在**真宿主不可达**」，并把断言写成
-  // `PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK)` —— **恒真式**（名单里当然有它），
-  // 与「可达性」**无关** ⇒ 该「守卫」测不到它要守的命题（正是 R27 点过的「断言不可满足 / 假精度」）。
-  // 更严重的是：那句「不可达」是**事实错误**——本仓实测（env 通道下）插件经 `/proc/self/environ`
-  // 反读 nonce 后，把**匹配前缀**的结果行写到 stdout，真宿主**确实命中** `plugin.protocol_injection`。
-  //
-  // ## 现在的口径（事实陈述，不越权承诺）
-  // 结构级防线要求「**匹配 nonce 前缀**的结果行 ≥2 条 / 出现在 stdout」⇒ 它**可达当且仅当**
-  // 插件能拿到 nonce。当前实现 nonce 经 **stdin** 下发（不经 env / argv）⇒ 经这两条**读取面**
-  // 不可达（由下面的通道形态守卫 + 夹具自检钉住）；但**同进程同 uid** 下插件仍可用**其它**手段
-  // 拿到 nonce（猴子补丁 / 读内存）⇒ **不得**写「真宿主不可达」，那是把未验证的命题写成对外口径。
-  // 故本段的断言改为**可证伪**：构造输入 → 判据必须命中；去掉 nonce → 判据必须**不**命中。
   {
     const mkPayload = (ok = true) => JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok, runCompleted: true, phase: 'plugin-integration' });
     const nonce = createProbeNonce(randomBytes).value;
@@ -1436,6 +1422,9 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     ['R26', '协议注入 → 放行级假绿（结果通道被注入伪造报告）'],
     ['R27', '口径守卫同义绕过 + 只守了错的命题'],
     ['R28', '修法 A 自检判据不可判定（has()||listenerCount>0 假阳性）'],
+    // v0.2.3（评审复评 §三）：两条新活口必须留痕（「已知活口不得静默」）
+    ['R29', '全局改写（猴子补丁 JSON.stringify）→ 放行级假绿（R26 同族，逐点补不可穷尽）'],
+    ['R30', '探针无 nonce 路径硬崩 → 甩锅上游（PROBE_RESULT_MARKER 未 import）'],
   ]) {
     eq(`口径守卫：RISKS 记录 ${id}（${label}）`, true, new RegExp(`\\|\\s*${id}\\s*\\|`).test(risks));
   }
@@ -1449,6 +1438,29 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     eq(`口径守卫：${label} 夹具存在且真的复现该形态`, true, marker.test(src));
     eq(`口径守卫：${label} 夹具自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
   }
+  // 🔴-A（评审复评）：探针**用到**的标识符必须真的 import —— 旧缺陷是 `probe-template.mjs` 在
+  // 无 nonce 分支用 `PROBE_RESULT_MARKER` 却没 import ⇒ 任何不带 nonce 的调用 `ReferenceError`
+  // 硬崩、无结构化结果、被归因成 `UPSTREAM_DRIFT`（探针自身缺陷甩锅上游）。
+  // 守卫按**标识符词元**判（不用 includes，防前缀包含绕过）——「用到的必须在 import 里」。
+  {
+    const probeSrcForImport = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+    const importBlock = probeSrcForImport.slice(0, probeSrcForImport.indexOf("} from './contract.mjs'"));
+    const bodyAfterImport = probeSrcForImport.slice(probeSrcForImport.indexOf("} from './contract.mjs'"));
+    const tokens = (text) => text.split(/[^A-Za-z0-9_$]+/).filter(Boolean);
+    // ⚠️ 判据只认**代码**（`codeOnly` 去注释 + 去字符串/模板文本，保留 `${...}` 插值）：
+    // 注释里为说明历史而引用某个常量名（如「见 host.mjs 的 `PROBE_NONCE_STDIN_CHANNEL`」）
+    // **不是**「用到」——按原文扫描会把文档当实现（误报），而守卫本身不能有误报。
+    const imported = new Set(tokens(codeOnly(importBlock)));
+    // 判据范围 = **contract.mjs 真的导出**的名字（避免把本地 Symbol / 属性名误判为缺 import）
+    const contractExports = new Set(Object.keys(contractNs));
+    const used = new Set(tokens(codeOnly(bodyAfterImport)).filter((t) => contractExports.has(t)));
+    const missing = [...used].filter((t) => !imported.has(t));
+    eq('🔴-A 源码守卫：探针用到的 PROBE_/PLUGIN_ 常量均已 import（缺失即 ReferenceError 硬崩）',
+      JSON.stringify([]), JSON.stringify(missing));
+    eq('🔴-A 源码守卫：PROBE_RESULT_MARKER 已在 import 列表内（旧缺陷点）', true,
+      imported.has('PROBE_RESULT_MARKER'));
+  }
+
   // 🆕 信任边界（🟡-4）必须**显式**登记：既有缺口（base 同样可复现）不得因「本 PR 未引入」而漏登记。
   // 断言三件套：① R26 行存在；② 显式前提「插件为可信代码」写明；③ 残留边界（进程隔离）写明。
   eq('🟡-4：RISKS R26 写明显式前提「插件为可信代码」（此前是隐式）', true, /插件为\*\*?可信代码|插件为可信代码/.test(risks));

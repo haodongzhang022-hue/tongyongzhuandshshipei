@@ -554,6 +554,33 @@ assert "R24 同步死循环：按相位信标归因插件侧 + hostFatal 为空"
 assert "R24 同步死循环：完成位 false（未跑完不得判通过）" "false" "$(j syncLoop '.completed')"
 assert "R24 同步死循环：归因 PLUGIN_REGRESSION（有信标 ⇒ 不判上游漂移）" "PLUGIN_REGRESSION" "$(j syncLoop '.attribution')"
 
+# 🔴-A（评审复评）：**探针端**「无 nonce 仍出报告」回归。
+# 为什么补：旧缺陷是 `probe-template.mjs` 用了 `PROBE_RESULT_MARKER` 但**没 import** ⇒ 任何
+# 不带 nonce 的调用（stdin 不可读 / 手工直跑 / 旧宿主）都 `ReferenceError` 硬崩、无结构化结果、
+# 被归因成 `UPSTREAM_DRIFT`（探针**自身**缺陷甩锅上游）。而既有 [13] 只测了**解释端**的
+# 「无 nonce 退化」，给探针做不到的承诺开了绿灯 —— 故必须在**探针端**补一条。
+NONONCE_OUT="$("$NODE_BIN" --input-type=module -e "
+import path from 'node:path';
+import { runOfflineProbe } from '$ROOT/tests/offline-probe-harness.mjs';
+const r = runOfflineProbe({ pluginPath: path.join('$ROOT', 'tests/fixtures/demo-plugin.mjs'), expectedTools: ['demo_echo', 'demo_status'], stdinUnreadable: true });
+const checks = r.result.checks;
+console.log([
+  r.exit.status,
+  checks.length,
+  checks.filter((c) => c.status === 'pass').length,
+  r.result.hostFatal.length,
+  r.result.ok === true,
+  r.attribution === 'UPSTREAM_DRIFT',
+  r.result.runCompleted === true,
+].join('|'));
+")"
+assert "🔴-A 无 nonce（stdin 不可读）：探针**不得**硬崩（rc=0）" "0" "$(echo "$NONONCE_OUT" | cut -d'|' -f1)"
+assert "🔴-A 无 nonce：仍出**完整**结构化报告（17 项，不是 checks 归零）" "17" "$(echo "$NONONCE_OUT" | cut -d'|' -f2)"
+assert "🔴-A 无 nonce：健康插件仍 17/17 全绿" "17" "$(echo "$NONONCE_OUT" | cut -d'|' -f3)"
+assert "🔴-A 无 nonce：hostFatal 为空（探针自身缺陷**不得**写成宿主侧信号）" "0" "$(echo "$NONONCE_OUT" | cut -d'|' -f4)"
+assert "🔴-A 无 nonce：完成位=true（跑完了）" "true" "$(echo "$NONONCE_OUT" | cut -d'|' -f7)"
+assert "🔴-A 无 nonce：**不得**归因 UPSTREAM_DRIFT（不甩锅上游）" "false" "$(echo "$NONONCE_OUT" | cut -d'|' -f6)"
+
 
 echo "  [19] 🆕 批 1.5：结果通道可见化 + 降级不得判 PASS + §3 反例固化 + exit 钩子台账"
 # 四项分别对应复评裁定的批 1.5 清单：

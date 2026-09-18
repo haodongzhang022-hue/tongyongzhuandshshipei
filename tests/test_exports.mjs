@@ -159,13 +159,27 @@ console.log("  [2b'] INDEX 清单标题/序号列/注脚结构");
 console.log("  [2b'''] 文档「另有 N 项条件检查」与 CONDITIONAL_PROBE_CHECKS 一致");
 {
   const N = CONDITIONAL_PROBE_CHECKS.length;
-  for (const file of ['docs/ADAPTER_GUIDE.md', 'docs/INDEX.md']) {
+  // 🟡-1（评审复评）：此前只守 ADAPTER_GUIDE / INDEX 两份 ⇒ ARCHITECTURE / README **可静默漂移**
+  // （实测：ARCHITECTURE 的「另有 8→9」+ `plugin.protocol_injection` 改名 → exports 仍全绿）。
+  // 文档即防线：凡声明了条件项数 / 名单的文档都必须纳入守卫。
+  // ⚠️ 名单匹配按**标识符词元**判（split 后精确相等），不用 `text.includes(name)`：
+  // 否则把 `plugin.probe_result_forged` 改成 `plugin.probe_result_forgedX` 时 `includes` 仍命中
+  // （前缀包含）⇒ 改名静默逃逸（与 🟡-1 同族）。
+  const hasIdent = (hay, name) => hay.split(/[^A-Za-z0-9_.]+/).includes(name);
+  for (const file of ['docs/ADAPTER_GUIDE.md', 'docs/INDEX.md', 'docs/ARCHITECTURE.md']) {
     const text = readFileSync(path.join(ROOT, file), 'utf8');
     const declared = /另有\s*(\d+)\s*项条件检查/.exec(text);
     if (!declared) { bad(`${file} 声明「另有 N 项条件检查」`, '未找到该声明（声明本身是必需项）'); continue; }
     eq(`${file} 的「另有 N 项条件检查」N = CONDITIONAL_PROBE_CHECKS.length`, String(N), declared[1]);
-    const missing = CONDITIONAL_PROBE_CHECKS.filter((name) => !text.includes(name));
+    const missing = CONDITIONAL_PROBE_CHECKS.filter((name) => !hasIdent(text, name));
     eq(`${file} 条件检查表覆盖全部条件项（名单取自唯一事实源）`, JSON.stringify([]), JSON.stringify(missing));
+  }
+  // README 用另一种写法（「17 项探针（+N 条件项）」）——同样必须与唯一事实源一致，且不得静默漂移。
+  {
+    const readme = readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+    const m = /\+(\d+)\s*条件项/.exec(readme);
+    if (!m) bad('README 声明「+N 条件项」', '未找到该声明（声明本身是必需项）');
+    else eq('README 的「+N 条件项」N = CONDITIONAL_PROBE_CHECKS.length', String(N), m[1]);
   }
   // 守卫自证：N 改字即红（把两份文档的 N 改掉，断言必须不成立）
   const idxText = readFileSync(path.join(ROOT, 'docs/INDEX.md'), 'utf8');
