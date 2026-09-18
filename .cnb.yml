@@ -68,20 +68,16 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D / 🔴-D′ 闸门：插件侧异常与**插件侧中断**都不得进判据字段 hostFatal[]。
-            # 断言口径与夹具清单**只有一处**（tests/gate_plugin_side.mjs）——push 段与 PR 段
-            # 原先各抄一份同样的 inline 断言，两处一旦漂移，其中一处会静默失效（闸门失效比没有
-            # 闸门更危险：它给人「已守住」的错觉）。
+            # 🔴-D / 🔴 必修-2/3 闸门：插件侧错误**不得**进判据字段 hostFatal[]。
+            # 四条出口（同步 / 异步 / 进程 exit / run() 被拖住）+ 不可捕获边界（SIGKILL）
+            # + **防过度修正**（健康插件仍须 17/17 GREEN）。
             #
-            # 覆盖 8 份夹具、三种形态：
-            #  ① 探针活着·同步异常（plugin-side-throw / plugin-registry-throw）
-            #  ② 探针活着·异步异常（plugin-async-throw / plugin-async-reject）
-            #  ③ **探针被插件杀掉**（plugin-hang / plugin-process-exit / plugin-detach-handlers /
-            #     plugin-busy-loop）——探针内任何兜底都来不及跑，由**装配器**读带外侧信道相位
-            #     （probe-phase.txt）归因；失败项 plugin.probe_aborted / plugin.async_uncaught_exception。
-            # 每份都断言：attribution=PLUGIN_REGRESSION、hostFatal 为空、verdict≠AMBER、
-            # checks 非空且 17 项一项不缺、失败项全在 PLUGIN_SIDE_CHECKS 内、期望失败项确实出现。
-            node tests/gate_plugin_side.mjs --channel stable --json-dir ./.ci
+            # 口径与夹具清单的唯一事实源是 tests/gate_plugin_side.sh —— push 段与 PR 段
+            # **共用同一份**（评审 🟢 重复项：此前两段各自维护，54 行差异 ⇒ 迟早一处加了
+            # 夹具、另一处忘了，闸门静默失效）。
+            #
+            # 出口④ 的回归加速：宿主侧**缩短**看门狗窗口（探针只许缩短、不许延长）。
+            DSH_PROBE_RUN_WATCHDOG_MS=5000 bash tests/gate_plugin_side.sh
     - name: upstream-watch
       docker:
         image: node:22
@@ -134,10 +130,9 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D / 🔴-D′ 闸门（与 push 段同一脚本：口径与夹具清单只有一处，防两段漂移后
-            # 其中一处静默失效）。8 份夹具 / 三种形态：探针活着·同步、探针活着·异步、
-            # **探针被插件杀掉**（挂起 / process.exit / 摘处理器 / 占死事件循环）。
-            node tests/gate_plugin_side.mjs --channel stable --json-dir ./.ci
+            # 🔴-D / 🔴 必修-2/3 闸门（同 push 段，**同一份脚本**）：
+            # 四条出口 + 不可捕获边界 + 防过度修正（健康插件 17/17）。
+            DSH_PROBE_RUN_WATCHDOG_MS=5000 bash tests/gate_plugin_side.sh
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
     - name: upstream-drift-scan

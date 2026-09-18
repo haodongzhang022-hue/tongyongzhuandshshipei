@@ -171,13 +171,37 @@ console.log("  [2b'''] 文档「另有 N 项条件检查」与 CONDITIONAL_PROBE
   const idxText = readFileSync(path.join(ROOT, 'docs/INDEX.md'), 'utf8');
   const mutated = idxText.replace(/另有\s*\d+\s*项条件检查/, `另有 ${N + 1} 项条件检查`);
   eq('🟡-4 守卫自证：N 被改字即红', false, /另有\s*(\d+)\s*项条件检查/.exec(mutated)?.[1] === String(N));
-  // 守卫自证：条件项名单被删一项即红（用**同一段断言逻辑**跑一份「删掉最后一条」的假文档）
+  // 守卫自证：条件项名单被删一项即红。
+  //
+  // ⚠️ 纪律（本轮实测发现的**守卫自身缺陷**）：自证必须把变异作用在**条件检查表**这一段落上，
+  // 不能对整份文档做 `text.replace(dropped, ...)` —— 条件检查名可能**同时**出现在别处
+  // （如 INDEX.md 的「负例插件」索引行里也写了 `plugin.abnormal_termination`），
+  // 于是「删掉一条」的变异只改了第一处、`includes()` 仍然命中 → **自证断言空转**（实测逃逸）。
+  // 修法：先把条件检查表段落切出来（自「另有 N 项条件检查」起，到下一个空行后的引用块止），
+  // 变异与断言都在**该段落内**做——与「文档即防线」的口径一致（守的是那张表，不是全文）。
+  const tableOf = (text) => {
+    const start = text.search(/另有\s*\d+\s*项条件检查/);
+    if (start < 0) return '';
+    // 标题行与表之间可能隔一个空行 → 先定位**表头行**（`| 条件检查 |`），再取到其后第一个空行。
+    const lines = text.slice(start).split('\n');
+    const head = lines.findIndex((line) => /^\|\s*条件检查\s*\|/.test(line));
+    if (head < 0) return '';
+    const end = lines.findIndex((line, i) => i > head && line.trim() === '');
+    return lines.slice(head, end < 0 ? undefined : end).join('\n');
+  };
+  const idxTable = tableOf(idxText);
+  eq('🟡-4 守卫自证：条件检查表段落可定位（段落锚点改名即红）', true, idxTable.includes('| 条件检查 |'));
   const dropped = CONDITIONAL_PROBE_CHECKS[CONDITIONAL_PROBE_CHECKS.length - 1];
-  const mutatedName = idxText.replace(dropped, '`some_other_check`');
-  const missingInMutated = CONDITIONAL_PROBE_CHECKS.filter((name) => !mutatedName.includes(name));
-  eq('🟡-4 守卫自证：条件项名单缺一项即红', JSON.stringify([dropped]), JSON.stringify(missingInMutated));
-  eq('🟡-4 守卫自证：未变异的文档不缺项（反证断言非空转）', JSON.stringify([]),
-    JSON.stringify(CONDITIONAL_PROBE_CHECKS.filter((name) => !idxText.includes(name))));
+  const mutatedTable = idxTable.replace(dropped, '`some_other_check`');
+  const missingInMutated = CONDITIONAL_PROBE_CHECKS.filter((name) => !mutatedTable.includes(name));
+  eq('🟡-4 守卫自证：条件检查表内缺一项即红', JSON.stringify([dropped]), JSON.stringify(missingInMutated));
+  eq('🟡-4 守卫自证：未变异的表不缺项（反证断言非空转）', JSON.stringify([]),
+    JSON.stringify(CONDITIONAL_PROBE_CHECKS.filter((name) => !idxTable.includes(name))));
+  // 反证（把「为什么必须按段落变异」写成断言，防后人改回整份文档 replace）：
+  // 整份文档 replace 只改到第一处 → `includes()` 仍命中 → 旧自证漏检。
+  const mutatedWhole = idxText.replace(dropped, '`some_other_check`');
+  eq('🟡-4 反证：整份文档 replace 会漏检（条件项名在别处也出现）', false,
+    CONDITIONAL_PROBE_CHECKS.every((name) => mutatedWhole.includes(name)) === false);
   // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷）
   // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷：JSDoc 写「1 项」、文档写「2 项」）。
   // 只判**代码**视图：JSDoc 里为了说明历史而引用「另有 1 项条件检查」这句原文不算违规
@@ -218,6 +242,7 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
   eq('CHANGELOG 自述的防线编号均可在对应测试文件检索到', [], missing);
   ok('CHANGELOG 防线编号自述扫描完成', `已声明 ${claimed.size} 类，未登记 ${unknown.length} 类`);
 }
+
 
 // ---- 2c. 文档自述版本 = package.json 版本（防「文档说 vX，实际是 vY」） ----
 console.log('  [2c] 文档头部版本与 package.json 一致');

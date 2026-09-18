@@ -28,9 +28,9 @@ const healthy = {
   name: 'demo_echo',
   description: '回显',
   parameters: { type: 'object', properties: { text: { type: 'string' } } },
-  // 真实 render（默认投影）：`render: () => []` 会让 dispatch.render_projected / echo_payload
-  // 额外失败，噪声掩盖「失败点精确留在后台任务」的自述（评审 🟡-5）。
-  output: { schema: { type: 'object', properties: { text: { type: 'string' } } } },
+  // 🟢 优化-3：render 返回空数组会产生 dispatch.render_projected / echo_payload 的**噪音**失败
+  // （不影响归因，但会淹没真因）→ 给一个正常的文本投影，把失败点精确留在「后台任务抛错」上。
+  output: { schema: { type: 'object', properties: { text: { type: 'string' } } }, render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }] },
   execute: async (args) => ({ text: `echo: ${args?.text ?? ''}` }),
 };
 

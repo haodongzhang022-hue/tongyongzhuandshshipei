@@ -28,22 +28,42 @@
  * 与 `probeAsyncFailureRoute()` / `recordProbeAsyncException()`。
  * 读插件侧数据的两处（`tools.schemas()` / `definitions.map()`）另有独立护栏，异常落插件侧 check。
  *
- * ## 两层兜底（🔴-D 同族活口：异步异常）
- * 只有**同步**异常才走 `run()` 的调用栈，能被顶层 `catch` 接住。插件在 `apply()` 里排的
- * 后台任务（`queueMicrotask` / `setTimeout` / 事件回调 / 预取 promise）抛错时，
- * 异常**不在** `run()` 的调用栈上 → 顶层 `catch` 永远接不到 → 探针在写出 `__DSH_PROBE__`
- * 之前就被 Node 杀掉 → 装配器看到「探针未输出结构化结果」→ 无条件 `pushHostFatal()`
- * → 插件 bug 被判 `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 0（整份报告消失）。
- * 故补**进程级兜底**：`uncaughtException` / `unhandledRejection` → 按相位归因
- * （`plugin-integration` → 插件侧 check `plugin.async_uncaught_exception`，绝不写 `hostFatal[]`）
- * → **照常输出结构化结果**（已跑完的 check 全部保留）→ 再退出。
+ * ## 四条出口 + 完成位（🔴-D 同族活口，逐轮补齐）
+ * 插件侧错误「逃出 `run()` 的调用栈」有四条出口，本文件必须**逐条闭合**——少一条，
+ * 插件 bug 就会被装配器判成 `UPSTREAM_DRIFT`/AMBER（「上游变了，不是你的问题」），
+ * 且 `checks` 从 17 掉到 0（整份报告消失）：
+ *
+ * | # | 出口 | 谁能接住 | 插件侧落点 check |
+ * |---|---|---|---|
+ * | ① | 同步异常（`run()` 调用栈上） | 顶层 `catch` | `plugin.unexpected_exception` |
+ * | ② | 异步异常（`uncaughtException` / `unhandledRejection`） | 进程级处理器 | `plugin.async_uncaught_exception` |
+ * | ③ | 进程 exit（插件调 `process.exit()` / 自杀式信号） | `process.on('exit')` + 信号处理器 | `plugin.early_exit` |
+ * | ④ | `run()` 被拖住（挂住事件循环 / `apply()` 永不 resolve） | **无条件**看门狗 `RUN_WATCHDOG_MS` | `plugin.run_incomplete` |
+ *
+ * 四条出口的归属规则**只有一份**（`contract.mjs` 的 `probeFailureRoute()` /
+ * `probeProcessFailureRoute()`），插件侧一律落 check、**绝不**写 `hostFatal[]`。
+ *
+ * ### 完成位（`runCompleted`）——「已跑完」与「没跑完」必须可区分
+ * `emit()` 的 `ok` 必须来自 `runCompleted && errors.length === 0`，而 `runCompleted`
+ * **只在 `run()` 正常返回后**置真。为什么必须如此：出口 ③ 的兜底会在验收**中途**输出报告，
+ * 此时「还没跑到」的检查一律是 `skip`（不是 `fail`）——若 `ok` 只看 `errors.length === 0`，
+ * 一个 `apply()` 里立刻 `process.exit(0)` 的插件会拿到 **GREEN / PASS / checks=6 的假绿**
+ * （比 AMBER 更危险：AMBER 至少不放行）。带上完成位后，同一夹具 → `RED`（不放行）。
  *
  * 三条纪律（都是「崩溃路径」上的经验，别再踩）：
  * 1. 兜底处理器**自身不得抛**（抛出 = 第二次崩溃 = 报告整份消失）；
  * 2. 结构化结果用 `writeSync` 输出（兜底后紧接着 `process.exit()`，异步 stdout 会被截断）；
  * 3. 记录后**不立即退出**——插件后台任务的抛错时机不确定（第几个 `await` 之后），
  *    立即退出会让「已跑完的检查」随时机变化 → 同一插件两次跑出不同 `checks`（报告不确定）。
- *    改为让 `run()` 跑完再统一收尾（报告形态与正常失败一致），另设看门狗兜住「run() 被拖住」。
+ *    改为让 `run()` 跑完再统一收尾（报告形态与正常失败一致），由看门狗（出口 ④）兜住
+ *    「`run()` 被拖住」。看门狗**不得 `unref()`**：那正是出口 ④ 曾经「装了却永不生效」的根因
+ *    （事件循环无其它 handle 时进程直接走 exit 路径）。收尾路径由 `finish()` 显式 `clearTimeout`。
+ *
+ * ### 相位信标（`__DSH_PROBE_PHASE__`）
+ * 进入 `plugin-integration` 相位时向 stdout 打一行信标。用途：闭合**不可捕获**终止
+ * （`SIGKILL` / OOM / 原生 `abort`）的归因——那时探针来不及写结构化结果，装配器按
+ * 「有没有信标」判断终止发生在哪一段：有信标 → 插件代码运行期间（落插件侧 check，
+ * 与「未知相位保守判插件侧」同一取向）；无信标 → 宿主装配段（`hostFatal[]`）。
  * 历史缺陷（🔴-B）：插件侧错误曾被统一写成 `fatal: ...`，而 `runner` 用裸 `fatal:` 判上游漂移
  * → 插件写坏了却被告知「上游变了，不是你的问题」。
  * 历史缺陷（🔴-C）：改用 `fatal(host)` 前缀后判据仍在**扫自由文本**——插件文件路径/错误文本里
@@ -51,17 +71,19 @@
  *
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
-import { writeFileSync, writeSync } from 'node:fs';
+import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import {
-  PLUGIN_SIDE_CHECKS,
+  PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
-  PROBE_PHASE_FILE,
+  PROBE_PHASE_BEACON_PREFIX,
   collectContract,
   pushHostFatal,
   recordProbeAsyncException,
+  recordProbeEarlyExit,
   recordProbeException,
+  recordProbeRunIncomplete,
 } from './contract.mjs';
 
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
@@ -78,32 +100,6 @@ const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}
  */
 let phase = PROBE_PHASE.HOST_ASSEMBLY;
 out.phase = phase;
-
-/**
- * 把当前相位写进**侧信道文件**（评审 🔴-D′：探针被杀时唯一还活着的证据）。
- *
- * 为什么必须落盘、且**每次切相位就写**：插件能把探针整个弄死（`apply()` 永不 settle →
- * Node 以 unsettled top-level await 退出；后台任务 `process.exit()`；先摘
- * `uncaughtException` / `unhandledRejection` 处理器再抛；占死事件循环）。这四种情形下
- * 探针内的兜底处理器与看门狗**都来不及跑**，「异常归属」随之丢失 → 装配器只看到
- * 「没有 `__DSH_PROBE__`」→ 旧行为一律判宿主侧（上游漂移）。
- *
- * 落盘文件不受进程内事件循环影响：**已经写下**的相位在探针死后依然可读，
- * 装配器据此判「探针死在插件集成相位 = 插件侧行为」。
- *
- * 纪律：本函数**不得抛**（它运行在验收主路径上，写不进去只说明环境只读——
- * 那就退回「装配器读不到侧信道 → 按宿主侧保守处理」，绝不能因此把整份验收搞崩）。
- *
- * @param {string} next 见 {@link PROBE_PHASE}
- * @returns {void}
- */
-function writePhaseSideChannel(next) {
-  try {
-    writeFileSync(PROBE_PHASE_FILE, `${next}\n`);
-  } catch { /* 侧信道写不进去：装配器读不到 → 按宿主侧保守处理，不阻断验收 */ }
-}
-// 启动即落盘宿主装配相位：装配器读不到文件（如探针根本没起来）与读到 host-assembly 同义。
-writePhaseSideChannel(phase);
 const check = (name, ok, detail) => {
   out.checks.push({ name, status: ok ? 'pass' : 'fail', detail: detail === undefined ? '' : String(detail).slice(0, 600) });
   if (!ok) out.errors.push(`${name}: ${detail ?? ''}`);
@@ -126,6 +122,30 @@ const skipAll = (names, reason) => {
 };
 const brief = (error, limit = 600) => String(error?.stack ?? error).split('\n').slice(0, 3).join(' | ').slice(0, limit);
 /**
+ * 向 stdout 打一行**相位信标**（`__DSH_PROBE_PHASE__<phase>`）。
+ *
+ * 为什么需要它：探针被**不可捕获**终止（`SIGKILL` / OOM / 原生 `abort`）时来不及写结构化结果，
+ * 装配器只看到「探针未输出结构化结果」。若没有信标，它只能无条件 `pushHostFatal()`
+ * → 插件把自己 `kill -9` 也会被判「上游漂移」。信标把「终止发生在哪一段」变成**证据**：
+ * 有信标 ⇒ 插件代码正在运行（落插件侧 check）；无信标 ⇒ 宿主装配段（`hostFatal[]`）。
+ *
+ * 纪律：`writeSync` + 全包 try（这是崩溃路径上的写操作，**不得**抛）。
+ * 命名与结构化结果标记（`__DSH_PROBE__`）刻意错开：信标第 13 个字符是 `P`，
+ * 而结果标记要求 `_`，故 `startsWith('__DSH_PROBE__')` 不会误命中信标（见 [9.9] 断言）。
+ *
+ * @param {string} name 相位名（见 {@link PROBE_PHASE}）
+ * @returns {void}
+ */
+function beacon(name) {
+  const line = `${PROBE_PHASE_BEACON_PREFIX}${name}\n`;
+  try {
+    writeSync(1, line);
+  } catch {
+    try { process.stdout.write(line); } catch { /* 崩溃路径上的兜底不得再崩 */ }
+  }
+}
+
+/**
  * 结构化结果**只输出一次**（正常收尾 / 进程级兜底 两条路径共用）。
  *
  * 为什么用 `writeSync(1, ...)` 而不是 `process.stdout.write`：兜底路径随后立即
@@ -138,7 +158,11 @@ let emitted = false;
 function emit() {
   if (emitted) return;
   emitted = true;
-  out.ok = out.errors.length === 0;
+  // 完成位落进结构化结果（排障与断言都看得见「这次到底跑完了没有」）。
+  out.runCompleted = runCompleted;
+  // 🔴 必修-1：`ok` 必须**同时**要求「跑完」与「无失败」——否则出口 ③ 的中途报告会假绿
+  // （`apply()` 里 process.exit(0) → 剩余检查是 skip 不是 fail → 只看 errors 就 GREEN）。
+  out.ok = runCompleted && out.errors.length === 0;
   const payload = `__DSH_PROBE__${JSON.stringify(out)}\n`;
   try {
     writeSync(1, payload);
@@ -253,20 +277,20 @@ async function run() {
   // 绝不写 hostFatal[]（否则插件 bug 会被判成上游漂移，并盖掉插件侧已失败的 check）。
   phase = PROBE_PHASE.PLUGIN_INTEGRATION;
   out.phase = phase;
-  // 侧信道同步落盘：此后的任何「探针被杀」都仍能被装配器正确归因（插件侧）。
-  writePhaseSideChannel(phase);
+  // 相位信标：装配器据此为「不可捕获终止」（SIGKILL / OOM）按证据归因（见文件头）。
+  beacon(phase);
   let plugin = null;
   try {
     plugin = await import(pathToFileURL(pluginPath).href);
   } catch (error) {
     check('plugin.loaded', false, `插件 import 失败（语法/依赖错误）：${brief(error)}`);
-    skipAll(PLUGIN_SIDE_CHECKS, '插件 import 失败，无法执行验收');
+    skipAll(PLUGIN_SKIP_ON_PRECONDITION, '插件 import 失败，无法执行验收');
     return;
   }
   const hasApply = typeof plugin.apply === 'function';
   check('plugin.loaded', hasApply, hasApply ? '插件导出 apply(ctx)' : `插件未导出 apply(ctx)（导出面：${Object.keys(plugin).join(',') || '空'}）`);
   if (!hasApply) {
-    skipAll(PLUGIN_SIDE_CHECKS, '插件未导出 apply(ctx)，无法执行验收');
+    skipAll(PLUGIN_SKIP_ON_PRECONDITION, '插件未导出 apply(ctx)，无法执行验收');
     return;
   }
 
@@ -275,7 +299,7 @@ async function run() {
     check('plugin.apply_ok', true, '插件 apply(ctx) 执行成功（工具已注册）');
   } catch (error) {
     check('plugin.apply_ok', false, `插件 apply(ctx) 抛错（插件侧初始化失败）：${brief(error)}`);
-    skipAll(PLUGIN_SIDE_CHECKS, '插件 apply(ctx) 未成功，后续检查无法验证');
+    skipAll(PLUGIN_SKIP_ON_PRECONDITION, '插件 apply(ctx) 未成功，后续检查无法验证');
     return;
   }
 
@@ -375,9 +399,9 @@ async function run() {
     check('lifecycle.dispose', after.length === 0, after.length === 0 ? '卸载后无残留' : '卸载后仍残留：' + after.join(','));
   } catch (error) {
     check('lifecycle.registered', false, `生命周期路径执行抛错（插件定义不可注册）：${brief(error)}`);
-    // 报告完整性（本轮闸门发现的**同族**漏洞）：`lifecycle.disposer_count` 的 `check()` 在
-    // 抛错点**之前**，异常打断后它既没 pass 也没 fail——报告里就少了一项（17 → 16），
-    // 人分不清「没验」与「验过了」。`skipAll` 只补未记录项，故不会与已记录的 fail/skip 重复。
+    // 报告完整性（本轮实测发现的**同族**漏洞）：`lifecycle.disposer_count` 的 `check()` 在抛错点
+    // **之前**，异常打断后它既没 pass 也没 fail——报告里就少一项（17 → 16），人分不清
+    // 「没验」与「验过了」。`skipAll` 只补未记录项，故不会与已记录的 fail/skip 重复。
     skipAll(['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose'], '生命周期路径未完成（抛错），该项未验证');
   }
 
@@ -430,26 +454,15 @@ function skipPendingChecks(reason) {
   }
 }
 
-/**
- * 探针收尾：输出结构化结果并以退出码表达成败。
- *
- * @param {number} code 退出码（0 = 全绿；1 = 有失败）
- * @returns {void}
- */
-function finish(code) {
-  emit();
-  process.exit(code);
-}
-
-// ---- 进程级兜底（🔴-D 同族活口：插件侧异步异常） ----
+// ---- 进程级兜底（🔴-D 同族活口 / 🔴 必修-2 / 🔴 必修-3：四条出口） ----
 // 为什么必须有：只有**同步**异常才在 run() 的调用栈上、才被上面的 try/catch 接住。
-// 插件在 apply() 里排的后台任务（queueMicrotask / setTimeout / 事件回调 / 预取 promise）
-// 抛错时异常**不在**调用栈上 → 顶层 catch 接不到 → 探针在写出 __DSH_PROBE__ 之前被杀
-// → 装配器看到「探针未输出结构化结果」→ 无条件 pushHostFatal() → 插件 bug 被判
-// UPSTREAM_DRIFT/AMBER，且 checks 从 17 掉到 0（整份报告消失，比盖掉一条 check 更彻底）。
-// 处置：按**同一份相位路由**归因（plugin-integration → 插件侧 check
-// `plugin.async_uncaught_exception`，绝不写 hostFatal[]），照常输出结构化结果，再退出。
-// 纪律：本处理器**自身不得抛**——它运行在崩溃路径上，抛出 = 第二次崩溃 = 报告整份消失。
+// 插件侧错误还有三条出口逃出调用栈，逐条都要接住（少一条 = 插件 bug 被判成上游漂移）：
+//   ② 异步异常（uncaughtException / unhandledRejection）——后台任务 / 事件回调 / 预取 promise；
+//   ③ 进程 exit（插件调 process.exit() 或自杀式信号）——run() 再也回不来；
+//   ④ run() 被拖住（挂住事件循环 / apply() 返回永不 resolve 的 Promise）——既无异常也无退出。
+// 处置：按**同一份相位路由**归因（plugin-integration → 插件侧 check，绝不写 hostFatal[]），
+// 照常输出结构化结果（已跑完的 check 全部保留 + 未跑到的按序补 skip），再退出。
+// 纪律：本组处理器**自身不得抛**——它们运行在崩溃路径上，抛出 = 第二次崩溃 = 报告整份消失。
 
 /**
  * 收尾前的异步排空窗口（毫秒）——给「插件在 apply() 里排的后台任务」一次抛错的机会。
@@ -460,49 +473,149 @@ function finish(code) {
 const ASYNC_DRAIN_MS = 50;
 
 /**
- * 异步异常后的**看门狗**窗口（毫秒）：run() 若被插件异常拖住不返回，到此强制收尾。
+ * **无条件**安装的 `run()` 看门狗窗口（毫秒）——出口 ④ 的唯一防线。
  *
- * 为什么要它：记录异步异常后**不立即退出**（为了报告确定性），于是存在「run() 永不返回」
- * 的极端情形（插件后台任务把事件循环占死）。没有看门狗 = CI 干等直到外层超时（600s）。
+ * 与旧实现（`ASYNC_WATCHDOG_MS`）的三处差别，都是「装了却永不生效」的根因：
+ * 1. **无条件安装**：旧版只在 `onProcessLevelException()` 里装 ⇒「单纯挂住、没有任何异常」
+ *    （`apply()` 返回永不 resolve 的 Promise）根本不装看门狗 → 进程干等到外层超时（600s）
+ *    → 装配器判「探针未输出结构化结果」→ 同一个误判。现在探针启动即装。
+ * 2. **不 `unref()`**：旧版紧跟 `watchdog.unref?.()` ⇒ 事件循环里没有其它 handle 时
+ *    进程直接走 exit 路径，看门狗**永不触发**（正是「run() 被拖住」这个场景）。
+ *    收尾由 `finish()` 显式 `clearTimeout`，不靠 unref 让进程自己走。
+ * 3. **与完成位联动**：到点收尾时 `runCompleted` 仍为 false ⇒ `emit()` 的 `ok` 必为 false
+ *    ⇒ 判决 RED（不放行），而不是靠「恰好有一条 fail check」。
+ *
+ * 取值：比外层超时（600s）小两个数量级，又远大于健康插件全程（实测 3.7–4.2s）与
+ * `ASYNC_DRAIN_MS`，故对正常验收零影响。回归可用 `DSH_PROBE_RUN_WATCHDOG_MS` **缩短**（见下）。
  */
-const ASYNC_WATCHDOG_MS = 10_000;
+const RUN_WATCHDOG_DEFAULT_MS = 20_000;
+/**
+ * 看门狗窗口的实际取值：默认 20s；**宿主侧**（CI / 回归）可用环境变量
+ * `DSH_PROBE_RUN_WATCHDOG_MS` **缩短**它——用于让「run() 被拖住」的回归不必干等 20s。
+ *
+ * 为什么这不是活口（三条一起成立才成立）：
+ * 1. **只许缩短、不许延长**（`Math.min`）：缩短 = 更保守（健康插件会被判红，不会假绿）；
+ * 2. **下限 1s**：防止极端取值把窗口压到比正常验收还短；
+ * 3. **在任何插件代码运行之前读取**（本常量位于文件顶部，早于 `phase` 切换与插件 import）
+ *    ⇒ 被测插件**无法**影响它。
+ */
+const RUN_WATCHDOG_MS = Math.min(
+  RUN_WATCHDOG_DEFAULT_MS,
+  Math.max(1_000, Number(process.env.DSH_PROBE_RUN_WATCHDOG_MS) || RUN_WATCHDOG_DEFAULT_MS),
+);
 
-let asyncHandled = false;
-function onProcessLevelException(kind, error) {
-  if (asyncHandled) return; // 只记第一条：后续异常是崩溃后的连锁噪声，记下来只会淹没真因
-  asyncHandled = true;
+/** 是否已记录「进程级逃逸」的第一条（后续异常/信号是崩溃后的连锁噪声，记下来只会淹没真因）。 */
+let failureHandled = false;
+/** 探针收尾进行中（finish() 已调用）——exit 钩子据此不重复记「提前退出」。 */
+let finishing = false;
+/**
+ * **完成位**：`run()` 是否正常返回过。
+ *
+ * 只在 `run()` 正常返回后置真（见文件尾）。`emit()` 的 `ok` 必须同时要求它——
+ * 否则出口 ③ 的中途报告会假绿（`apply()` 里 `process.exit(0)` → 剩余检查是 `skip` 不是 `fail`
+ * → 只看 `errors.length` 就 GREEN，比 AMBER 更危险）。
+ */
+let runCompleted = false;
+/** 看门狗句柄（收尾时 clear，避免它拖住进程 / 在收尾后再开一枪）。 */
+let runWatchdog = null;
+
+/**
+ * 统一收尾：clear 看门狗 → 输出结构化结果（含完成位）→ 以退出码退出。
+ *
+ * 收尾路径**只有这一条**（正常收尾、看门狗到点、信号处理器都调它），
+ * 保证「报告形态与正常失败一致」只有一处可写错。`exit` 钩子走的是 `emit()`（它不能调
+ * `process.exit`，会死循环），故钩子里单独补 skip + emit + 改 `process.exitCode`。
+ *
+ * @param {number} code 退出码（0 = 全绿；1 = 有失败）
+ * @returns {void}
+ */
+function finish(code) {
+  if (finishing) return;
+  finishing = true;
+  if (runWatchdog) { clearTimeout(runWatchdog); runWatchdog = null; }
+  emit();
+  process.exit(code);
+}
+
+/**
+ * 记录一次「进程级逃逸」（出口 ②③④ 共用入口）。
+ *
+ * 只记第一条（后续是连锁噪声）；记录后**不立即退出**——抛错/退出的时机不确定，
+ * 立即退出会让「已跑完的检查」取决于时机 → 同一插件两次跑出不同 `checks`（报告不确定）。
+ * 改为让 `run()` 跑完再统一收尾；若 `run()` 不返回，由**无条件看门狗**兜住（出口 ④）。
+ * 这条「不立即退出」正是「报告确定性」与「不挂死」的折中，两侧各有一条防线。
+ *
+ * @param {(out: object, phase: string, detail: string) => unknown} record 归属记录函数（按出口分落点）
+ * @param {string} label 人读标签（进 skip 原因）
+ * @returns {void}
+ */
+function recordProcessEscape(record, label) {
+  if (failureHandled) return;
+  failureHandled = true;
   try {
-    const detail = `${kind}：${brief(error, 1200)}`;
-    recordProbeAsyncException(out, phase, detail);
+    record(out, phase, label);
   } catch {
     // 兜底里的兜底：连归因都写不进去时，至少保证报告仍被输出（绝不在崩溃路径上抛）。
   }
-  // 记录后**不立即退出**：插件后台任务的抛错时机不确定（微任务 / 宏任务 / 第几个 await 之后），
-  // 立即退出会让「已跑完的检查」取决于时机 → 报告不确定（同一插件两次跑出不同 checks）。
-  // 改为让 run() 跑完再统一收尾，报告形态与「正常失败」完全一致（17 项 + 1 条 fail）。
-  // 代价：run() 若被插件异常拖住不返回，需要一个看门狗兜底（否则 CI 干等）。
-  const watchdog = setTimeout(() => {
-    try {
-      skipPendingChecks(`探针因插件侧未捕获异步异常中断（${kind}），该项未验证`);
-    } catch { /* 崩溃路径上不再抛 */ }
-    finish(1);
-  }, ASYNC_WATCHDOG_MS);
-  // ⚠️ 纪律（评审 🔴-D′ 必修中的必修）：**绝不可**在此 `watchdog.unref()`。
-  // 历史缺陷：这一行让「看门狗兜住 run() 被拖住」这条声明在**它被写出来的那个场景里不可达**——
-  // 插件让 apply() 永不 settle 时事件循环已空，unref 的定时器不算「有活儿」→ Node 直接以
-  // 「unsettled top-level await」退出（exit 13），看门狗永远排不上，报告整份消失。
-  // 现在定时器保持 ref：run() 被拖住 → 10s 后强制收尾并输出结构化结果（报告不丢）。
-  // 代价可接受：run() 正常跑完时走 finish() → process.exit()，不会多等。
-  // 防线：`tests/test_attribution.mjs` [9.8g]（源码级「不得出现 watchdog.unref」）+
-  // `tests/test_e2e_regression.mjs` [8c]（行为级：挂起 + 后台抛错 → 失败项必须是
-  // 探针侧 `plugin.async_uncaught_exception`，而不是装配器侧 `plugin.probe_aborted`——
-  // 把 unref 写回去即红）。
 }
-process.on('uncaughtException', (error) => onProcessLevelException('uncaughtException', error));
-process.on('unhandledRejection', (reason) => onProcessLevelException('unhandledRejection', reason));
 
+// ---- 出口 ②：进程级异步异常 ----
+process.on('uncaughtException', (error) => recordProcessEscape(recordProbeAsyncException, `uncaughtException：${brief(error, 1200)}`));
+process.on('unhandledRejection', (reason) => recordProcessEscape(recordProbeAsyncException, `unhandledRejection：${brief(reason, 1200)}`));
+
+// ---- 出口 ③：进程 exit（插件调 process.exit() / 自杀式信号） ----
+// 为什么必须有 exit 钩子：`process.exit()` **不抛异常**，上面所有 try/catch 与 uncaughtException
+// 都接不到；旧探针于是在写出结构化结果前直接消失 → 装配器判「探针未输出结构化结果」
+// → 无条件 pushHostFatal() → 插件 bug 判 UPSTREAM_DRIFT/AMBER，且 checks 归零。
+// 钩子内必须用 writeSync（见 emit 的说明），且**不得**抛（崩溃路径）。
+process.on('exit', (code) => {
+  if (finishing) return; // 探针自己正在收尾（finish() 已输出过结果）：不重复记、不改退出码
+  try {
+    // 走到这里 = 进程**不是**由探针的 finish() 退出的（finish 会先置 finishing）⇒ 一律是
+    // 插件侧提前终止（探针从不在自己收尾之外主动退出）。**不看完成位**：即使 run() 已返回，
+    // 插件在排空窗口里 exit 也是缺陷（宿主进程不是插件可以随便杀的）。
+    recordProcessEscape(recordProbeEarlyExit, `插件在探针自身收尾前退出（exit code=${code}，runCompleted=${runCompleted}）`);
+    skipPendingChecks('探针因插件侧提前退出（process.exit / 自杀式信号）中断，该项未验证');
+  } catch { /* 崩溃路径上不再抛 */ }
+  // 无论哪种情形都必须**补输出**报告：`run()` 已跑完但插件在排空窗口里 exit 时，
+  // 探针自己没机会走 finish()——不补输出就又变成「探针未输出结构化结果」（整份报告消失）。
+  emit();
+  // 退出码：报告判失败（含「没跑完」）时，插件 exit(0) 也不得让装配器把这次运行读成通过。
+  // exit 钩子里只能改 process.exitCode，不能再次 process.exit（会死循环）。
+  if (!out.ok) { try { process.exitCode = 1; } catch { /* 极端情形：静默，报告已输出 */ } }
+});
+// 自杀式信号：默认行为直接终止进程，**不触发** exit 钩子的记账语义（来不及写报告），
+// 故显式接住 → 记插件侧 check → 输出报告 → 以失败码退出。
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT']) {
+  try {
+    process.on(signal, () => {
+      try {
+        recordProcessEscape(recordProbeEarlyExit, `进程在验收完成前收到 ${signal}（插件侧自杀式信号 / 被外部终止）`);
+        skipPendingChecks(`探针因 ${signal} 中断，该项未验证`);
+      } catch { /* 崩溃路径上不再抛 */ }
+      finish(1);
+    });
+  } catch { /* 平台不支持该信号时静默跳过，不影响其它出口 */ }
+}
+
+// ---- 出口 ④：run() 被拖住（无条件看门狗） ----
+// 装上后**不 unref**：unref 会让「事件循环里没有其它 handle」时看门狗永不触发——
+// 而那正是本出口的场景（插件把事件循环占死 / 返回永不 resolve 的 Promise）。
+// 收尾由 finish() 显式 clearTimeout；健康插件在 3.7–4.2s 内跑完，20s 窗口零影响。
+runWatchdog = setTimeout(() => {
+  try {
+    recordProcessEscape(recordProbeRunIncomplete, `探针 run() 未在 ${RUN_WATCHDOG_MS}ms 内返回（插件挂住事件循环 / apply() 返回永不 resolve 的 Promise）`);
+    skipPendingChecks(`探针 run() 未在 ${RUN_WATCHDOG_MS}ms 内返回（插件侧挂住），该项未验证`);
+  } catch { /* 崩溃路径上不再抛 */ }
+  finish(1);
+}, RUN_WATCHDOG_MS);
+
+// ---- 出口 ①：同步异常（run() 调用栈上） ----
+let syncThrew = false;
 try {
   await run();
+  // 完成位：只有走到这里（run() 正常返回）才算「跑完」——中途被 exit / 看门狗打断时保持 false。
+  runCompleted = true;
 } catch (error) {
   // 兜底（同步路径）：探针自身未预期的异常。**按相位归因**（🔴-D），不猜：
   // - host-assembly：宿主包 import / Context 装配 / 契约采集阶段 → 宿主/环境侧 → hostFatal[];
@@ -512,6 +625,7 @@ try {
   // 直接从插件数据读取处逃逸），故必须显式分相位，不能一律 pushHostFatal()。
   // 归属逻辑收敛在 contract.mjs 的 recordProbeException()（与离线回归共用同一份）。
   recordProbeException(out, phase, brief(error, 1200));
+  syncThrew = true;
 }
 
 // 收尾前先给已排队的微任务/宏任务一次机会跑完：插件在 apply() 里排的后台任务若抛错，
@@ -523,6 +637,6 @@ try {
 // ① 覆盖微任务（queueMicrotask / Promise）与已就绪的宏任务（setTimeout(0)）；
 // ② 对正常验收的额外耗时无感（相对 200ms 的宿主就绪等待可忽略）。
 await new Promise((resolve) => setTimeout(resolve, ASYNC_DRAIN_MS));
-if (asyncHandled) finish(1);
 
-finish(out.errors.length === 0 ? 0 : 1);
+// 退出码：跑完 + 无失败 + 无逃逸 ⇒ 0；否则 1。**完成位参与判定**（未跑完绝不给 0）。
+finish(runCompleted && !syncThrew && !failureHandled && out.errors.length === 0 ? 0 : 1);
