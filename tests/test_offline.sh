@@ -180,8 +180,11 @@ echo "  [9] 归因判定（结构化判据：宿主侧 hostFatal[] vs 插件侧 
 # 插件侧只认插件侧 check 名；errors[] 仅作日志、不参与判据。
 # 历史缺陷：v0.1.1 裸 /npm|fatal:/；v0.1.2 改为扫 fatal(host) 前缀（仍是自由文本子串扫描，
 # 插件路径/文本含该字面量即翻案）。更完整的回归见 tests/test_attribution.mjs。
+# 🔴-D（v0.1.6）：判据字段 hostFatal[] 的**写入端**分相位——插件集成相位的未预期异常
+# 落插件侧 check（plugin.unexpected_exception），绝不进 hostFatal[]。
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure, attributionDetail } from '$ROOT/src/verify/runner.mjs';
+import { PROBE_PHASE, recordProbeException } from '$ROOT/src/harness/contract.mjs';
 const ch = { label: 'x', line: '0.1.6' };
 const p = (errors, checks = [], extra = {}) => ({ errors, checks, hostFatal: [], profile: { flavor: 'modern' }, contract: {}, ...extra });
 const hf = (detail) => p(['fatal(host): ' + detail], [], { hostFatal: [detail] });
@@ -202,6 +205,16 @@ console.log(attributeFailure(p(['plugin.apply_ok: 插件 apply 抛错 | at file:
 console.log(attributeFailure(p(['探针非零退出（status=null）']), ch, 'dev'));
 // 理由链可审计
 console.log(attributionDetail(p(['registry.exact: x'], [fc('registry.exact')]), ch, 'dev').reasons.length > 0 ? 'has-reasons' : 'no-reasons');
+// 🔴-D：插件集成相位的未预期异常 → 插件侧 check，且**绝不**写 hostFatal[]
+const pluginPhase = { checks: [], errors: [], hostFatal: [] };
+recordProbeException(pluginPhase, PROBE_PHASE.PLUGIN_INTEGRATION, 'TypeError: x | at get name (file:///tmp/plugin.mjs:5:33)');
+console.log(pluginPhase.checks[0].name);
+console.log(pluginPhase.hostFatal.length);
+console.log(attributeFailure({ ...pluginPhase, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
+// 🔴-D 反向：宿主装配相位仍写 hostFatal[] 并判漂移
+const hostPhase = { checks: [], errors: [], hostFatal: [] };
+recordProbeException(hostPhase, PROBE_PHASE.HOST_ASSEMBLY, 'Cannot find package @deepseek-ai/dsh-tools');
+console.log(attributeFailure({ ...hostPhase, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
 ")"
 assert "宿主安装失败（结构化 hostFatal[]）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
 assert "宿主未就绪 → UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 2p)"
@@ -212,6 +225,10 @@ assert "🔴-B：插件侧裸 fatal: 措辞不误判为上游漂移" "PLUGIN_REG
 assert "🔴-C：路径含 fatal(host) 不误判为上游漂移" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 7p)"
 assert "无失败 check → UNKNOWN（不猜归因）" "UNKNOWN" "$(echo "$OUT" | sed -n 8p)"
 assert "归因带可审计理由链" "has-reasons" "$(echo "$OUT" | sed -n 9p)"
+assert "🔴-D：插件集成相位异常落插件侧 check" "plugin.unexpected_exception" "$(echo "$OUT" | sed -n 10p)"
+assert "🔴-D：插件集成相位异常不写 hostFatal[]（不变量）" "0" "$(echo "$OUT" | sed -n 11p)"
+assert "🔴-D：插件侧异常 → PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 12p)"
+assert "🔴-D 反向：宿主装配相位异常 → 仍判 UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 13p)"
 
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure } from '$ROOT/src/verify/runner.mjs';

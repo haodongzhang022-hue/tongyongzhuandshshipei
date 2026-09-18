@@ -1,2 +1,2 @@
 /** 中台版本（唯一事实源）。 */
-export const VERSION = '0.1.5';
+export const VERSION = '0.1.7';

@@ -19,6 +19,10 @@
  *    `PLUGIN_REGRESSION`（判据只读结构化 `hostFatal[]`，不扫插件侧 stack/路径文本）。
  * 8. **真宿主侧致命信号**（离线缺缓存）→ 期望 `UPSTREAM_DRIFT` 且 `hostFatal` 非空
  *    （收窄判据不得丢掉真漂移）。
+ * 9. **🔴-D（插件侧异常不得进判据字段）**：插件写错代码（未初始化类字段 / 抛错 getter）时，
+ *    探针读插件侧数据（`tools.schemas()` / `definitions.map()`）会抛错——该异常必须落**插件侧 check**，
+ *    归因 `PLUGIN_REGRESSION`/RED，且 `hostFatal[]` **必须为空**（历史缺陷：落进 `hostFatal[]` →
+ *    误判 `UPSTREAM_DRIFT`/AMBER，把插件 bug 甩给上游并盖掉插件侧已失败的 check）。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
@@ -230,6 +234,40 @@ try {
   eq('离线缺缓存（真宿主）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT', offlineReport.attribution);
   eq('离线缺缓存：结构化 hostFatal 非空（判据只读该字段）', true, (offlineReport.hostFatal ?? []).length > 0);
   eq('离线缺缓存：理由链指向 hostFatal 字段', true, (offlineReport.attributionReasons ?? []).some((r) => r.includes('hostFatal')));
+  // ---- 11. 🔴-D：插件侧异常（未初始化字段 / 抛错 getter）不得进 hostFatal[] ----
+  console.log('  [8] 🔴-D：插件写错代码 → 必须判插件且 hostFatal 为空');
+  for (const [label, fixture, failedCheck] of [
+    ['插件 definitions 抛错 getter → PLUGIN_REGRESSION', 'plugin-side-throw-plugin.mjs', 'guard.reserved_rejected'],
+    ['插件注册项 getter 抛错 → PLUGIN_REGRESSION', 'plugin-registry-throw-plugin.mjs', 'registry.exact'],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    // 核心不变量（🔴-D）：插件侧错误**永远**不进判据字段 hostFatal[]
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    // 失败项必须是插件侧 check（不得是宿主侧）
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    const hostSide = new Set(['host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed']);
+    eq(`${label}（失败项无宿主侧 check）`, 0, failed.filter((n) => hostSide.has(n)).length);
+    eq(`${label}（失败项含 ${failedCheck}）`, true, failed.includes(failedCheck));
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack（夹具路径 / at 帧）
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+    eq(`${label}（hostFatal 不含 stack 帧 'at '）`, false, /\n\s*at /.test(fatalText));
+    // 插件侧 stack 仍应保留在**日志**里（可排障，只是不参与判据）
+    eq(`${label}（插件侧 stack 保留在 errors 日志中）`, true, (report.errors ?? []).some((e) => e.includes(fixture)));
+    // 相位随报告透出（排障看得见异常归属依据）
+    eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+  }
+
+  // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----
+  console.log('  [9] 🔴-D 反向：宿主侧异常仍判漂移（收窄写入端不丢真漂移）');
+  {
+    const offline = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status', { tmp: path.join(work, 'empty-tmp-2'), offline: true });
+    eq('离线缺缓存（宿主装配相位）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT', offline.attribution);
+    eq('离线缺缓存 → hostFatal 非空（宿主侧信号照写）', true, (offline.hostFatal ?? []).length > 0);
+    eq('离线缺缓存 → probePhase=host-assembly（未进插件集成段）', 'host-assembly', offline.probePhase);
+  }
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

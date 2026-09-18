@@ -18,22 +18,25 @@ PASS=0
 FAIL=0
 
 step() { echo; echo "▶ $1"; }
+# 测试项数**从输出里取**（不再硬编码）：硬编码计数与文档/实际三者互漂，是 P2-9 同族问题的根。
+# 用法：count_of <logfile> → 输出 PASS 数（取不到则输出 ?，调用方据此判红）。
+count_of() { sed -n 's/.*PASS=\([0-9]*\).*/\1/p' "$1" | tail -1; }
 ok() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 
 step "1. 离线单元测试 + 归因离线回归"
 if bash "$ROOT/tests/test_offline.sh" > /tmp/offline.log 2>&1; then
-  ok "离线单元测试全绿（66 项）"
+  ok "离线单元测试全绿（$(count_of /tmp/offline.log) 项）"
 else
   bad "离线单元测试失败"; tail -20 /tmp/offline.log
 fi
 if "$NODE_BIN" "$ROOT/tests/test_attribution.mjs" > /tmp/attribution.log 2>&1; then
-  ok "归因离线回归全绿（80 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + 判据表完备性）"
+  ok "归因离线回归全绿（$(count_of /tmp/attribution.log) 项：判据只读结构化字段 + 硬证据优先 + 🔴-D 相位化兜底 + P2-10 守卫加固）"
 else
   bad "归因离线回归失败"; tail -20 /tmp/attribution.log
 fi
 if "$NODE_BIN" "$ROOT/tests/test_exports.mjs" > /tmp/exports.log 2>&1; then
-  ok "发布面自检全绿（exports 全解析 + 模板拷贝可用 + 文档清单顺序一致 + 文档版本一致，20 项）"
+  ok "发布面自检全绿（exports 全解析 + 模板拷贝可用 + 文档清单顺序一致，$(count_of /tmp/exports.log) 项）"
 else
   bad "发布面自检失败"; tail -20 /tmp/exports.log
 fi
@@ -87,7 +90,7 @@ step "4. 归因端到端回归（真宿主；上游取消保留名 / 插件侧�
 "$NODE_BIN" "$ROOT/tests/test_e2e_regression.mjs" > /tmp/e2e.log 2>&1
 E2E_EXIT=$?
 if [[ "$E2E_EXIT" -eq 0 ]]; then
-  ok "归因端到端回归全绿（43 项；含 🔴-A / 🔴-B / 🔴-C 原始复现场景 + attribution/verdict 双断言）"
+  ok "归因端到端回归全绿（$(count_of /tmp/e2e.log) 项；含 🔴-A / 🔴-B / 🔴-C / 🔴-D 复现场景 + attribution/verdict 双断言）"
 elif [[ "$E2E_EXIT" -eq 2 ]]; then
   echo "  ⚠️ 无宿主缓存，端到端回归跳过（前一步 verify 已建立缓存，正常不会走到这里）"
   ok "端到端回归显式跳过（不假装通过）"
@@ -113,6 +116,35 @@ if git -C "$ROOT" diff --quiet -- registry/contract-snapshots/latest.json; then
 else
   bad "基线被验收过程改写（漂移侦测会被自己写坏）"; git -C "$ROOT" diff --stat -- registry/contract-snapshots/latest.json
 fi
+
+step "7. 文档计数防漂移（文档声明的项数必须等于实际跑出来的项数）"
+# P2-9 同族：文档/编排里的「N 项」最容易与实际脱节（59/48/34 就曾残留两轮）。
+# 这里把**实际**项数与文档声明**逐一对齐**：任一文档写错 → 本节红（不是靠人眼复核）。
+DOC_COUNT_MISMATCH=0
+check_doc_count() {
+  local label="$1" actual="$2" pattern="$3" file="$4"
+  local declared
+  declared="$(grep -oE "$pattern" "$ROOT/$file" | head -1 | sed -E 's/.* ([0-9]+) 项$/\1/')"
+  if [[ -z "$declared" ]]; then
+    echo "  ⚠️ $file 未找到「$label」的项数声明（跳过比对）"
+    return
+  fi
+  if [[ "$declared" == "$actual" ]]; then
+    ok "$file 的「$label」项数 = 实际（$actual）"
+  else
+    bad "$file 的「$label」声明 $declared 项，实际 $actual 项（文档漂移）"
+    DOC_COUNT_MISMATCH=$((DOC_COUNT_MISMATCH + 1))
+  fi
+}
+check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 [0-9]+ 项' 'README.md'
+check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 [0-9]+ 项' 'README.md'
+check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 [0-9]+ 项' 'README.md'
+check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 [0-9]+ 项' 'docs/ARCHITECTURE.md'
+check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 [0-9]+ 项' 'docs/ARCHITECTURE.md'
+check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 [0-9]+ 项' 'docs/ARCHITECTURE.md'
+check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 . .tests/test_offline.sh. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
+check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 . .tests/test_attribution.mjs. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
+check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 . .tests/test_e2e_regression.mjs. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
 
 echo
 echo "▶ 双通道验收结果：PASS=$PASS FAIL=$FAIL"

@@ -17,6 +17,8 @@
  * 6. CLI 参数契约：带值参数缺值显式报错（不静默改语义）、`resolveChannels` 默认值可指定；
  * 7. 缓存维护：`pruneHostCache()` 有真实调用点（`keepFingerprintsFor` + `cache` 子命令）；
  * 8. 装配器 `runHostProbe()`：宿主/环境侧失败落**结构化** `hostFatal[]`（离线缺缓存，无网可跑）。
+ * 9. **🔴-D 回归**：探针顶层兜底必须**按相位**归因——插件集成相位的未预期异常落插件侧 check
+ *    （`plugin.unexpected_exception`），**绝不**写 `hostFatal[]`；不变量守卫：`hostFatal[]` 不含插件侧 stack。
  *
  * 退出码：0 = 全绿；1 = 有失败。
  */
@@ -25,10 +27,23 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync as readText } from 'node:fs';
-import { CONTRACT_SIDE_CHECKS, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS, collectContract } from '../src/harness/contract.mjs';
+import {
+  CONTRACT_SIDE_CHECKS,
+  HOST_SIDE_CHECKS,
+  PLUGIN_HARD_EVIDENCE,
+  PLUGIN_PROBE_EXCEPTION_CHECK,
+  PLUGIN_SIDE_CHECKS,
+  PROBE_PHASE,
+  collectContract,
+  probeFailureRoute,
+  pushHostFatal,
+  recordProbeException,
+} from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
 import { channelFingerprint, loadChannels, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
+// 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
+import { codeOnly, stripComments } from './source-scan.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -398,6 +413,114 @@ console.log('  [8] 装配器结构化宿主信号（runHostProbe 离线缺缓存
   }
 }
 
+// ---- 9. 🔴-D：探针顶层兜底按相位归因（插件侧异常绝不进 hostFatal[]） ----
+console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
+{
+  // 9.1 相位路由：唯一事实源 contract.mjs 的 probeFailureRoute()
+  eq('🔴-D：host-assembly 相位 → 宿主侧（写 hostFatal[]）', JSON.stringify({ side: 'host', field: 'hostFatal' }), JSON.stringify(probeFailureRoute(PROBE_PHASE.HOST_ASSEMBLY)));
+  eq('🔴-D：plugin-integration 相位 → 插件侧 check（不写 hostFatal[]）', JSON.stringify({ side: 'plugin', check: 'plugin.unexpected_exception' }), JSON.stringify(probeFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION)));
+  eq('🔴-D：未知相位保守判插件侧（绝不写判据字段）', 'plugin', probeFailureRoute('some-unknown-phase').side);
+  eq('🔴-D：插件侧兜底 check 名已登记进 PLUGIN_SIDE_CHECKS', true, PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROBE_EXCEPTION_CHECK));
+
+  // 9.2 写入端：插件侧异常带插件 stack → 仍不得进 hostFatal[]（不变量守卫，运行时级）
+  const pluginStack = "TypeError: Cannot read properties of undefined (reading 'name') |     at get name (file:///tmp/plugin-side-throw/plugin.mjs:5:33)";
+  const pluginPhaseOut = { checks: [], errors: [], hostFatal: [] };
+  const routed = recordProbeException(pluginPhaseOut, PROBE_PHASE.PLUGIN_INTEGRATION, pluginStack);
+  eq('🔴-D：插件集成相位的未预期异常 → 落插件侧 check', PLUGIN_PROBE_EXCEPTION_CHECK, pluginPhaseOut.checks[0]?.name);
+  eq('🔴-D：插件集成相位的未预期异常 → hostFatal[] 为空（不变量）', 0, pluginPhaseOut.hostFatal.length);
+  eq('🔴-D：插件集成相位 → 归因 PLUGIN_REGRESSION（不是上游漂移）', 'PLUGIN_REGRESSION',
+    attributeFailure({ ...pluginPhaseOut, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+  eq('🔴-D：插件集成相位 → 理由链指出插件侧 check', true,
+    attributionDetail({ ...pluginPhaseOut, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev').reasons.some((r) => r.includes(PLUGIN_PROBE_EXCEPTION_CHECK)));
+  eq('🔴-D：写入端回执 side=plugin（可审计）', 'plugin', routed.side);
+
+  // 9.3 反向护栏：宿主装配相位的异常**仍须**判漂移（收窄写入端不得丢掉真漂移）
+  const hostPhaseOut = { checks: [], errors: [], hostFatal: [] };
+  recordProbeException(hostPhaseOut, PROBE_PHASE.HOST_ASSEMBLY, 'Cannot find package @deepseek-ai/dsh-tools');
+  eq('🔴-D 反向：host-assembly 相位 → hostFatal[] 非空', true, hostPhaseOut.hostFatal.length > 0);
+  eq('🔴-D 反向：host-assembly 相位 → 仍判 UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
+    attributeFailure({ ...hostPhaseOut, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+
+  // 9.4 不变量守卫（源码级）：探针顶层 catch **不得**无条件调 pushHostFatal()
+  const probeSrc = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+  eq('🔴-D：探针顶层兜底走 recordProbeException（按相位归因）', true, /catch[\s\S]{0,900}recordProbeException\(out, phase/.test(probeSrc));
+  eq('🔴-D：探针声明了相位状态并随段落切换', true, /PROBE_PHASE\.HOST_ASSEMBLY/.test(probeSrc) && /PROBE_PHASE\.PLUGIN_INTEGRATION/.test(probeSrc));
+  eq('🔴-D：读插件侧数据的两处（tools.schemas / definitions.map）均在 try 内', true,
+    /try \{[\s\S]{0,300}tools\.schemas\(\)/.test(probeSrc) && /try \{[\s\S]{0,300}definitions\.map\(/.test(probeSrc));
+  // 顶层 catch 体内**代码**不得出现裸 pushHostFatal（注释里提到它不算——故先 stripComments）
+  const catchBody = stripComments(probeSrc.slice(probeSrc.lastIndexOf('try {\n  await run();')));
+  eq('🔴-D：顶层 catch 体内无裸 pushHostFatal（交由按相位路由）', false, /pushHostFatal\(/.test(catchBody));
+
+  // 9.4b 夹具自检：夹具必须真的复现「读插件侧数据时抛错」——否则离线/E2E 的断言会空转
+  for (const fixture of ['plugin-side-throw-plugin.mjs', 'plugin-registry-throw-plugin.mjs']) {
+    const src = readText(path.join(ROOT, 'tests/fixtures', fixture), 'utf8');
+    eq(`🔴-D 夹具 ${fixture}：getter 派生自未初始化字段（真的会抛 TypeError）`, true,
+      /get (name|parameters)\(\)[\s\S]{0,200}this\.config/.test(src));
+    eq(`🔴-D 夹具 ${fixture}：夹具自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
+  }
+
+  // 9.5 写入端硬化：只给 hostFatal 的调用方不得抛 TypeError（🟢 评审建议）
+  let pushThrew = 'no-throw';
+  try { pushHostFatal({ hostFatal: [] }, 'x'); } catch { pushThrew = 'threw'; }
+  eq('🟢：pushHostFatal 对缺失 errors 的目标不抛错（写入端最不该炸）', 'no-throw', pushThrew);
+
+  // 9.6 判据读取端归一：hostFatal 非数组（字符串）不得被当成漂移信号
+  eq('🟢：hostFatal 为字符串时不判漂移（Array.isArray 归一）', 'PLUGIN_REGRESSION',
+    attributeFailure({ errors: [], checks: [failCheck('registry.exact')], hostFatal: 'fatal(host): 文本不是结构化信号', profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+  eq('🟢：hostFatal 含空白项时不判漂移（过滤空串）', 'PLUGIN_REGRESSION',
+    attributeFailure({ errors: [], checks: [failCheck('registry.exact')], hostFatal: ['   '], profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+
+  // 9.7 理由链可读性：宿主侧信号与插件侧失败同时存在时如实说明
+  const mixed = attributionDetail({ errors: ['fatal(host): x'], checks: [failCheck('plugin.apply_ok')], hostFatal: ['宿主装配失败'], profile: { flavor: 'modern' }, contract: {} }, channel, 'dev');
+  eq('🟢：同时存在插件侧失败时理由链补一句（不影响判决）', true,
+    mixed.attribution === 'UPSTREAM_DRIFT' && mixed.reasons.some((r) => r.includes('同时') && r.includes('plugin.apply_ok')));
+}
+
+// ---- 10. P2-10：判据源码守卫加固（别名绕过也拦得住，且不误报注释/文案） ----
+console.log('  [10] P2-10 判据源码守卫加固（别名绕过也拦得住）');
+{
+  const runnerSrc = readText(path.join(ROOT, 'src/verify/runner.mjs'), 'utf8');
+  const judgeSrc = runnerSrc.slice(runnerSrc.indexOf('export function attributionDetail'));
+  // codeOnly：去注释 + 去字符串/模板字面量**文本**（保留 ${...} 插值里的代码）
+  const judgeCode = codeOnly(judgeSrc);
+  // stripComments：只去注释（保留字符串内容，用于「不得出现某字面量」类断言）
+  const judgeNoComments = stripComments(judgeSrc);
+  // P2-10 教训：原守卫只认 \`errors.\` 前缀，别名（const logLines = probe.errors）可绕过，
+  // 且注释里写「不读 errors」反而误报。现在按**标识符**判（codeOnly 后注释与文案都不在视野内）。
+  eq('P2-10：判据代码不引用 errors（含别名赋值，codeOnly 后判标识符）', 'no-errors-ref',
+    /\berrors\b/.test(judgeCode) ? 'errors-referenced' : 'no-errors-ref');
+  eq('P2-10：判据代码不含 fatal(host) 字面量（含字符串字面量，stripComments 后判）', 'no-literal',
+    /fatal\(host\)/.test(judgeNoComments) ? 'literal-present' : 'no-literal');
+  eq('P2-10：判据代码不引用日志前缀常量 HOST_FATAL_PREFIX', 'no-prefix-const',
+    /HOST_FATAL_PREFIX/.test(judgeCode) ? 'prefix-referenced' : 'no-prefix-const');
+  eq('P2-10：判据代码只读结构化字段 HOST_FATAL_FIELD', 'reads-field',
+    /HOST_FATAL_FIELD/.test(judgeCode) ? 'reads-field' : 'field-not-read');
+
+  // 守卫自身的有效性自证：把三种「写回文本扫描」的写法喂给守卫，必须全部命中
+  const bypassSamples = {
+    '直接扫描': "if (probe.errors.includes('fatal(host)')) return 'drift';",
+    '别名扫描': "const logLines = probe.errors; if (logLines.join('|').includes('fatal(host)')) return 'drift';",
+    '模板插值扫描': "reasons.push(`${probe.errors.join('|')}`);",
+  };
+  for (const [label, sample] of Object.entries(bypassSamples)) {
+    eq(`P2-10 守卫自证：${label} 写法被抓到`, true, /\berrors\b/.test(codeOnly(sample)));
+  }
+  eq('P2-10 守卫自证：注释里写 errors 不误报（去掉注释后判）', false, /\berrors\b/.test(codeOnly("// 本判据不读 errors\nconst a = 1;")));
+  eq('P2-10 守卫自证：文案里写 errors 不误报（模板文本被剔除）', false, /\berrors\b/.test(codeOnly('reasons.push(`请人工看原始 errors`)')));
+
+  // 主防线仍是行为反证：把 errors 换成抛错 getter，判据不得炸、也不得改判
+  const trapped = {};
+  Object.defineProperty(trapped, 'errors', { get() { throw new Error('判据读了 errors 自由文本'); } });
+  let trapResult = 'threw';
+  try {
+    trapResult = attributeFailure({ ...trapped, checks: [failCheck('registry.exact')], hostFatal: [], profile: { flavor: 'modern' }, contract: {} }, channel, 'dev');
+  } catch { trapResult = 'threw'; }
+  eq('P2-10：判据对 errors 抛错 getter 无感（行为级反证，主防线）', 'PLUGIN_REGRESSION', trapResult);
+
+  // 判据不得读 errors：反向证明——只给 errors 文本、不给结构化字段，不判漂移
+  eq('P2-10：仅 errors 文本含 fatal(host)、hostFatal 为空 → 不判漂移', 'PLUGIN_REGRESSION',
+    attributeFailure(probeOf(['fatal(host): 文本不算结构化信号'], [failCheck('registry.exact')]), channel, 'dev'));
+}
 console.log();
 console.log(`▶ 归因与契约采集离线回归结果：PASS=${pass} FAIL=${fail}`);
 process.exit(fail === 0 ? 0 : 1);

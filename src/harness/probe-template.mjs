@@ -9,14 +9,23 @@
  *   验证「装上就能用」；
  * - **生命周期路径**：用中台 `registerTools` 重注册并逐个卸载，验证 disposer 语义。
  *
- * ## 错误分级（归因的前提，见评审 🔴-A / 🔴-B）
+ * ## 错误分级（归因的前提，见评审 🔴-A / 🔴-B / 🔴-D）
  * 探针的错误分两侧，措辞**必须可区分**，否则归因会被带跑：
  * - **宿主/环境侧**（装不上、宿主包 import 失败、ToolRuntime 未就绪、探针自身契约采集炸）
  *   → `pushHostFatal()`：结构化落 `hostFatal[]`（**归因判据只读它**）+ 人读日志 `fatal(host): ...`；
- * - **插件侧**（import 失败、未导出 `apply`、`apply` 抛错、`definitions` 抛错、
- *   工具清单不符、dispatch 失败、卸载残留、声明保留名）
+ * - **插件侧**（import 失败、未导出 `apply`、`apply` 抛错、`definitions` 抛错/不可读、
+ *   工具清单不符/不可枚举、dispatch 失败、卸载残留、声明保留名）
  *   → 一律落成 **check 失败**（`plugin.*` / `registry.*` / `dispatch.*` / `lifecycle.*` /
  *   `guard.reserved_rejected`），归因判 `PLUGIN_REGRESSION`。
+ *
+ * ## 相位（🔴-D：写入端纪律）
+ * 探针分两段跑，两段的**异常归属**不同，顶层兜底靠 `phase` 决定落点：
+ * - `host-assembly`（第 1/3 段：宿主包 import、Context 装配、契约指纹采集）→ `hostFatal[]`；
+ * - `plugin-integration`（第 5 段起：插件 import / apply / definitions / dispatch / 生命周期）
+ *   → **插件侧 check**（`plugin.unexpected_exception`），**绝不**进 `hostFatal[]`。
+ * 未知相位**保守判插件侧**（宁可让人多看一眼插件失败，也不让未确认的信号去开「上游漂移」的门）。
+ * 归属路由的唯一事实源：`contract.mjs` 的 `PROBE_PHASE` / `probeFailureRoute()` / `recordProbeException()`。
+ * 读插件侧数据的两处（`tools.schemas()` / `definitions.map()`）另有独立护栏，异常落插件侧 check。
  * 历史缺陷（🔴-B）：插件侧错误曾被统一写成 `fatal: ...`，而 `runner` 用裸 `fatal:` 判上游漂移
  * → 插件写坏了却被告知「上游变了，不是你的问题」。
  * 历史缺陷（🔴-C）：改用 `fatal(host)` 前缀后判据仍在**扫自由文本**——插件文件路径/错误文本里
@@ -25,14 +34,22 @@
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
 import { pathToFileURL } from 'node:url';
-import { collectContract, PLUGIN_SIDE_CHECKS, pushHostFatal } from './contract.mjs';
+import { collectContract, PLUGIN_SIDE_CHECKS, PROBE_PHASE, pushHostFatal, recordProbeException } from './contract.mjs';
 
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
 
 // hostFatal：**结构化**的宿主/环境侧致命信号（归因判据唯一依据，见 🔴-C）。
 // errors：人类可读日志（可含插件侧 stack/路径）——**不参与判据**。
-const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}, probes: [], ok: false };
+const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}, probes: [], phase: null, ok: false };
+/**
+ * 当前执行相位（🔴-D 的唯一事实源在 `contract.mjs` 的 {@link PROBE_PHASE}）。
+ *
+ * 顶层 catch 靠它决定异常归属：`host-assembly` → `hostFatal[]`；`plugin-integration`
+ * → **插件侧 check**（绝不进 `hostFatal[]`）。默认取宿主装配相位（探针启动即装配宿主）。
+ */
+let phase = PROBE_PHASE.HOST_ASSEMBLY;
+out.phase = phase;
 const check = (name, ok, detail) => {
   out.checks.push({ name, status: ok ? 'pass' : 'fail', detail: detail === undefined ? '' : String(detail).slice(0, 600) });
   if (!ok) out.errors.push(`${name}: ${detail ?? ''}`);
@@ -56,6 +73,12 @@ const skipAll = (names, reason) => {
 const brief = (error, limit = 600) => String(error?.stack ?? error).split('\n').slice(0, 3).join(' | ').slice(0, limit);
 /** definitions 不可用时无法验证的检查项（第 9/10/11 段共用，避免两处清单各自漂移）。 */
 const SKIP_AFTER_DEFINITIONS = ['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected'];
+/**
+ * 工具清单**不可枚举**时无法验证的检查项（🔴-D：第 6 段读 `tools.schemas()` 时插件侧数据抛错）。
+ *
+ * 与 `SKIP_AFTER_DEFINITIONS` 同理：前置失败只标 skip，不制造噪音失败。
+ */
+const SKIP_AFTER_REGISTRY = ['dispatch.execute_ok', 'dispatch.render_projected', 'dispatch.echo_payload', 'dispatch.abort_semantics', 'plugin.definitions_ok', 'lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected'];
 /**
  * 装配一个隔离宿主（新 Context + SystemPrompt + ToolRuntime），返回其 `ctx.tools`。
  *
@@ -141,6 +164,10 @@ async function run() {
   check('compat.schema_flatten', flattenOk, flattenOk ? `schema 压平后无违规：${JSON.stringify(flattened)}` : `schema 压平后仍有违规：${JSON.stringify(flattened)}`);
 
   // ---- 5. 集成路径：插件 import / apply（**插件侧**失败 → check，绝不 fatal） ----
+  // 🔴-D：相位切到「插件集成」——此后逃到顶层 catch 的异常一律落**插件侧 check**，
+  // 绝不写 hostFatal[]（否则插件 bug 会被判成上游漂移，并盖掉插件侧已失败的 check）。
+  phase = PROBE_PHASE.PLUGIN_INTEGRATION;
+  out.phase = phase;
   let plugin = null;
   try {
     plugin = await import(pathToFileURL(pluginPath).href);
@@ -165,9 +192,18 @@ async function run() {
     return;
   }
 
-  // ---- 6. 工具清单精确匹配 ----
-  const actual = tools.schemas().map((s) => s.name).filter((n) => !n.startsWith('probe_')).sort();
+  // ---- 6. 工具清单精确匹配（🔴-D：读插件侧数据必须加护栏，异常落插件侧 check） ----
   const want = [...expectedTools].sort();
+  let actual;
+  try {
+    actual = tools.schemas().map((s) => s.name).filter((n) => !n.startsWith('probe_')).sort();
+  } catch (error) {
+    // `tools.schemas()` 会调用插件注册项的 getter（插件侧数据）——插件写错（未初始化字段 /
+    // 抛错 getter）时异常从这里抛出。它**不是**宿主问题，必须落插件侧 check。
+    check('registry.exact', false, `工具清单不可枚举（插件侧注册项读取出错）：${brief(error)}`);
+    skipAll(SKIP_AFTER_REGISTRY, '工具清单不可枚举');
+    return;
+  }
   const registryExact = JSON.stringify(actual) === JSON.stringify(want);
   check('registry.exact', registryExact, registryExact ? `工具清单精确匹配（${actual.join(',')}）` : `期望 ${want.join(',')} / 实得 ${actual.join(',')}`);
 
@@ -256,7 +292,15 @@ async function run() {
   }
 
   // ---- 11. 保留名冲突：既不得静默丢弃，也不得被放行（插件须改名） ----
-  const reservedInDefs = definitions.map((d) => d?.name).filter((n) => hub.RESERVED_TOOL_NAMES.includes(n));
+  // 🔴-D：读插件侧 definitions 必须加护栏——`d?.name` 会触发插件对象的 getter，
+  // 插件写错时异常从这里逃逸（历史缺陷：逃到顶层 catch → hostFatal[] → 误判上游漂移）。
+  let reservedInDefs;
+  try {
+    reservedInDefs = definitions.map((d) => d?.name).filter((n) => hub.RESERVED_TOOL_NAMES.includes(n));
+  } catch (error) {
+    check('guard.reserved_rejected', false, `插件 definitions 不可读取（插件侧 getter/字段错误）：${brief(error)}`);
+    return;
+  }
   if (reservedInDefs.length === 0) {
     check('guard.reserved_rejected', true, `插件未使用 DSH 保留名（${hub.RESERVED_TOOL_NAMES.join(',')}）`);
   } else {
@@ -282,8 +326,14 @@ async function run() {
 try {
   await run();
 } catch (error) {
-  // 兜底：探针自身未预期的异常。**不猜归因**：按宿主侧记录（插件侧错误在 run() 内已落成 check）。
-  pushHostFatal(out, `探针未预期异常：${brief(error, 1200)}`);
+  // 兜底：探针自身未预期的异常。**按相位归因**（🔴-D），不猜：
+  // - host-assembly：宿主包 import / Context 装配 / 契约采集阶段 → 宿主/环境侧 → hostFatal[]；
+  // - plugin-integration：读插件侧数据（tools.schemas() / definitions.map()）时插件代码抛错
+  //   → **插件侧 check**（plugin.unexpected_exception），绝不进 hostFatal[]。
+  // 历史缺陷：旧注释假定「插件侧错误在 run() 内已落成 check」——该前提不成立（有插件侧异常
+  // 直接从插件数据读取处逃逸），故必须显式分相位，不能一律 pushHostFatal()。
+  // 归属逻辑收敛在 contract.mjs 的 recordProbeException()（与离线回归共用同一份）。
+  recordProbeException(out, phase, brief(error, 1200));
 }
 
 out.ok = out.errors.length === 0;

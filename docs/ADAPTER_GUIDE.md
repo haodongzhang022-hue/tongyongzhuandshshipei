@@ -196,6 +196,9 @@ node /path/to/hub/src/cli.mjs watch
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
+**另有 1 项条件检查**（不计入上表 17 项，仅在异常路径出现）：`plugin.unexpected_exception`——
+探针在 `plugin-integration` 相位发生未预期异常（读插件侧数据时**插件代码**抛错）时写入，
+归因 `PLUGIN_REGRESSION`。它是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
 
 **归因优先级**（`attributionReasons` 判据链按此顺序取第一条命中）：
 
@@ -208,6 +211,15 @@ node /path/to/hub/src/cli.mjs watch
 6. 插件侧 check   插件侧 / 中台契约层检查失败（上游契约与基线一致）
 7. UNKNOWN        有失败但无可识别 check（被外力打断）→ 不猜、不甩锅
 ```
+
+> **`hostFatal[]` 什么时候会被写？**（写入端分相位，🔴-D）
+> 探针分两段跑：`host-assembly`（宿主包 import / Context 装配 / 契约采集）与
+> `plugin-integration`（插件 import / apply / definitions / dispatch / 生命周期）。
+> **只有 `host-assembly` 段的未预期异常**才写 `hostFatal[]`；插件集成段的异常一律落
+> **插件侧 check**（`plugin.unexpected_exception` / `registry.exact` / `guard.reserved_rejected`）。
+> 所以：`hostFatal[]` 非空 ⇒ 确实是宿主/环境侧问题；`hostFatal[]` 为空 + 插件侧 check 失败
+> ⇒ 是你的插件问题（哪怕 `errors[]` 里出现了宿主侧措辞的字面量——`errors` 不参与判据）。
+> 报告里的 `probePhase` 字段告诉你异常发生在哪一段，排障不必猜。
 
 > 第 3 条是「漂移窗口内的插件 bug」不被吞的关键：上游取消保留名 = 契约漂移（照实记录），
 > 但插件**仍不得**声明 `run_code`——两者互不抵消。

@@ -82,6 +82,79 @@ export const HOST_FATAL_PREFIX = 'fatal(host)';
 export const HOST_FATAL_FIELD = 'hostFatal';
 
 /**
+ * 探针执行**相位**（🔴-D：探针兜底写入端的归属判据）。
+ *
+ * 探针分两段跑，两段的「异常归属」完全不同：
+ * - `host-assembly`：宿主包 import / Context 装配 / 契约指纹采集 —— 失败是**宿主/环境侧**；
+ * - `plugin-integration`：插件 import / apply / definitions / dispatch / 生命周期 —— 失败是**插件侧**。
+ *
+ * 历史缺陷（评审三轮 🔴-D）：顶层 catch 不看相位，一律 `pushHostFatal()`，
+ * 于是「读插件侧数据时抛出的插件 bug」（未初始化字段 / 抛错 getter）被写进判据字段
+ * `hostFatal[]` → 判 `UPSTREAM_DRIFT`/AMBER，把插件 bug 甩给上游，
+ * 并盖掉同一次运行里已失败的插件侧 check。
+ *
+ * @type {{HOST_ASSEMBLY: string, PLUGIN_INTEGRATION: string}}
+ */
+export const PROBE_PHASE = {
+  HOST_ASSEMBLY: 'host-assembly',
+  PLUGIN_INTEGRATION: 'plugin-integration',
+};
+
+/**
+ * 「探针自身未预期异常」在**插件集成相位**的落点 check 名（已登记进 {@link PLUGIN_SIDE_CHECKS}）。
+ *
+ * 为什么需要它：插件集成相位里有些异常发生在 `run()` 的 try/catch 之外（读插件侧数据：
+ * `tools.schemas()` / `definitions.map()`），逃到顶层 catch 时**没有**对应 check，
+ * 若照旧落 `hostFatal[]` 就等于「插件 bug 报成上游漂移」。故给它们一个插件侧 check 名。
+ */
+export const PLUGIN_PROBE_EXCEPTION_CHECK = 'plugin.unexpected_exception';
+
+/**
+ * 探针异常归属路由（**唯一事实源**，探针顶层 catch 与离线回归共用）。
+ *
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @returns {{side: 'host'|'plugin', field?: string, check?: string}} 归属：宿主侧写字段 / 插件侧写 check
+ *
+ * 保守取向：**未知相位按插件侧处理**（绝不写 `hostFatal[]`）。
+ * 宁可让人多看一眼插件侧失败，也不让一个未确认的信号去开「上游漂移」这道门
+ * （那道门直接决定放行/改中台，代价更大）。
+ */
+export function probeFailureRoute(phase) {
+  return phase === PROBE_PHASE.HOST_ASSEMBLY
+    ? { side: 'host', field: HOST_FATAL_FIELD }
+    : { side: 'plugin', check: PLUGIN_PROBE_EXCEPTION_CHECK };
+}
+
+/**
+ * 记录「探针未预期异常」——**按相位**决定落点（🔴-D 的核心修复，探针与离线回归共用）。
+ *
+ * 收敛成一个函数的原因：`hostFatal[]` 是判据唯一事实字段，它的**写入端**必须只有一处可写错。
+ * 此前顶层 catch 直接调 `pushHostFatal()`，而插件侧异常也会逃到那里 → 插件 bug 被写成宿主信号。
+ *
+ * @param {{checks: object[], errors: string[], hostFatal?: string[]}} target 探针 `out`
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @param {string} detail 异常摘要（`brief()` 产物，含 stack）。仅进**人读日志**或**插件侧 check 的 detail**，
+ *   **不得**进入 `hostFatal[]`（判据字段只收宿主/环境侧信号）
+ * @returns {{side: 'host'|'plugin', line: string}} 归属与写入的日志行（供排障）
+ */
+export function recordProbeException(target, phase, detail) {
+  const route = probeFailureRoute(phase);
+  // 相位落进结构化结果：报告里看得见「异常发生在哪一段」，排障不必猜。
+  target.phase = phase;
+  if (route.side === 'host') {
+    return { side: 'host', line: pushHostFatal(target, `探针未预期异常：${detail}`) };
+  }
+  // 插件集成相位：落**插件侧 check**（名字已登记进 PLUGIN_SIDE_CHECKS，否则归因退化成 UNKNOWN）。
+  // 绝不写 hostFatal[]——那是「上游漂移」这道门的唯一钥匙。
+  const text = String(detail).slice(0, 600);
+  target.checks.push({ name: route.check, status: 'fail', detail: text });
+  const line = `${route.check}: 探针未预期异常（${phase} 相位，插件侧数据读取出错）：${text}`;
+  if (!Array.isArray(target.errors)) target.errors = [];
+  target.errors.push(line);
+  return { side: 'plugin', line };
+}
+
+/**
  * 记录一条宿主/环境侧致命信号：**同时**写结构化字段（判据唯一依据）与人读日志行。
  *
  * 存在的意义：把「谁写信号、谁读信号」收敛成一个函数，避免有人再往
@@ -94,6 +167,9 @@ export const HOST_FATAL_FIELD = 'hostFatal';
 export function pushHostFatal(target, detail) {
   const text = String(detail);
   if (!Array.isArray(target.hostFatal)) target.hostFatal = [];
+  // 🟢：两个字段都归一——只给了 hostFatal 的调用方（或外部传入的畸形对象）不得在此抛 TypeError，
+  // 否则「记录一条宿主侧信号」本身会炸成未归因异常（写入端最不该有的失败模式）。
+  if (!Array.isArray(target.errors)) target.errors = [];
   target.hostFatal.push(text);
   const line = `${HOST_FATAL_PREFIX}: ${text}`;
   target.errors.push(line);
@@ -137,6 +213,8 @@ export const PLUGIN_SIDE_CHECKS = [
   'lifecycle.registered',
   'lifecycle.dispose',
   'guard.reserved_rejected',
+  // 🔴-D：插件集成相位里逃到顶层 catch 的未预期异常（读插件侧数据时插件代码抛错）
+  'plugin.unexpected_exception',
 ];
 
 /** 探测工具名（用于残留自检；这三个名字不得出现在被测插件可见的工具清单里）。 */

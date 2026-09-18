@@ -68,7 +68,9 @@ export function verifyChannel(options) {
     contractDrift,
     checks: probe.checks,
     errors: probe.errors,
-    hostFatal: probe.hostFatal ?? [],
+    hostFatal: Array.isArray(probe.hostFatal) ? probe.hostFatal : [],
+    // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
+    probePhase: probe.phase ?? null,
     probeExit: probe.probeExit ?? null,
     install: probe.install,
     cacheHit: probe.cacheHit,
@@ -130,9 +132,18 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
 
   // 1. 宿主/环境侧：**只读结构化字段** hostFatal[]（绝不扫 errors 自由文本——插件侧 stack/路径
   //    里出现 `fatal(host)` 字面量就会翻案，评审 🔴-C），或失败项属宿主侧 check 名。
-  const hostFatal = probe?.[HOST_FATAL_FIELD] ?? [];
+  // 🟢：归一为数组——此前「非数组但 length>0」（如外部传入字符串）会被当成漂移信号；
+  // 现在只认真正的数组元素（判据字段的**读取端**也不许有含糊）。
+  const rawHostFatal = probe?.[HOST_FATAL_FIELD];
+  const hostFatal = Array.isArray(rawHostFatal) ? rawHostFatal.filter((item) => String(item ?? '').trim().length > 0) : [];
   if (hostFatal.length > 0) {
     reasons.push(`[${channelName}] 探针报告宿主/环境侧致命错误（${hostFatal.length} 条，字段 ${HOST_FATAL_FIELD}）：${String(hostFatal[0]).slice(0, 200)}`);
+    // 🟢 可读性（评审建议）：宿主侧信号与插件侧失败可能**同时**存在（如宿主装配失败前插件已失败）。
+    // 判据优先级不变（宿主侧优先），但理由链要如实说出来，避免人误读成「插件没问题」。
+    const alsoPluginFailed = PLUGIN_SIDE_CHECKS.filter((name) => failedNames.has(name));
+    if (alsoPluginFailed.length > 0) {
+      reasons.push(`[${channelName}] 注意：本次**同时**存在插件侧失败 check（${alsoPluginFailed.join(',')}）——宿主侧信号优先判漂移，但插件侧问题需另行修复（见 checks[].detail）`);
+    }
   }
   for (const name of HOST_SIDE_CHECKS) {
     if (failedNames.has(name)) reasons.push(`[${channelName}] 宿主侧检查失败：${name}`);

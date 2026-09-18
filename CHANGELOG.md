@@ -1,5 +1,47 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.1.7 — 🔴-D 收口：`hostFatal[]` 写入端分相位（插件侧异常永不进判据字段）+ P2-9 / P2-10
+
+> 承接 v0.1.5（复测清单闭环）/ v0.1.6（文档守卫加固）。
+> 评审 @ `f995979` 判 `disposition = fix_bug`：🔴-D 未清零——同一失效族**仍有活口**，
+> 但活口从「判据读取端」搬到了「**写入端**」。
+
+### 🔴 必修
+
+| # | 问题 | 修复 | 回归防线 |
+|---|---|---|---|
+| 🔴-D | **探针顶层兜底把插件侧异常写进 `hostFatal[]`**（判据唯一事实字段）。探针有两条「读插件侧数据」的路径不在 try 内：`tools.schemas().map(...)`（第 6 段）与 `definitions.map((d) => d?.name)`（第 11 段）。插件写错代码（类实例未初始化字段 / 抛错 getter）→ 异常逃出 `run()` → 顶层 `catch` 一律 `pushHostFatal()` → 判据 1 命中 → `UPSTREAM_DRIFT`/AMBER，且判据 1 **优先于**判据 5 → 插件侧已失败的 check 被整条盖掉。违反本 PR 自订不变量「插件侧错误**永远**不进该字段」 | ① **相位化兜底**：探针声明执行相位（`host-assembly` / `plugin-integration`），顶层兜底按相位归因——宿主装配相位 → `hostFatal[]`，插件集成相位 → **插件侧 check** `plugin.unexpected_exception`（已登记 `PLUGIN_SIDE_CHECKS`）；未知相位**保守判插件侧**；② **插件数据读取加护栏**：`tools.schemas()` → `registry.exact`、`definitions.map()` → `guard.reserved_rejected`（异常均落插件侧 check，并 `skipAll` 后续未验项）；③ 归属路由唯一事实源 `contract.mjs` 的 `PROBE_PHASE` / `probeFailureRoute()` / `recordProbeException()`（探针与离线回归共用同一份）；④ 相位随报告透出（`probePhase`），排障看得见异常归属依据 | **离线** [9] 20 条（相位路由 / 写入端不变量 / 反向护栏 / 源码守卫）；**真宿主** [8] 18 条 ×2 夹具（`plugin-side-throw-plugin.mjs` / `plugin-registry-throw-plugin.mjs` → `PLUGIN_REGRESSION`/RED **且 `hostFatal.length === 0`**、`hostFatal` 不含夹具路径与 `at ` 帧、插件侧 stack 仍留在 `errors` 日志）；**反向** 真宿主 [9] 3 条（离线缺缓存仍判漂移、`hostFatal` 非空、`probePhase=host-assembly`） |
+
+### 🟡 建议（同批修）
+
+| # | 问题 | 处置 |
+|---|---|---|
+| P2-9 | 文档判据表与计数仍漂移：`docs/ARCHITECTURE.md` 判据 1 仍写「错误串含 `fatal(host)`」——正是 v0.1.4 已删掉的判据，留着会诱导下一个人把文本扫描写回来；`docs/ARCHITECTURE.md` / `README.md` / `docs/INDEX.md` 的 59/48/34 计数未同步（`INDEX.md:39/40` 改了、`:38` 漏了） | **已修**：判据 1 改为「**结构化字段** `hostFatal[]` 非空（**判据不读 `errors` 自由文本**）」；补「写入端纪律（🔴-D）」段；全部测试计数同步为实际值（离线 70 / 归因离线 128 / 发布面 27 / 端到端 64），并新增 `test_hub.sh` 第 7 步机器守卫；`docs/INDEX.md` 与 `docs/ADAPTER_GUIDE.md` 补「条件触发检查项」小节（`plugin.unexpected_exception` 不计入 17 项，仅在异常路径出现） |
+| P2-10 | 源码守卫可被平凡绕过：`test_attribution.mjs` [7] 的正则只认 `errors.` 前缀，别名（`const logLines = probe.errors`）写回文本扫描时**不命中**；同时注释/文案里写「不读 errors」反而**误报** | **已修**：新增 `tests/source-scan.mjs`（`stripComments` / `codeOnly`——后者去注释 + 去字符串/模板字面量的**文本部分**、保留 `${...}` 插值里的代码，因为「模板插值扫描」正是最短的绕过路径）。守卫改为「判据代码不得引用 `errors` 标识符（含别名）+ 不得出现 `fatal(host)` 字面量 + 不得引用 `HOST_FATAL_PREFIX`」，并**自证**三种绕过写法全部命中、注释/文案不误报；主防线仍是行为反证（`errors` 换抛错 getter，判据无感） |
+
+### 🟢 优化（同批顺手）
+
+- `pushHostFatal()`：`target.errors` 缺失时不再抛 `TypeError`（写入端最不该炸——记录信号本身失败会退化成未归因异常）；`target.hostFatal` 与 `target.errors` 双向归一。
+- `attributionDetail()`：`hostFatal` 读取端 `Array.isArray` 归一 + 过滤空白项（此前「非数组但 `length > 0`」如字符串会被当成漂移信号）。
+- 理由链可读性：`hostFatal[]` 非空时若**同时**存在插件侧失败 check，理由链补一句说明（判据优先级不变，避免人误读成「插件没问题」）。
+
+### 兼容性
+
+- 探针输出、验收报告新增字段 `phase` / `probePhase`（`host-assembly` / `plugin-integration`）。
+- `attributionDetail()` / `attributeFailure()` 签名不变；**写入端语义收窄**——插件集成相位的异常不再进 `hostFatal[]`。
+- 新增 `contract.mjs` 导出：`PROBE_PHASE` / `probeFailureRoute()` / `recordProbeException()` / `PLUGIN_PROBE_EXCEPTION_CHECK`。
+
+### 测试项数
+
+- `tests/test_offline.sh`：66 → **70 项**（🔴-D 相位化兜底 4 条；承接 v0.1.6 的 66 项基线）
+- `tests/test_attribution.mjs`：94 → **128 项**（承接 v0.1.6 的 94 项基线）
+- `tests/test_e2e_regression.mjs`：43 → **64 项**
+- `tests/test_exports.mjs`：25 → **27 项**
+- 新增夹具：`tests/fixtures/plugin-side-throw-plugin.mjs`、`tests/fixtures/plugin-registry-throw-plugin.mjs`
+- 新增工具：`tests/source-scan.mjs`（`stripComments` / `codeOnly`）
+- `tests/test_hub.sh`：新增第 7 步「文档计数防漂移」（文档声明的项数 ≠ 实际项数即红；P2-9 同族防线）；测试项数改为**从输出取**，不再硬编码
+- `.cnb.yml`：push / PR 各新增 `plugin-error-not-host-signal` 闸门（两份 🔴-D 夹具：断言 `PLUGIN_REGRESSION` + `hostFatal` 为空 + 非 AMBER）
+
 ## v0.1.6 — 复测 🟠P1-新/🟡P2-新 收口（文档守卫加固：从「关键词存在」升级到「结构 + 行序」）
 
 > 承接 v0.1.5（续）。复测结论：文档修复本体通过，但**判据表守卫「守住了文字，没守住结构与顺序」**——
@@ -75,7 +117,6 @@
 - `tests/test_attribution.mjs`：69 → **80 项**（+[7b] 11 条 ARCHITECTURE 判据表守卫：旧口径已删 + 结构化字段 + errors 不读 + 唯一事实源 + 四条纪律四条齐全 + 名单覆盖）
 - `tests/test_exports.mjs`：19 → **20 项**（+[2c] 1 条文档版本一致性）
 - `tests/test_e2e_regression.mjs`：43 项（不变；本版未动归因源码，无需重跑真宿主）
-
 ## v0.1.5 — 复测遗留项收口（评审 §三/§四 清单闭环）
 
 > 承接 v0.1.3（🔴-C + 负例闸门）与 v0.1.4（判据只读结构化字段）。本轮把复测清单里**剩余未落地项**补齐，

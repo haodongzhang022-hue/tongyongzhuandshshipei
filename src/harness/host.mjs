@@ -14,7 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { pushHostFatal } from './contract.mjs';
+import { PROBE_PHASE, pushHostFatal } from './contract.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,7 +93,7 @@ export function pruneHostCache(options = {}) {
  * @param {string} [options.cacheDir] 宿主依赖缓存根（默认 $TMPDIR/dsh-adapt-host-cache）
  * @param {boolean} [options.offline] 仅用缓存，缺失即失败
  * @param {number} [options.timeoutMs] 安装 / 探针超时
- * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], hostFatal:string[], contract:object, probes:object[], probeExit:object|null, install:string, cacheHit:boolean, durationMs:number}}
+ * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], hostFatal:string[], contract:object, probes:object[], phase:string|null, probeExit:object|null, install:string, cacheHit:boolean, durationMs:number}}
  *
  * 缓存策略：命中时以**软链**挂载缓存 `node_modules`（不再全量复制）；
  * 历史残留用 {@link pruneHostCache} 清理（保留当前钉版指纹）。
@@ -125,6 +125,10 @@ export function runHostProbe(options) {
     contract: {},
     probes: [],
     probeExit: null,
+    // 探针执行相位（异常归属依据；见 contract.mjs 的 PROBE_PHASE）。
+    // 装配器自身的失败（离线缺缓存 / npm 失败 / 装配异常）**都是宿主装配相位**——
+    // 探针跑通后由探针回报的相位覆盖（那时才可能进入插件集成相位）。
+    phase: PROBE_PHASE.HOST_ASSEMBLY,
     install: 'skipped',
     cacheHit: false,
     durationMs: 0,
@@ -208,9 +212,14 @@ export function runHostProbe(options) {
     result.checks = payload.checks ?? [];
     result.contract = payload.contract ?? {};
     result.probes = payload.probes ?? [];
-    result.errors.push(...(payload.errors ?? []));
-    // 探针侧的结构化宿主致命信号**原样透传**（执行器判据只读这一处，不再扫 errors 文本）
-    result.hostFatal.push(...(payload.hostFatal ?? []));
+    // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，透传给报告供排障。
+    // 探针未回报时保留装配器判定（host-assembly），不退化成 null（否则排障看不到归属依据）。
+    result.phase = payload.phase ?? result.phase;
+    // 🟢 同样归一：errors 是日志（不参与判据），但非数组也不该被 spread 成逐字符噪声。
+    if (Array.isArray(payload.errors)) result.errors.push(...payload.errors);
+    // 探针侧的结构化宿主致命信号**原样透传**（执行器判据只读这一处，不再扫 errors 文本）。
+    // 🟢 归一：只透传真正的数组元素——非数组（如畸形 payload 给字符串）不得被 spread 成逐字符噪声。
+    if (Array.isArray(payload.hostFatal)) result.hostFatal.push(...payload.hostFatal);
     result.ok = payload.ok === true && result.errors.length === 0;
     return result;
   } catch (error) {
