@@ -1,5 +1,74 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.1.9 — 🔴 必修-1/2/3 收口：**完成位** + 进程 exit 出口 + `run()` 被拖住（四条出口逐条闭合）
+
+> 承接 v0.1.8（异步异常兜底）。评审 @ `c8965b9` 判 `disposition = fix_bug`（**第 6 次回转 = 硬上限**）：
+> 异步活口已收口 ✅，但同一失效族仍有**三条**未闭合——且其中一条被「修一半」后会产生**假绿**。
+> 评审 §五 把总师的「可穷举 3 出口」修正为 **4 个**：① `run()` try/catch ② 异步异常 ③ 进程 `exit`
+> ④ **`run()` 被插件拖住**。②③④ 同属单一进程边界，本版**一次修完**。
+
+### 🔴 必修（本轮清零）
+
+| # | 问题 | 修复 | 回归防线 |
+|---|---|---|---|
+| **必修-1** | **完成位缺失**（总师点名「必须」）。`emit()` 的 `ok` 只看 `errors.length === 0`，而出口 ③ 的兜底会在验收**中途**输出报告——此时「还没跑到」的检查一律是 `skip`（不是 `fail`）⇒ 一个在 `apply()` 里 `process.exit(0)` 的插件会拿到 **GREEN / PASS / checks=6 的假绿**（比 AMBER 更危险：AMBER 至少不放行）。评审实测：只加 `exit` 钩子而**不带完成位** = 用一个 HIGH 换一个 MEDIUM | `runCompleted` **只在 `run()` 正常返回后**置真；`emit()` 的 `ok = runCompleted && errors.length === 0`；完成位随结构化结果输出，装配器**原样透传**（`result.ok` 同样要求完成位）；判据新增 **1b**（宿主侧信号之后、硬证据之前）：`runCompleted === false` 且无失败项且 `checks` 非空 → `PLUGIN_REGRESSION`（**绝不判 PASS**）。`exit` 钩子里 `process.exitCode = 1`（插件 `exit(0)` 也不得让装配器读成通过） | 离线 [9.9d] 完成位 6 条（含反向护栏：缺字段不翻案 / 宿主侧信号优先）；装配器层 [9.9e] 3 条；`test_offline.sh` [16] 断言「未跑完绝不给 ok / 退出码非 0」；真宿主 [8c] 断言 `runCompleted=false` 且 verdict=RED |
+| **必修-2** | **进程 exit 出口未闭合、且未声明（静默）**。插件调 `process.exit()` **不抛异常** ⇒ 顶层 `catch` 与 `uncaughtException` 都接不到 ⇒ 探针在写出结构化结果前消失 ⇒ 装配器**无条件** `pushHostFatal()` ⇒ `UPSTREAM_DRIFT`/AMBER + `checks` 归零。且 `CHANGELOG` / `docs/RISKS.md` / 提交信息 / PR 描述**均无**「已知未收口」标注（违反「不得静默」） | ① `process.on('exit')` 钩子：`recordProbeEarlyExit()` 落插件侧 check `plugin.early_exit` → `skipPendingChecks()` 补 skip → `emit()`（`writeSync`，防截断）→ `process.exitCode = 1`；② 自杀式信号（`SIGTERM`/`SIGINT`/`SIGHUP`/`SIGQUIT`）显式接住，同一路径收尾；③ **不可捕获边界**（`SIGKILL`/OOM/原生 `abort`）**显式声明**（本文件 + `docs/RISKS.md` R21 + 指南 + 判据表口径），并**按相位信标**归因（见下），不是「声明了事」 | 离线 [9.9a/b/c/f/g] 路由 + 写入端不变量 + 崩溃路径不抛 + 信标 + 源码守卫；`test_offline.sh` [16] 出口③ 5 条；真宿主 [8c] 3 条 + 假绿反证 2 条；闸门 `tests/gate_plugin_side.sh` |
+| **必修-3** | **看门狗不覆盖「单纯挂住」**。`ASYNC_WATCHDOG_MS` 只在**记录过异步异常**时才安装 ⇒ `apply()` 返回永不 resolve 的 Promise（无异常、无退出）**根本没装**；且紧跟 `watchdog.unref?.()` ⇒ 事件循环里没有其它 handle 时进程直接走 exit 路径，看门狗**永不触发**（这正是「`run()` 被拖住」的场景）。评审实测：仅删 `unref` 只覆盖一半 | 看门狗**无条件**安装（探针启动即装）、**不得 `unref`**（收尾由 `finish()` 显式 `clearTimeout`）、与完成位联动；落插件侧 check `plugin.run_incomplete`。窗口默认 20s；宿主侧可用 `DSH_PROBE_RUN_WATCHDOG_MS` **只许缩短**（`Math.min` + 下限 1s，且在**任何插件代码运行之前**读取 ⇒ 插件无法影响），供回归不必干等 | 离线 [9.9g] 源码守卫（无条件安装 / **不得 unref** / clearTimeout / 只许缩短）；`test_offline.sh` [16] 出口④ 4 条；真宿主 [8c] |
+
+### 边界（本轮**显式声明**，不再静默）
+
+| 形态 | 归因 | 依据 |
+|---|---|---|
+| 可捕获出口（①同步 ②异步 ③进程 exit ④`run()` 被拖住） | 插件侧 check（`plugin.unexpected_exception` / `plugin.async_uncaught_exception` / `plugin.early_exit` / `plugin.run_incomplete`），`hostFatal[]` **保持为空** | 探针自己闭合，照常输出结构化结果 |
+| **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort` / stdout 被破坏） | **有相位信标** → 插件侧 check `plugin.abnormal_termination`（插件代码运行期间被终止）；**无信标** → `hostFatal[]` → `UPSTREAM_DRIFT`/AMBER（宿主装配段，真上游信号不丢） | 探针来不及写报告 ⇒ 装配器按 `__DSH_PROBE_PHASE__` 信标**按证据**归因（评审 🔴 必修-2 的「二选一」中的方案②），不再无条件甩锅上游 |
+
+> **为什么信标是必须的**：只「声明边界」解决「静默」，但不解决「甩锅」——插件把自己 `kill -9` 也会被判成「上游变了，不是你的问题」。信标把「终止发生在哪一段」变成**证据**。
+
+### 🟡 建议（本轮清零）
+
+| # | 问题 | 处置 |
+|---|---|---|
+| 🟡-1 | **口径自订不变量与实现不符**：`contract.mjs` / `docs/ADAPTER_GUIDE.md` 写「插件侧错误**永不**进 `hostFatal[]`」，但探针**未**覆盖全部退出路径（③④ 未闭合）⇒ 文案在说谎 | 二选一 → **选「覆盖全路径 → 保留」**：四条可捕获出口全部闭合 + 不可捕获边界显式声明并给证据化归因。文案**收窄为准确口径**（「插件侧错误**不得**进该字段；探针**可捕获**的全部逃逸形态都落插件侧 check，唯一例外是不可捕获的进程级终止，按信标归因」），`contract.mjs` 与指南同步 |
+
+### 🟢 优化（顺手）
+
+| # | 问题 | 处置 |
+|---|---|---|
+| 🟢-1 | `CHANGELOG.md` v0.1.7 段有**重复句**（「本轮先照单复跑…」×2） | 已删 |
+| 🟢-2 | `tests/test_offline.sh` [14] 的 `known` **硬编码 17 条**（已被三张事实源表 100% 覆盖，评审实测 17/17 冗余） | 改为**派生**：`[...HOST_SIDE_CHECKS, ...CONTRACT_SIDE_CHECKS, ...PLUGIN_SIDE_CHECKS]`（新增 check 时不会漏改一处而静默失效） |
+| 🟢-3 | 两份异步夹具的 `definitions().render` 返回 `[]` ⇒ 附带 `dispatch.render_projected` / `echo_payload` 噪音 fail（不影响归因，但淹没真因） | 改为正常文本投影，把失败点精确留在「后台任务抛错」上 |
+| 🟢-4 | `.cnb.yml` push / PR 两段闸门脚本**各自维护**（54 行差异，两段口径迟早不一致 = 闸门静默失效） | 抽成 **`tests/gate_plugin_side.sh`**（唯一事实源：夹具清单 + 断言口径 + 防过度修正断言），push / PR 共用；`tests/test_hub.sh` 新增第 4b 步（本地也能跑，不必等 CI） |
+
+### 新增能力（顺带，为本轮防线服务）
+
+- **离线探针回归台** `tests/offline-probe-harness.mjs`：造一个**最小假宿主**（`Context` / `ToolRuntime` 三条面 + 与真宿主同构的保留名拒绝措辞），把 `probe-template.mjs` 当真实探针跑（子进程），再用**装配器的真实实现**（`interpretProbeStdout()`）解释输出。⇒ 四条出口从「只被真宿主 E2E 覆盖（慢、要网、CI 才跑）」变成**秒级离线回归**。
+  **边界显式声明**：假宿主**不做**真实 schema 子集校验与 ToolRuntime 的并发/取消细节 ⇒ **「假宿主通过」不等于「真宿主适配通过」**（那是 `verify` 的事），它只回答「探针有没有把插件侧错误写成宿主侧信号」。
+- `host.mjs` 抽出纯函数 `interpretProbeStdout(result, stdout)`：装配器与离线回归**共用同一份**解析/归因逻辑（判据字段的写入端只有一处可写错）。
+- `contract.mjs` 新增：`PLUGIN_EARLY_EXIT_CHECK` / `PLUGIN_RUN_INCOMPLETE_CHECK` / `PLUGIN_ABNORMAL_TERMINATION_CHECK` / `PROBE_PHASE_BEACON_PREFIX` / `probeProcessFailureRoute()` / `recordProbeEarlyExit()` / `recordProbeRunIncomplete()` / `PLUGIN_SKIP_ON_PRECONDITION`（派生：插件侧 check 表 **减去**条件项，避免普通失败报告里多出 5 条无意义的 skip）。
+
+### 兼容性
+
+- 探针结构化结果**新增字段** `runCompleted`；验收报告通道级**新增字段** `runCompleted`。
+- `contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS` 由 2 项扩到 **5 项**（新增 `plugin.early_exit` / `plugin.run_incomplete` / `plugin.abnormal_termination`）；「17 项 + N 条件项」口径随之更新（文档由 `test_exports.mjs` 断言一致）。
+- 判据新增 **1b**（完成位），位置在宿主侧信号之后、插件侧硬证据之前（理由见 `docs/ARCHITECTURE.md` §4.2 ③）。
+- `probeFailureRoute()` / `probeAsyncFailureRoute()` 语义不变；新增通用入口 `probeProcessFailureRoute(phase, check)`（旧入口委托它，行为等价）。
+- **行为变更（预期）**：插件在验收中调 `process.exit()` / 挂住事件循环，从此判 `PLUGIN_REGRESSION`/RED（此前判 `UPSTREAM_DRIFT`/AMBER 或假绿）。这是**修复**，不是回归。
+
+### 测试项数
+
+- `tests/test_offline.sh`：85 → **103 项**（新增 [16] 四条出口 18 条；[14] 改派生不增减）
+- `tests/test_attribution.mjs`：209 → **277 项**（新增 [9.9] 四条出口 + 完成位 65 条）
+- `tests/test_e2e_regression.mjs`：92 → **124 项**（新增 [8c] 三条出口 × 10 + 假绿反证 2）
+- `tests/test_exports.mjs`：28 → **33 项**（新增 [2b'''] 文档条件项计数 = 事实源长度 5 条）
+- 新增夹具：`tests/fixtures/plugin-exit-plugin.mjs`、`tests/fixtures/plugin-hang-plugin.mjs`、`tests/fixtures/plugin-sigkill-plugin.mjs`
+- 新增脚本：`tests/gate_plugin_side.sh`（闸门唯一事实源）、`tests/offline-probe-harness.mjs`（离线探针回归台）
+- `tests/test_hub.sh`：新增第 4b 步（插件侧闸门，含防过度修正）
+- `.cnb.yml`：push / PR 的 `plugin-error-not-host-signal` 改为**共用** `tests/gate_plugin_side.sh`（夹具 4 → 7 份 + 健康插件防过度修正断言）
+
+### 放行判据（总师 §三⑤，不变）
+
+- 异步路径 + 进程 exit 路径均 `hostFatal=[]`；**且健康插件仍 GREEN 17/17**（防过度修正）。
+
 ## v0.1.8 — 🔴-D 同族活口收口：插件侧**异步**异常进程级兜底 + 🟡 两处守卫加固
 
 > 承接 v0.1.7（写入端分相位）。评审 @ `24362c7` 判 `disposition = fix_bug`：
@@ -90,7 +159,7 @@
 
 ### v0.1.7（同版本第二批）— 复测收口（漂移表唯一事实源 + 文档守卫三处活口）+ 新增 **上游漂移自动归因影响面**
 
-> 承接本版第一批（🔴-D 写入端分相位）。本轮先**照单复跑**用户点名的 §二 14 组变异（含 2b 行下移/整行删除、INDEX 标题与序号），本轮先**照单复跑**你点名的 §二 14 组变异（含 2b 行下移/整行删除、INDEX 标题与序号），
+> 承接本版第一批（🔴-D 写入端分相位）。本轮先**照单复跑**你点名的 §二 14 组变异（含 2b 行下移/整行删除、INDEX 标题与序号），
 > 并核对 `[2b'']` 的「编号可检索」是否符合 P2-新-3 的预期；再往后开发一个新能力。
 > 结论：**14 组拦下 12 / 逃逸 2**（逃逸的都是真活口，已在本版堵上）；`[2b'']` 符合预期（逃逸 0）。
 

@@ -349,12 +349,10 @@ out.push(hardcoded.length === 0 ? 'no-hardcoded' : 'hardcoded:' + hardcoded.join
 out.push(runner.includes("startsWith('dispatch.')") ? 'prefix-wildcard' : 'no-prefix-wildcard');
 const leaked = Object.values(DRIFT_IMPACT).flatMap((v) => v.checks).filter((n) => PLUGIN_HARD_EVIDENCE.includes(n));
 out.push(leaked.length === 0 ? 'hard-evidence-excluded' : 'hard-evidence-leaked:' + leaked.join(','));
-const known = new Set([...HOST_SIDE_CHECKS, ...CONTRACT_SIDE_CHECKS, ...PLUGIN_SIDE_CHECKS,
-  'host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed',
-  'guard.reserved_name', 'compat.schema_flatten', 'guard.reserved_rejected',
-  'plugin.loaded', 'plugin.apply_ok', 'plugin.definitions_ok', 'registry.exact',
-  'dispatch.execute_ok', 'dispatch.render_projected', 'dispatch.echo_payload', 'dispatch.abort_semantics',
-  'lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose']);
+// 🟢 优化-2（评审 §三）：原先这里**硬编码 17 条**，已被三张事实源表 100% 覆盖
+// （评审实测 17/17 冗余）→ 改为**派生**：check 名的唯一事实源是 contract.mjs 的三张表。
+// 手写清单必然与事实源漂移（新增 check 时漏改一处 = 本节静默失去防线）。
+const known = new Set([...HOST_SIDE_CHECKS, ...CONTRACT_SIDE_CHECKS, ...PLUGIN_SIDE_CHECKS]);
 const unknown = Object.values(DRIFT_IMPACT).flatMap((v) => v.checks).filter((n) => !known.has(n));
 out.push(unknown.length === 0 ? 'checks-known' : 'checks-unknown:' + unknown.join(','));
 console.log(out.join('\n'));
@@ -385,6 +383,69 @@ assert "影响面指明中台要改的文件（定向修）" "yes" "$(echo "$OUT
 assert "新增保留名被点名 → 插件必须改名" "yes" "$(echo "$OUT" | grep -q '必须' && echo yes || echo no)"
 assert "建议里声明 advice 不得回灌判据" "yes" "$(echo "$OUT" | grep -q '不得.*判据' && echo yes || echo no)"
 rm -f "$DRIFT_REPORT"
+
+echo "  [16] 🔴 四条出口（离线探针回归台：假宿主 + 真实探针 + 真实归因）"
+# 为什么搬到离线：这四条出口此前只被真宿主 E2E 覆盖（慢、要网、CI 才跑），而它们恰恰是最容易
+# 写错的地方——历史缺陷：exit 出口既未闭合也未声明；看门狗只在记录过异步异常时才装、且被 unref 掉。
+# 本节的「假宿主」只模拟探针用到的那点宿主面（见 tests/offline-probe-harness.mjs 的边界声明）：
+# **「假宿主通过」不等于「真宿主适配通过」**，本节只回答「探针有没有把插件侧错误写成宿主侧信号」。
+EXIT_OUT="$("$NODE_BIN" --input-type=module -e "
+import path from 'node:path';
+import { runOfflineProbe } from '$ROOT/tests/offline-probe-harness.mjs';
+const root = '$ROOT';
+const probe = (fixture, tools, watchdogMs) => {
+  const r = runOfflineProbe({ pluginPath: path.join(root, 'tests/fixtures', fixture), expectedTools: tools, watchdogMs });
+  const checks = r.result.checks;
+  const fails = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+  return {
+    attribution: r.attribution,
+    hostFatal: r.result.hostFatal.length,
+    completed: r.result.runCompleted,
+    ok: r.result.ok === true,
+    pass: checks.filter((c) => c.status === 'pass').length,
+    fails,
+    phase: r.result.phase,
+    exitStatus: r.exit.status,
+  };
+};
+const cases = {
+  healthy: probe('demo-plugin.mjs', ['demo_echo', 'demo_status']),
+  sync: probe('apply-throws-plugin.mjs', ['demo_echo']),
+  asyncThrow: probe('plugin-async-throw-plugin.mjs', ['demo_echo']),
+  exit0: probe('plugin-exit-plugin.mjs', ['demo_echo']),
+  hang: probe('plugin-hang-plugin.mjs', ['demo_echo'], 2000),
+  sigkill: probe('plugin-sigkill-plugin.mjs', ['demo_echo']),
+};
+console.log(JSON.stringify(cases));
+")"
+j() { echo "$EXIT_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);const c=r['$1'];console.log(eval('c$2'))})"; }
+assert "健康插件：17/17 全绿且跑完（完成位=true）" "17|true|true" "$(j healthy '.pass+"|"+c.completed+"|"+c.ok')"
+assert "健康插件：无失败项、hostFatal 为空、probePhase=plugin-integration" "0|0|plugin-integration" "$(j healthy '.fails.length+"|"+c.hostFatal+"|"+c.phase')"
+assert "出口①同步异常：归因 PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(j sync '.attribution')"
+assert "出口①同步异常：hostFatal 为空（插件侧错误不进判据字段）" "0" "$(j sync '.hostFatal')"
+assert "出口②异步异常：落插件侧异步 check" "true" "$(j asyncThrow '.fails.includes("plugin.async_uncaught_exception")')"
+assert "出口②异步异常：hostFatal 为空 + 已跑完（完成位=true，报告不丢）" "0|true" "$(j asyncThrow '.hostFatal+"|"+c.completed')"
+assert "出口③进程 exit：归因 PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(j exit0 '.attribution')"
+assert "出口③进程 exit：hostFatal 为空 + 完成位=false" "0|false" "$(j exit0 '.hostFatal+"|"+c.completed')"
+assert "出口③进程 exit：失败项 plugin.early_exit（已登记插件侧）" "true" "$(j exit0 '.fails.includes("plugin.early_exit")')"
+assert "出口③进程 exit：**不得假绿**（未跑完绝不给 ok / 退出码非 0）" "false|1" "$(j exit0 '.ok+"|"+c.exitStatus')"
+assert "出口③进程 exit：已跑完的 pass 项保留（报告不丢）" "true" "$(j exit0 '.pass >= 6')"
+assert "出口④run() 被拖住：归因 PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(j hang '.attribution')"
+assert "出口④run() 被拖住：hostFatal 为空 + 完成位=false" "0|false" "$(j hang '.hostFatal+"|"+c.completed')"
+assert "出口④run() 被拖住：失败项 plugin.run_incomplete（无条件看门狗生效）" "true" "$(j hang '.fails.includes("plugin.run_incomplete")')"
+assert "出口④run() 被拖住：**不得假绿**（未跑完绝不给 ok）" "false" "$(j hang '.ok')"
+assert "边界（不可捕获 SIGKILL）：归因 PLUGIN_REGRESSION（按相位信标，不甩锅上游）" "PLUGIN_REGRESSION" "$(j sigkill '.attribution')"
+assert "边界（不可捕获 SIGKILL）：hostFatal 为空 + 落 plugin.abnormal_termination" "0|true" "$(j sigkill '.hostFatal+"|"+c.fails.includes("plugin.abnormal_termination")')"
+
+# 反证：假宿主若**不**打相位信标（= 探针在宿主装配段就被终止），装配器必须仍落 hostFatal[]
+# （收窄装配器归因不得丢掉真上游信号——与「插件侧不甩锅」是一对反向护栏）
+NOBEACON_OUT="$("$NODE_BIN" --input-type=module -e "
+import { interpretProbeStdout } from '$ROOT/src/harness/host.mjs';
+const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
+interpretProbeStdout(r, 'Killed（无相位信标：终止发生在宿主装配段）');
+console.log(r.hostFatal.length + '|' + r.checks.length);
+")"
+assert "反向护栏：无相位信标（宿主装配段被终止）→ 仍写 hostFatal[]（真上游信号不丢）" "1|0" "$NOBEACON_OUT"
 
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"

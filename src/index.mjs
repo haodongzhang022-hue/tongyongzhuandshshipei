@@ -29,9 +29,36 @@ export {
   wrapExecute,
   registerTools,
 } from './compat/tool.mjs';
-export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, pruneHostCache, HUB_ROOT } from './harness/host.mjs';
+export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, pruneHostCache, interpretProbeStdout, HUB_ROOT } from './harness/host.mjs';
 export { verifyChannel, verifyAll, summarize, attributeFailure, attributionDetail, resolvePlugin } from './verify/runner.mjs';
-export { collectContract, pushHostFatal, CONTRACT_PROBES, CONTRACT_PROBE_NAMES, HOST_FATAL_PREFIX, HOST_FATAL_FIELD } from './harness/contract.mjs';
+export {
+  collectContract,
+  pushHostFatal,
+  probeFailureRoute,
+  probeProcessFailureRoute,
+  recordProbeException,
+  recordProbeAsyncException,
+  recordProbeEarlyExit,
+  recordProbeRunIncomplete,
+  CONTRACT_PROBES,
+  CONTRACT_PROBE_NAMES,
+  HOST_FATAL_PREFIX,
+  HOST_FATAL_FIELD,
+  HOST_SIDE_CHECKS,
+  CONTRACT_SIDE_CHECKS,
+  PLUGIN_SIDE_CHECKS,
+  PLUGIN_SKIP_ON_PRECONDITION,
+  PLUGIN_HARD_EVIDENCE,
+  CONDITIONAL_PROBE_CHECKS,
+  PROBE_CHECK_ORDER,
+  PROBE_PHASE,
+  PROBE_PHASE_BEACON_PREFIX,
+  PLUGIN_PROBE_EXCEPTION_CHECK,
+  PLUGIN_ASYNC_EXCEPTION_CHECK,
+  PLUGIN_EARLY_EXIT_CHECK,
+  PLUGIN_RUN_INCOMPLETE_CHECK,
+  PLUGIN_ABNORMAL_TERMINATION_CHECK,
+} from './harness/contract.mjs';
 export { watchUpstream, fetchDistTags, contractSnapshot, diffContracts } from './watch/upstream.mjs';
 export { classifyDrift, diffReservedNames, triageUpstream, toTriageMarkdown, DRIFT_IMPACT, DRIFT_FIELDS } from './triage/index.mjs';
 export { buildSecondary, toMarkdown } from './report/secondary.mjs';

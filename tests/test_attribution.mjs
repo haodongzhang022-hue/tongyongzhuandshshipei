@@ -31,22 +31,30 @@ import {
   CONDITIONAL_PROBE_CHECKS,
   CONTRACT_SIDE_CHECKS,
   HOST_SIDE_CHECKS,
+  PLUGIN_ABNORMAL_TERMINATION_CHECK,
   PLUGIN_ASYNC_EXCEPTION_CHECK,
+  PLUGIN_EARLY_EXIT_CHECK,
   PLUGIN_HARD_EVIDENCE,
   PLUGIN_PROBE_EXCEPTION_CHECK,
+  PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_SIDE_CHECKS,
+  PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
+  PROBE_PHASE_BEACON_PREFIX,
   collectContract,
   probeAsyncFailureRoute,
   probeFailureRoute,
+  probeProcessFailureRoute,
   pushHostFatal,
   recordProbeAsyncException,
+  recordProbeEarlyExit,
   recordProbeException,
+  recordProbeRunIncomplete,
 } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
-import { channelFingerprint, loadChannels, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
+import { channelFingerprint, interpretProbeStdout, loadChannels, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
 // 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
 import { codeOnly, stripComments } from './source-scan.mjs';
 import { DRIFT_FIELDS, DRIFT_IMPACT, classifyDrift, diffReservedNames, triageUpstream } from '../src/triage/index.mjs';
@@ -614,9 +622,11 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
   eq('🔴-D：探针挂 uncaughtException 处理器', true, /process\.on\('uncaughtException'/.test(probeSrc));
   eq('🔴-D：探针挂 unhandledRejection 处理器（另一条代码路径，只兜一个 = 活口搬家）', true,
     /process\.on\('unhandledRejection'/.test(probeSrc));
-  eq('🔴-D：两个处理器都走 recordProbeAsyncException（按相位归因，不直接 pushHostFatal）', true,
-    (probeSrc.match(/recordProbeAsyncException\(out, phase/g) ?? []).length >= 1
-    && /onProcessLevelException/.test(probeSrc));
+  // v0.1.9：写入端统一收敛到 recordProcessEscape() 包装（三条出口共用同一条收尾路径），
+  // 故这里断言的是「两个处理器都经统一入口走到 recordProbeAsyncException」，而不是旧的字面调用式。
+  eq('🔴-D：两个处理器都经统一入口走 recordProbeAsyncException（按相位归因，不直接 pushHostFatal）', true,
+    /process\.on\('uncaughtException'[^\n]*recordProcessEscape\(recordProbeAsyncException/.test(probeSrc)
+    && /process\.on\('unhandledRejection'[^\n]*recordProcessEscape\(recordProbeAsyncException/.test(probeSrc));
   // 结构化结果必须用 writeSync 落盘：兜底后立即 process.exit()，异步 stdout 会被截断
   // （截断 = 装配器又看到「探针未输出结构化结果」= 等于没修）
   eq('🔴-D：结构化结果用 writeSync 输出（防 exit 截断 stdout → 报告整份消失）', true,
@@ -727,6 +737,176 @@ console.log('  [9.8] 🔴-D 异步活口（进程级兜底 + 双路径不变量�
       /export function apply\(ctx\)[\s\S]*$/.test(src.slice(0, src.indexOf(marker))) || src.indexOf(marker) > src.indexOf('export function apply'));
     eq(`🔴-D 异步夹具 ${fixture}：自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
     eq(`🔴-D 异步夹具 ${fixture}：健康工具先注册（失败点精确留在后台任务）`, true, /demo_echo/.test(src));
+  }
+}
+
+// ---- 9.9. 🔴 必修-1/2/3：完成位 + 进程 exit 出口 + run() 被拖住（四条出口逐条闭合） ----
+// 为什么必须单列一段：评审 §五 把「可穷举 3 出口」修正为 **4 个**——
+//   ① run() try/catch（已闭合）② 异步异常（v0.1.8 闭合）③ 进程 exit（本轮）④ run() 被拖住（本轮）。
+// ②③④ 同属单一进程边界；本段把四条出口的**归属**（写入端）与**收尾**（完成位）都钉住。
+console.log('  [9.9] 🔴 四条出口 + 完成位（进程 exit / run() 被拖住 / 不可捕获终止）');
+{
+  // 9.9a 归属路由：同一份规则，落点按出口区分（排障动作不同 ⇒ 报告必须能分清）
+  eq('🔴 出口③：进程 exit → 插件侧 check plugin.early_exit', JSON.stringify({ side: 'plugin', check: PLUGIN_EARLY_EXIT_CHECK }),
+    JSON.stringify(probeProcessFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION, PLUGIN_EARLY_EXIT_CHECK)));
+  eq('🔴 出口④：run() 被拖住 → 插件侧 check plugin.run_incomplete', JSON.stringify({ side: 'plugin', check: PLUGIN_RUN_INCOMPLETE_CHECK }),
+    JSON.stringify(probeProcessFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION, PLUGIN_RUN_INCOMPLETE_CHECK)));
+  eq('🔴 边界：不可捕获终止 → 插件侧 check plugin.abnormal_termination（由装配器按信标落）',
+    JSON.stringify({ side: 'plugin', check: PLUGIN_ABNORMAL_TERMINATION_CHECK }),
+    JSON.stringify(probeProcessFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION, PLUGIN_ABNORMAL_TERMINATION_CHECK)));
+  eq('🔴 出口③④ 反向：宿主装配相位仍判宿主侧（收窄不得丢掉真漂移）', 'host',
+    probeProcessFailureRoute(PROBE_PHASE.HOST_ASSEMBLY, PLUGIN_EARLY_EXIT_CHECK).side);
+  eq('🔴 出口③④：未知相位保守判插件侧（与同步/异步路由同取向）', 'plugin',
+    probeProcessFailureRoute('some-unknown-phase', PLUGIN_EARLY_EXIT_CHECK).side);
+  eq('🔴 四条出口的落点 check 名**互不相同**（混用 = 报告撒谎，排障动作不同）', 4,
+    new Set([PLUGIN_PROBE_EXCEPTION_CHECK, PLUGIN_ASYNC_EXCEPTION_CHECK, PLUGIN_EARLY_EXIT_CHECK, PLUGIN_RUN_INCOMPLETE_CHECK]).size);
+  for (const name of [PLUGIN_EARLY_EXIT_CHECK, PLUGIN_RUN_INCOMPLETE_CHECK, PLUGIN_ABNORMAL_TERMINATION_CHECK]) {
+    eq(`🔴 落点 ${name} 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）`, true, PLUGIN_SIDE_CHECKS.includes(name));
+  }
+
+  // 9.9b 写入端不变量：三条新出口的插件侧记录**绝不**写 hostFatal[]
+  for (const [label, record, check] of [
+    ['进程 exit', recordProbeEarlyExit, PLUGIN_EARLY_EXIT_CHECK],
+    ['run() 被拖住', recordProbeRunIncomplete, PLUGIN_RUN_INCOMPLETE_CHECK],
+  ]) {
+    const target = { checks: [], errors: [], hostFatal: [] };
+    const routed = record(target, PROBE_PHASE.PLUGIN_INTEGRATION, 'at file:///tmp/plugin-exit/plugin.mjs:12:3');
+    eq(`🔴 出口（${label}）：落插件侧 check ${check}`, check, target.checks[0]?.name);
+    eq(`🔴 出口（${label}）：hostFatal[] 为空（不变量：插件侧错误永不进判据字段）`, 0, target.hostFatal.length);
+    eq(`🔴 出口（${label}）：归因 PLUGIN_REGRESSION（不甩锅上游）`, 'PLUGIN_REGRESSION',
+      attributeFailure({ ...target, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+    eq(`🔴 出口（${label}）：相位写进结构化结果（排障依据）`, PROBE_PHASE.PLUGIN_INTEGRATION, target.phase);
+    eq(`🔴 出口（${label}）：写入端回执 side=plugin（可审计）`, 'plugin', routed.side);
+  }
+  // 反向：宿主装配相位仍写 hostFatal[]（收窄不得丢掉真漂移）
+  const hostExitOut = { checks: [], errors: [], hostFatal: [] };
+  recordProbeEarlyExit(hostExitOut, PROBE_PHASE.HOST_ASSEMBLY, 'Cannot find package @deepseek-ai/dsh-tools');
+  eq('🔴 出口③ 反向：host-assembly 相位 → hostFatal[] 非空且判 UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
+    attributeFailure({ ...hostExitOut, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+
+  // 9.9c 崩溃路径纪律：记录函数**自身不得抛**（运行在 uncaughtException / exit 钩子 / 看门狗里）
+  for (const [label, record] of [['进程 exit', recordProbeEarlyExit], ['run() 被拖住', recordProbeRunIncomplete]]) {
+    for (const [tlabel, target] of [
+      ['缺 checks/errors 字段', { hostFatal: [] }],
+      ['字段类型全错', { checks: 'x', errors: 1, hostFatal: 'y' }],
+      ['errors 为抛错 getter', Object.defineProperty({ hostFatal: [] }, 'errors', { get() { throw new Error('boom'); }, set() { throw new Error('boom'); } })],
+    ]) {
+      let threw = 'no-throw';
+      try { record(target, PROBE_PHASE.PLUGIN_INTEGRATION, 'x'); } catch { threw = 'threw'; }
+      eq(`🔴 出口（${label}）：崩溃路径上记录函数不抛（${tlabel}）`, 'no-throw', threw);
+    }
+  }
+
+  // 9.9d **完成位**（🔴 必修-1）：未跑完的运行**不得**判 PASS（假绿比 AMBER 更危险）
+  eq('🔴 完成位：runCompleted=false + 无失败项 → PLUGIN_REGRESSION（不放行）', 'PLUGIN_REGRESSION',
+    attributeFailure(probeOf([], [{ name: 'host.tools_ready', status: 'pass', detail: 'x' }], { runCompleted: false }), channel, 'dev'));
+  eq('🔴 完成位：runCompleted=false + 全是 skip → PLUGIN_REGRESSION（不得当通过）', 'PLUGIN_REGRESSION',
+    attributeFailure(probeOf([], [{ name: 'plugin.apply_ok', status: 'skip', detail: '未验证' }], { runCompleted: false }), channel, 'dev'));
+  eq('🔴 完成位：runCompleted=false + 有失败项 → 仍按失败项归因（PLUGIN_REGRESSION）', 'PLUGIN_REGRESSION',
+    attributeFailure(probeOf(['plugin.early_exit: x'], [failCheck(PLUGIN_EARLY_EXIT_CHECK)], { runCompleted: false }), channel, 'dev'));
+  eq('🔴 完成位：**未跑完 + 宿主侧信号** → 仍判 UPSTREAM_DRIFT（判据 1 优先，不得翻成插件回归）', 'UPSTREAM_DRIFT',
+    attributeFailure(probeHostFatal('离线模式下缺少宿主依赖缓存', [{ name: 'host.tools_ready', status: 'skip', detail: 'x' }]), channel, 'dev'));
+  {
+    const incomplete = attributionDetail(probeOf([], [{ name: 'host.tools_ready', status: 'pass', detail: 'x' }], { runCompleted: false }), channel, 'dev');
+    eq('🔴 完成位：理由链点名「未跑完」与「skip 而非 fail」（可审计）', true,
+      incomplete.reasons.some((r) => r.includes('未跑完') && r.includes('skip')));
+  }
+  // 反向护栏：老报告 / 非探针来源（无 runCompleted 字段）**不得**据此翻案（避免把缺字段当新活口）
+  eq('🔴 完成位反向：runCompleted 缺字段（undefined）时不据此翻案（仍按失败项归因）', 'PLUGIN_REGRESSION',
+    attributeFailure(probeOf(['registry.exact: x'], [failCheck('registry.exact')]), channel, 'dev'));
+  eq('🔴 完成位反向：runCompleted=true + 无失败 → 归因退化为 UNKNOWN（正常失败路径不变）', 'UNKNOWN',
+    attributeFailure(probeOf([], [{ name: 'host.tools_ready', status: 'pass', detail: 'x' }], { runCompleted: true }), channel, 'dev'));
+
+  // 9.9e 装配器侧：`ok` 必须同时要求完成位与无失败（否则 exit 路径会假绿）
+  const okOf = (payload) => {
+    const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly', runCompleted: false };
+    interpretProbeStdout(r, `__DSH_PROBE__${JSON.stringify(payload)}\n`);
+    return `${r.ok}|${r.runCompleted}`;
+  };
+  eq('🔴 装配器：runCompleted=false + errors=[] → ok=false（假绿在装配器这层就拦掉）', 'false|false',
+    okOf({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: false }));
+  eq('🔴 装配器：runCompleted=true + errors=[] → ok=true（正常通过不受影响）', 'true|true',
+    okOf({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true }));
+  eq('🔴 装配器：探针未给完成位（老报告）→ ok=false（保守，不假装跑完）', 'false|false',
+    okOf({ checks: [], errors: [], hostFatal: [], ok: true }));
+
+  // 9.9f 相位信标：闭合**不可捕获**终止的归因（有信标 → 插件侧；无信标 → hostFatal[]）
+  const beaconText = `${PROBE_PHASE_BEACON_PREFIX}${PROBE_PHASE.PLUGIN_INTEGRATION}\nKilled\n`;
+  eq('🔴 信标：前缀与结构化结果标记不混淆（startsWith("__DSH_PROBE__") 不命中信标行）', false,
+    beaconText.split('\n')[0].startsWith('__DSH_PROBE__'));
+  {
+    const r = { checks: [], errors: [], hostFatal: [], phase: PROBE_PHASE.HOST_ASSEMBLY };
+    interpretProbeStdout(r, beaconText);
+    eq('🔴 信标：有信标（插件集成相位被终止）→ 落插件侧 check，hostFatal 为空', `${PLUGIN_ABNORMAL_TERMINATION_CHECK}|0`,
+      `${r.checks[0]?.name}|${r.hostFatal.length}`);
+    eq('🔴 信标：有信标 → 归因 PLUGIN_REGRESSION（不甩锅上游）', 'PLUGIN_REGRESSION',
+      attributeFailure(r, channel, 'dev'));
+    eq('🔴 信标：探针未输出结构化结果 ⇒ 完成位=false（未跑完，不得判通过）', false, r.runCompleted);
+  }
+  {
+    const r = { checks: [], errors: [], hostFatal: [], phase: PROBE_PHASE.HOST_ASSEMBLY };
+    interpretProbeStdout(r, 'Killed（宿主装配段，无信标）\n');
+    eq('🔴 信标反向：无信标 → 仍写 hostFatal[]（真上游信号不丢）', `0|${1}`,
+      `${r.checks.length}|${r.hostFatal.length}`);
+    eq('🔴 信标反向：无信标 → 判 UPSTREAM_DRIFT', 'UPSTREAM_DRIFT', attributeFailure(r, channel, 'dev'));
+  }
+
+  // 9.9g 源码守卫（防后人把四条出口改回去 / 重新 unref 掉看门狗）
+  const exitProbeSrc = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+  eq('🔴 出口③ 源码守卫：探针挂 process.on("exit") 钩子（可捕获出口闭合）', true, /process\.on\('exit'/.test(exitProbeSrc));
+  eq('🔴 出口③ 源码守卫：exit 钩子里用 writeSync 出报告（防 exit 截断 stdout）', true,
+    /process\.on\('exit'[\s\S]{0,1200}emit\(\)/.test(exitProbeSrc));
+  eq('🔴 出口③ 源码守卫：exit 钩子改 process.exitCode（插件 exit(0) 不得读成通过）', true,
+    /process\.on\('exit'[\s\S]{0,1600}process\.exitCode = 1/.test(exitProbeSrc));
+  // 按**代码视图**判（codeOnly 去掉注释与字符串文本）：本文件的注释里大量出现
+  // `watchdog.unref?.()` / `onProcessLevelException()` 这类「历史缺陷长什么样」的说明，
+  // 直接扫源码会把**文档**当成**实现**（误报）。守卫本身不能有盲区，也不能有误报。
+  const exitProbeCode = codeOnly(exitProbeSrc);
+  eq('🔴 出口④ 源码守卫：看门狗**无条件**安装（不在异常处理器内）', true,
+    /^runWatchdog = setTimeout\(/m.test(exitProbeCode) && !/onProcessLevelException/.test(exitProbeCode));
+  // 关键：`unref` 是出口④ 的**根因**（事件循环无其它 handle 时看门狗永不触发）——不得回来
+  eq('🔴 出口④ 源码守卫：看门狗**不得** unref（回退即红：那正是「run() 被拖住仍逃逸」的根因）', 'no-unref',
+    /\.unref/.test(exitProbeCode) ? 'unref-present' : 'no-unref');
+  eq('🔴 出口④ 源码守卫：收尾路径显式 clearTimeout（不靠 unref 让进程自己走）', true,
+    /function finish\(code\)[\s\S]{0,400}clearTimeout\(runWatchdog\)/.test(exitProbeSrc));
+  eq('🔴 出口④ 源码守卫：看门狗窗口只许**缩短**（Math.min + 下限，插件无法延长）', true,
+    /Math\.min\(\s*RUN_WATCHDOG_DEFAULT_MS/.test(exitProbeSrc) && /Math\.max\(1_000/.test(exitProbeSrc));
+  eq('🔴 完成位源码守卫：runCompleted 只在 run() 正常返回后置真', true,
+    /await run\(\);\s*\n\s*\/\/[^\n]*\n\s*runCompleted = true;/.test(exitProbeSrc) || /await run\(\);\s*\n\s*(?:\/\/[^\n]*\n\s*)*runCompleted = true;/.test(exitProbeSrc));
+  eq('🔴 完成位源码守卫：emit() 的 ok 来自 runCompleted && 无失败（不带完成位 = 用一个 HIGH 换一个 MEDIUM）', true,
+    /out\.ok = runCompleted && out\.errors\.length === 0;/.test(exitProbeSrc));
+  eq('🔴 完成位源码守卫：完成位随结构化结果输出（装配器可判）', true, /out\.runCompleted = runCompleted;/.test(exitProbeSrc));
+  // 判据侧源码守卫：1b 完成位判据不得被删（删了 = exit 路径重新假绿，而夹具仍会「有 fail」故 e2e 未必红）
+  const runnerSrcForGuard = readText(path.join(ROOT, 'src/verify/runner.mjs'), 'utf8');
+  const runnerCodeForGuard = codeOnly(runnerSrcForGuard);
+  eq('🔴 完成位源码守卫：runner 判据含「未跑完 → 不判通过」（1b）', true,
+    /runCompleted === false/.test(runnerCodeForGuard) && /failedChecks\.length === 0/.test(runnerCodeForGuard));
+  eq('🔴 完成位源码守卫：runner 通道报告透出 runCompleted（排障/闸门可断言）', true,
+    /runCompleted: probe\.runCompleted === true/.test(runnerCodeForGuard));
+  // 位置纪律：1b 必须在 2b（插件侧硬证据）**之前**、在宿主侧判据（reasons.length > 0）**之后**——
+  // 顺序错了语义就反了（前者会把上游信号翻成插件回归，后者会让硬证据被完成位抢走）。
+  // 注意：codeOnly 会把字符串字面量替换成 ` S `，故锚点不能含引号内容（否则永远匹配不到 = 守卫空转）
+  const iHostSide = runnerCodeForGuard.indexOf('if (reasons.length > 0) return { attribution:');
+  const iIncomplete = runnerCodeForGuard.indexOf('runCompleted === false');
+  const iHardEvidence = runnerCodeForGuard.indexOf('PLUGIN_HARD_EVIDENCE.filter');
+  eq('🔴 完成位源码守卫：判据顺序 = 宿主侧 → 完成位(1b) → 硬证据(2b)', true,
+    iHostSide !== -1 && iIncomplete !== -1 && iHardEvidence !== -1 && iHostSide < iIncomplete && iIncomplete < iHardEvidence);
+
+  eq('🔴 相位信标源码守卫：探针进插件集成相位时打信标', true,
+    /phase = PROBE_PHASE\.PLUGIN_INTEGRATION;\s*\n\s*out\.phase = phase;\s*\n\s*\/\/[^\n]*\n\s*beacon\(phase\);/.test(exitProbeSrc)
+    || /beacon\(phase\);/.test(exitProbeSrc));
+
+  // 9.9h 夹具自检：三份新夹具必须真的复现对应形态（否则离线/E2E 断言空转）
+  for (const [fixture, label, pattern] of [
+    ['plugin-exit-plugin.mjs', '进程 exit（process.exit）', /process\.exit\(0\)/],
+    ['plugin-hang-plugin.mjs', 'run() 被拖住（永不 resolve 的 Promise）', /return new Promise\(\(\) => \{[^}]*never resolves[^}]*\}\)/],
+    ['plugin-sigkill-plugin.mjs', '不可捕获终止（SIGKILL）', /process\.kill\(process\.pid, 'SIGKILL'\)/],
+  ]) {
+    const src = readText(path.join(ROOT, 'tests/fixtures', fixture), 'utf8');
+    eq(`🔴 夹具 ${fixture}：真的复现「${label}」`, true, pattern.test(src));
+    eq(`🔴 夹具 ${fixture}：自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
+    eq(`🔴 夹具 ${fixture}：健康工具先注册（失败点精确留在逃逸动作上）`, true, /demo_echo/.test(src));
+    eq(`🔴 夹具 ${fixture}：声明期望的工具清单（供闸门/回归取用）`, true, /export const expectedTools = \['demo_echo'\]/.test(src));
   }
 }
 

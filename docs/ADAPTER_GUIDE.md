@@ -201,25 +201,46 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
-**另有 2 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
+**另有 5 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
 
-| 条件检查 | 触发场景 | 归因 |
-|---|---|---|
-| `plugin.unexpected_exception` | **同步**异常：探针读插件侧数据（`tools.schemas()` / `definitions.map()`）时**插件代码**抛错，逃到顶层 `catch` | `PLUGIN_REGRESSION` |
-| `plugin.async_uncaught_exception` | **异步**异常：插件在 `apply()` 里排的后台任务（微任务 / 定时器 / 事件回调 / 预取 promise）抛错，**不在**探针 `run()` 的调用栈上 | `PLUGIN_REGRESSION` |
+| 条件检查 | 出口 | 触发场景 | 归因 |
+|---|---|---|---|
+| `plugin.unexpected_exception` | ① 同步 | 探针读插件侧数据（`tools.schemas()` / `definitions.map()`）时**插件代码**抛错，逃到顶层 `catch` | `PLUGIN_REGRESSION` |
+| `plugin.async_uncaught_exception` | ② 异步 | 插件在 `apply()` 里排的后台任务（微任务 / 定时器 / 事件回调 / 预取 promise）抛错，**不在**探针 `run()` 的调用栈上 | `PLUGIN_REGRESSION` |
+| `plugin.early_exit` | ③ 进程 exit | 插件在验收完成前调 `process.exit()` / 自杀式信号（`SIGTERM` 等）——`process.exit()` **不抛异常**，前两条出口都接不到 | `PLUGIN_REGRESSION` |
+| `plugin.run_incomplete` | ④ `run()` 被拖住 | 插件挂住事件循环，或 `apply()` 返回一个**永不 resolve** 的 Promise（无异常、无退出） | `PLUGIN_REGRESSION` |
+| `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort`）——探针来不及写报告，装配器按**相位信标**归因 | `PLUGIN_REGRESSION` |
 
-两者都是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
-异步那条为何必须单独兜：不在调用栈上 ⇒ 顶层 `catch` 永远接不到 ⇒ 旧探针会在写出结构化结果前被杀，
-装配器只看到「探针未输出结构化结果」→ 判 `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**。
-现在探针挂了 `uncaughtException` / `unhandledRejection` 两个进程级兜底：按同一份相位路由归因，
-**照常输出结构化结果**（已跑完的检查全部保留），`probePhase` 仍为 `plugin-integration`。
-边界（不越权承诺）：探针是**有限时长验收**，只在收尾前给已排队的微任务/宏任务一个 50ms 排空窗口；
-更晚的延迟抛错发生在探针退出之后，不属本防线范围。
+**为什么四条出口都要兜**（本中台被返工最多的一条线）：插件侧错误逃出探针 `run()` 的调用栈有
+**四条**出口，每条都会让旧探针在写出结构化结果前消失 → 装配器只看到「探针未输出结构化结果」
+→ 判 `UPSTREAM_DRIFT`/AMBER（「上游变了，不是你的问题」），且 `checks` 从 17 掉到 **0**（整份报告消失）：
+- ② 不在调用栈上 ⇒ 顶层 `catch` 永远接不到 ⇒ 挂 `uncaughtException` / `unhandledRejection`；
+- ③ `process.exit()` 不抛异常 ⇒ 上面两条都接不到 ⇒ 挂 `process.on('exit')` + 信号处理器；
+- ④ 既无异常也无退出 ⇒ 需要一个**无条件**看门狗（旧实现只在记录过异步异常时才装、且被 `unref()` 掉 ⇒
+  「单纯挂住」时**根本没装**，进程干等到外层超时）。
+
+四条出口都由探针自己闭合，**照常输出结构化结果**（已跑完的检查全部保留、未跑到的按序标 `skip`），
+`probePhase` 仍为 `plugin-integration`；且**完成位** `runCompleted` 只在 `run()` 正常返回后为真——
+`ok` 必须同时要求「跑完」与「无失败」，否则出口 ③ 的中途报告会**假绿**
+（`apply()` 里 `process.exit(0)` → 剩余检查是 `skip` 不是 `fail` → 看起来「全绿」，比 AMBER 更危险）。
+
+**边界（显式声明，不静默）**：
+1. **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort` / stdout 被破坏）：探针来不及写报告。
+   装配器按**相位信标** `__DSH_PROBE_PHASE__` 归因——有信标（插件代码运行期间）→ 插件侧 check
+   `plugin.abnormal_termination`；无信标（宿主装配段）→ `hostFatal[]`（真上游信号不丢）。
+2. 探针是**有限时长验收**，不是运行时守护：只在收尾前给已排队的微任务/宏任务一个 **50ms** 排空窗口
+   （`ASYNC_DRAIN_MS`）；更晚的延迟抛错发生在探针退出之后，不属本防线范围。
+3. 出口 ④ 的看门狗窗口默认 20s；宿主侧可用 `DSH_PROBE_RUN_WATCHDOG_MS` **只许缩短**
+   （`Math.min` + 下限 1s，且在插件代码运行之前读取 ⇒ 插件无法影响它）。
+
+以上各条都是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
 
 **归因优先级**（`attributionReasons` 判据链按此顺序取第一条命中）：
 
 ```
 1. 宿主/环境侧    结构化字段 hostFatal[] 非空（或失败项属宿主侧 check）
+1b. 完成位缺失    探针跑过但**没跑完**（插件提前 exit / 挂住 / 不可捕获终止）且无失败项
+                  —— 未跑到的检查是 skip 而非 fail，**不得**据此判通过（假绿比 AMBER 更危险）
 2. 版本线 unknown 探针无法判定版本线
 3. 插件侧硬证据   插件声明了 DSH 保留名（guard.reserved_rejected）——**优先于契约漂移相关性**
 4. 契约漂移相关   漂移字段与失败 check **一一对应**（表 = src/triage/index.mjs 的 DRIFT_IMPACT；
@@ -229,6 +250,10 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 7. UNKNOWN        有失败但无可识别 check（被外力打断）→ 不猜、不甩锅
 ```
 
+> **不变量（收窄后的准确口径）**：插件侧错误**不得**进 `hostFatal[]`——探针**可捕获**的全部
+> 逃逸形态（同步 / 异步 / 进程 exit / `run()` 被拖住）都落插件侧 check；唯一例外是**不可捕获**的
+> 进程级终止（`SIGKILL` / OOM），那时探针来不及写报告，装配器按相位信标归因（见上「边界」）。
+>
 > **`hostFatal[]` 什么时候会被写？**（写入端分相位，🔴-D）
 > 探针分两段跑：`host-assembly`（宿主包 import / Context 装配 / 契约采集）与
 > `plugin-integration`（插件 import / apply / definitions / dispatch / 生命周期）。

@@ -65,6 +65,20 @@ export const CONTRACT_PROBES = [
  */
 
 /**
+ * 探针**相位信标**的 stdout 前缀（`__DSH_PROBE_PHASE__<phase>`，独占一行）。
+ *
+ * 为什么需要：探针被**不可捕获**终止（`SIGKILL` / OOM / 原生 `abort`）时来不及写结构化结果，
+ * 装配器只看到「探针未输出结构化结果」。信标把「终止发生在哪一段」变成**证据**：
+ * 有信标 ⇒ 插件代码正在运行（落插件侧 check，与「未知相位保守判插件侧」同一取向）；
+ * 无信标 ⇒ 宿主装配段（`hostFatal[]`）。
+ *
+ * ⚠️ 命名纪律：前缀第 13 个字符是 `P`，而结构化结果标记 `__DSH_PROBE__` 要求第 13 个字符是 `_`
+ * ⇒ `line.startsWith('__DSH_PROBE__')` **不会**误命中信标行（装配器解析报告因此不受影响）。
+ * 该性质由 `tests/test_attribution.mjs` [9.9] 断言（改前缀即红）。
+ */
+export const PROBE_PHASE_BEACON_PREFIX = '__DSH_PROBE_PHASE__';
+
+/**
  * 宿主/环境侧致命信号的**日志前缀**（探针与装配器拼人类可读 `errors[]` 时使用）。
  *
  * ⚠️ 纪律（评审 🔴-C）：此前缀**只许用于人读日志，绝不可作为归因判据的文本扫描目标**。
@@ -77,7 +91,14 @@ export const HOST_FATAL_PREFIX = 'fatal(host)';
  * 宿主/环境侧致命信号的**结构化字段名**（探针 → 装配器 → 执行器 三段同名传递）。
  *
  * 归因判据 1 只读这个字段：`(probe.hostFatal ?? []).length > 0` → `UPSTREAM_DRIFT`。
- * 插件侧错误**永远**不进该字段（插件侧一律落 check）。
+ *
+ * 不变量（**收窄后的准确口径**，🔴 必修-2 口径裁决）：插件侧错误**不得**进该字段——
+ * 探针**可捕获**的全部插件侧逃逸形态（同步异常 / 异步异常 / 进程 `exit` / `run()` 被拖住）
+ * 都落插件侧 check。唯一的例外是**不可捕获**的进程级终止（`SIGKILL` / OOM / 原生 `abort` /
+ * 探针 stdout 被破坏）：那时探针来不及写出结构化结果，装配器按**相位信标**归因——
+ * 有信标（插件代码运行期间）→ 插件侧 check `plugin.abnormal_termination`；无信标（宿主装配段）
+ * → 落 `hostFatal[]` → `UPSTREAM_DRIFT`/AMBER（**不放行**，人须确认）。
+ * 该边界**显式声明**在 `docs/RISKS.md` R21 与 `docs/ADAPTER_GUIDE.md`，不是漏修。
  */
 export const HOST_FATAL_FIELD = 'hostFatal';
 
@@ -143,6 +164,46 @@ export function probeFailureRoute(phase) {
 export const PLUGIN_ASYNC_EXCEPTION_CHECK = 'plugin.async_uncaught_exception';
 
 /**
+ * 探针「**进程 exit 出口**」的插件侧落点 check 名（已登记进 {@link PLUGIN_SIDE_CHECKS}）。
+ *
+ * 与 {@link PLUGIN_ASYNC_EXCEPTION_CHECK} 的分工：那个收的是「进程还活着、只是异常没被接住」；
+ * 本名收的是「进程在验收完成前**终止**」——插件调 `process.exit(code)`（或自杀式信号），
+ * 探针的 `run()` 再也回不来。历史缺陷（评审 🔴 必修-2）：该出口**既未闭合也未声明**，
+ * 装配器只看到「探针未输出结构化结果」→ 无条件 `pushHostFatal()` → 插件 bug 判
+ * `UPSTREAM_DRIFT`/AMBER，且 `checks` 归零（整份报告消失）。
+ *
+ * 为什么给独立名字而不是复用异步那条：两条路径的**排障动作不同**（一个查后台任务抛错、
+ * 一个查插件是否调了 `process.exit` / 自杀信号），报告里必须能一眼分清。
+ */
+export const PLUGIN_EARLY_EXIT_CHECK = 'plugin.early_exit';
+
+/**
+ * 探针「**`run()` 被拖住**」的插件侧落点 check 名（已登记进 {@link PLUGIN_SIDE_CHECKS}）。
+ *
+ * 第三种逃逸形态：没有异常、也没有 `process.exit`，只是 `run()` **永不返回**
+ * （插件挂住事件循环，或 `apply()` 返回一个永不 resolve 的 Promise）。旧探针只给
+ * 「已记录异步异常」的情形装看门狗（且 `unref()` 掉）→ 本形态下看门狗**根本没装**，
+ * 进程干等到外层超时（600s）→ 装配器看到「探针未输出结构化结果」→ 同一个误判。
+ *
+ * 出口：**无条件**安装的看门狗（探针的 `RUN_WATCHDOG_MS`）到点强制收尾，落本 check。
+ */
+export const PLUGIN_RUN_INCOMPLETE_CHECK = 'plugin.run_incomplete';
+
+/**
+ * 探针被**不可捕获终止**（`SIGKILL` / OOM / 原生 `abort`）时的插件侧落点 check 名。
+ *
+ * 与前四条出口不同：这条**不由探针自己**记录（它来不及），而由装配器 `host.mjs` 在
+ * 「探针未输出结构化结果」时**按相位信标**（{@link PROBE_PHASE_BEACON_PREFIX}）归因：
+ * 有信标 ⇒ 终止发生在插件代码运行期间 → 落本 check（插件侧，`hostFatal[]` 保持为空）；
+ * 无信标 ⇒ 终止在宿主装配段 → `hostFatal[]`（真上游信号，不丢）。
+ *
+ * 为什么不能只「声明边界」了事：装配器原先是**无条件** `pushHostFatal()`——插件把自己
+ * `kill -9` 也会被判成「上游变了，不是你的问题」。声明边界解决「静默」，但不解决「甩锅」；
+ * 信标让归因有证据（评审 🔴 必修-2 给的「二选一」中的方案②）。
+ */
+export const PLUGIN_ABNORMAL_TERMINATION_CHECK = 'plugin.abnormal_termination';
+
+/**
  * 进程级异常归属路由（**唯一事实源**，探针的进程级兜底与离线回归共用）。
  *
  * 语义与 {@link probeFailureRoute} **完全一致**（按相位、未知相位保守判插件侧），
@@ -156,9 +217,26 @@ export const PLUGIN_ASYNC_EXCEPTION_CHECK = 'plugin.async_uncaught_exception';
  * @returns {{side: 'host'|'plugin', check?: string}} 归属：宿主侧 → hostFatal[]；插件侧 → check
  */
 export function probeAsyncFailureRoute(phase) {
-  return probeFailureRoute(phase).side === 'host'
-    ? { side: 'host' }
-    : { side: 'plugin', check: PLUGIN_ASYNC_EXCEPTION_CHECK };
+  return probeProcessFailureRoute(phase, PLUGIN_ASYNC_EXCEPTION_CHECK);
+}
+
+/**
+ * 「进程级 / 收尾级」逃逸形态的**通用**归属路由（唯一事实源，探针各出口与离线回归共用）。
+ *
+ * 语义与 {@link probeFailureRoute} 完全一致（按相位、未知相位保守判插件侧），
+ * 唯一差别是**插件侧落点 check 名由调用方给出**——三条出口
+ * （异步异常 `plugin.async_uncaught_exception` / 进程 exit `plugin.early_exit` /
+ * `run()` 被拖住 `plugin.run_incomplete`）排障动作不同，报告里必须能一眼分清。
+ *
+ * 为什么收敛成一处：新增出口时最容易犯的错是「自己判相位、自己挑落点」——
+ * 那样迟早有人把宿主装配相位的信号写成插件侧（或反之）。落点名字可换，**归属规则只有这一份**。
+ *
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @param {string} check 插件侧落点 check 名（须已登记进 {@link PLUGIN_SIDE_CHECKS}）
+ * @returns {{side: 'host'} | {side: 'plugin', check: string}} 归属
+ */
+export function probeProcessFailureRoute(phase, check) {
+  return probeFailureRoute(phase).side === 'host' ? { side: 'host' } : { side: 'plugin', check };
 }
 
 /**
@@ -178,24 +256,75 @@ export function probeAsyncFailureRoute(phase) {
  * @returns {{side: 'host'|'plugin', line: string}} 归属与写入的日志行（供排障）
  */
 export function recordProbeAsyncException(target, phase, detail) {
+  return recordProcessLevelFailure(target, phase, detail, PLUGIN_ASYNC_EXCEPTION_CHECK, '插件后台任务未捕获异常（插件侧异步错误）');
+}
+
+/**
+ * 记录「进程在验收完成前退出」（插件调 `process.exit()` / 自杀式信号）——**按相位**决定落点。
+ *
+ * 纪律与 {@link recordProbeAsyncException} 完全相同：不抛、全字段归一、插件侧绝不写 `hostFatal[]`。
+ * 探针在 `process.on('exit')` 与信号处理器里调用它（那是崩溃路径，任何抛出都等于报告整份消失）。
+ *
+ * @param {{checks?: object[], errors?: string[], hostFatal?: string[]}} target 探针 `out`
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @param {string} detail 退出实况摘要（exit code / 信号名）
+ * @returns {{side: 'host'|'plugin', line: string}} 归属与写入的日志行
+ */
+export function recordProbeEarlyExit(target, phase, detail) {
+  return recordProcessLevelFailure(target, phase, detail, PLUGIN_EARLY_EXIT_CHECK, '进程在验收完成前退出（插件侧提前终止）');
+}
+
+/**
+ * 记录「探针 `run()` 未在窗口内返回」（插件挂住事件循环 / `apply()` 返回永不 resolve 的 Promise）。
+ *
+ * 由探针的**无条件看门狗**调用（见 `RUN_WATCHDOG_MS`）；纪律同上（不抛、归一、绝不写 `hostFatal[]`）。
+ *
+ * @param {{checks?: object[], errors?: string[], hostFatal?: string[]}} target 探针 `out`
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @param {string} detail 超时实况摘要
+ * @returns {{side: 'host'|'plugin', line: string}} 归属与写入的日志行
+ */
+export function recordProbeRunIncomplete(target, phase, detail) {
+  return recordProcessLevelFailure(target, phase, detail, PLUGIN_RUN_INCOMPLETE_CHECK, '探针 run() 未在窗口内返回（插件侧挂住事件循环）');
+}
+
+/**
+ * 「进程级 / 收尾级」异常写入端的**唯一实现**（三条出口共用）。
+ *
+ * 为什么收敛：`hostFatal[]` 是判据唯一事实字段，它的写入端必须只有一处可写错——
+ * 三条出口各自实现一份，迟早有一条把插件侧信号写进 `hostFatal[]`（那正是 🔴-D 的失效机制）。
+ *
+ * 额外保证（崩溃路径纪律）：本函数**不抛异常**——它运行在 `uncaughtException` /
+ * `process.on('exit')` / 看门狗回调里，任何抛出都会让探针在写出 `__DSH_PROBE__` 之前再次崩掉，
+ * 于是整份报告消失、`checks` 从 17 掉到 0（比「盖掉一条 check」更彻底）。
+ * 故内部对 `target` 做全部归一，并吞掉自身异常（记一条日志行）。
+ *
+ * @param {{checks?: object[], errors?: string[], hostFatal?: string[]}} target 探针 `out`
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @param {string} detail 异常 / 退出摘要（含 stack 或 exit code）
+ * @param {string} check 插件侧落点 check 名（须已登记进 {@link PLUGIN_SIDE_CHECKS}）
+ * @param {string} label 人读标签（进日志行，说明这条出口的性质）
+ * @returns {{side: 'host'|'plugin', line: string}} 归属与写入的日志行（供排障）
+ */
+function recordProcessLevelFailure(target, phase, detail, check, label) {
   try {
-    const route = probeAsyncFailureRoute(phase);
+    const route = probeProcessFailureRoute(phase, check);
     target.phase = phase;
     const text = String(detail).slice(0, 600);
     if (!Array.isArray(target.checks)) target.checks = [];
     if (!Array.isArray(target.errors)) target.errors = [];
     if (route.side === 'host') {
-      return { side: 'host', line: pushHostFatal(target, `探针进程级异步异常：${text}`) };
+      return { side: 'host', line: pushHostFatal(target, `探针进程级异常：${text}`) };
     }
     target.checks.push({ name: route.check, status: 'fail', detail: text });
-    const line = `${route.check}: 插件后台任务未捕获异常（${phase} 相位，插件侧异步错误）：${text}`;
+    const line = `${route.check}: ${label}（${phase} 相位，插件侧错误）：${text}`;
     target.errors.push(line);
     return { side: 'plugin', line };
   } catch (error) {
     // 兜底里的兜底：记录失败**不得**升级成第二次崩溃（否则报告整份消失）。
     try {
       if (!Array.isArray(target.errors)) target.errors = [];
-      target.errors.push(`recordProbeAsyncException 自身失败（已吞掉，不影响报告输出）：${String(error?.message ?? error)}`);
+      target.errors.push(`recordProcessLevelFailure 自身失败（已吞掉，不影响报告输出）：${String(error?.message ?? error)}`);
     } catch { /* 连 errors 都写不进去时，静默——绝不能在这里抛 */ }
     return { side: 'plugin', line: '' };
   }
@@ -294,16 +423,49 @@ export const PLUGIN_SIDE_CHECKS = [
   // 🔴-D 同族活口：插件后台任务（apply 里排的微任务/定时器/promise）的未捕获异常——
   // 不在 run() 调用栈上，顶层 catch 接不到，由探针的进程级兜底按相位归到这里。
   'plugin.async_uncaught_exception',
+  // 🔴 必修-2：进程 exit 出口——插件在验收完成前调 process.exit() / 自杀式信号。
+  'plugin.early_exit',
+  // 🔴 必修-3：run() 被拖住（插件挂住事件循环 / apply() 返回永不 resolve 的 Promise）——
+  // 由探针的**无条件**看门狗兜住（旧实现只在记录过异步异常时才装，且 unref 掉了）。
+  'plugin.run_incomplete',
+  // 🔴 必修-2 边界：不可捕获终止（SIGKILL / OOM）由装配器按相位信标归因（有信标 → 本 check）。
+  'plugin.abnormal_termination',
 ];
 
 /**
  * 探针的**条件触发检查项**：仅在异常路径出现，**不计入 17 项**（文档口径见
- * `docs/ADAPTER_GUIDE.md`「另有 1 项条件检查」/ `docs/INDEX.md`）。
+ * `docs/ADAPTER_GUIDE.md` / `docs/INDEX.md` 的「另有 N 项条件检查」，N 由本表长度决定，
+ * 并由 `tests/test_exports.mjs` 断言「文档声明的 N == 本表长度」）。
  *
  * 为什么单独成表：`PROBE_CHECK_ORDER` 与「条件项」必须能互相推出，
  * 否则「17 项」的口径会随新增条件项悄悄变成 18 项而无人发现。
+ *
+ * 五条出口各占一项：同步异常（`plugin.unexpected_exception`）/ 异步异常
+ * （`plugin.async_uncaught_exception`）/ 进程 exit（`plugin.early_exit`）/
+ * `run()` 被拖住（`plugin.run_incomplete`）/ 不可捕获终止
+ * （`plugin.abnormal_termination`，由装配器按相位信标归因）。
  */
-export const CONDITIONAL_PROBE_CHECKS = [PLUGIN_PROBE_EXCEPTION_CHECK, PLUGIN_ASYNC_EXCEPTION_CHECK];
+export const CONDITIONAL_PROBE_CHECKS = [
+  PLUGIN_PROBE_EXCEPTION_CHECK,
+  PLUGIN_ASYNC_EXCEPTION_CHECK,
+  PLUGIN_EARLY_EXIT_CHECK,
+  PLUGIN_RUN_INCOMPLETE_CHECK,
+  PLUGIN_ABNORMAL_TERMINATION_CHECK,
+];
+
+/**
+ * 「前置失败时该标 `skip` 的插件侧检查项」= {@link PLUGIN_SIDE_CHECKS} **减去**条件项。
+ *
+ * 为什么必须减去：条件项（同步/异步异常、进程 exit、`run()` 被拖住、不可捕获终止）按口径
+ * **仅在异常路径出现**（见 {@link CONDITIONAL_PROBE_CHECKS} 的文档说明）。若把它们也塞进
+ * 「前置失败 → skipAll」的清单，那么每个普通的插件失败报告里都会多出 5 条
+ * `skip`（`plugin.early_exit` / `plugin.run_incomplete` / …）——报告噪声，且与
+ * 「17 项 + N 条件项」的口径不符（人会以为探针真的验过这些出口）。
+ *
+ * 派生而非手写：新增条件项时只需改 {@link CONDITIONAL_PROBE_CHECKS}，本表自动跟随
+ * （手写两处必然漂移，本仓已因此返工过多次）。
+ */
+export const PLUGIN_SKIP_ON_PRECONDITION = PLUGIN_SIDE_CHECKS.filter((name) => !CONDITIONAL_PROBE_CHECKS.includes(name));
 
 /**
  * 探针 17 项检查的**规范输出顺序**（= `docs/INDEX.md` 的 `#` 序号列口径）。

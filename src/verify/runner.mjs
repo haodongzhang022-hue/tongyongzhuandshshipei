@@ -71,6 +71,9 @@ export function verifyChannel(options) {
     checks: probe.checks,
     errors: probe.errors,
     hostFatal: Array.isArray(probe.hostFatal) ? probe.hostFatal : [],
+    // 完成位：探针是否**跑完**（🔴 必修-1）。未跑完的运行**绝不**能判 PASS——
+    // 中途被打断时「没跑到的检查」是 skip 不是 fail，只看失败项会假绿。
+    runCompleted: probe.runCompleted === true,
     // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
     probePhase: probe.phase ?? null,
     probeExit: probe.probeExit ?? null,
@@ -106,6 +109,12 @@ export { HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CH
  * 1. **宿主/环境侧**：结构化字段 `probe.hostFatal[]` 非空，或失败项属 {@link HOST_SIDE_CHECKS}
  *    （宿主未就绪 / 版本线不可判定 / 契约探测未卸载）→ `UPSTREAM_DRIFT`。
  *    `errors[]` 是**人类可读日志**（含插件侧 stack / 文件路径），**不参与任何判据**；
+ * 1b. **完成位缺失**（`probe.runCompleted === false` 且无失败项且 `checks` 非空）
+ *    → `PLUGIN_REGRESSION`。探针中途被打断时「没跑到的检查」是 `skip` 而非 `fail`，
+ *    若照常往下走，一个「`apply()` 里 `process.exit(0)`」的插件会因为恰好没有失败项而被判
+ *    **PASS / GREEN（假绿）**——比 AMBER 更危险（AMBER 至少不放行）；完成位是这类运行的
+ *    **唯一**可区分信号。为什么排在**宿主侧之后**（而不是最前）：离线缺缓存 / 装配失败这类
+ *    **真上游信号**同样满足 `runCompleted === false`，排在最前就会把上游问题翻成插件回归；
  * 2. **版本线 unknown** → `UPSTREAM_DRIFT`；
  * 2b. **插件侧硬证据**（{@link PLUGIN_HARD_EVIDENCE}，如 `guard.reserved_rejected`）
  *    → `PLUGIN_REGRESSION`，**优先于任何漂移相关性**：插件违反宿主硬约束与上游契约是否
@@ -154,6 +163,25 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
   // 2. 版本线不可判定
   if (probe?.profile && probe.profile.flavor === 'unknown') reasons.push(`[${channelName}] 版本线探测为 unknown（${probe.profile.evidence ?? ''}）`);
   if (reasons.length > 0) return { attribution: 'UPSTREAM_DRIFT', channel: channelName, reasons };
+
+  // 1b. **完成位缺失**（🔴 必修-1）：探针跑过、但**没跑完**，且一条 fail 都没有 ——
+  //     这正是「假绿」风险区（`apply()` 里 `process.exit(0)` → 剩余检查是 `skip` 不是 `fail`
+  //     → 只看失败项会判 PASS/GREEN，比 AMBER 更危险）。完成位是这类运行的**唯一**可区分信号。
+  //     为什么排在宿主侧之后：离线缺缓存 / 装配失败这类**真上游信号**也满足 runCompleted=false，
+  //     若排在最前就会把上游问题翻成插件回归（判据 1 必须优先）。
+  //     为什么要求 `checks.length > 0`：探针**完全没输出结构化结果**时（装配器侧失败、
+  //     人工构造的报告）不应据完成位翻案——那种情形交给判据 1（hostFatal[]）与判据 6（UNKNOWN）。
+  if (probe?.runCompleted === false && failedChecks.length === 0 && (probe?.checks ?? []).length > 0) {
+    return {
+      attribution: 'PLUGIN_REGRESSION',
+      channel: channelName,
+      reasons: [
+        `[${channelName}] 探针**未跑完**（完成位 runCompleted=false）且无失败项——验收被插件侧中断`
+          + `（提前 process.exit / 挂住事件循环 / 不可捕获终止）；未跑到的检查是 skip 而非 fail，`
+          + `**不得**据此判通过（假绿比 AMBER 更危险）。详见 checks[].detail 与 probePhase。`,
+      ],
+    };
+  }
 
   // 2b. 插件侧硬证据：优先于漂移相关性（漂移窗口内插件违规仍判插件，评审 🔴-C）
   const hardEvidence = PLUGIN_HARD_EVIDENCE.filter((name) => failedNames.has(name));

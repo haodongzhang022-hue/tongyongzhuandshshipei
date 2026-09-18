@@ -14,7 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { PROBE_PHASE, pushHostFatal } from './contract.mjs';
+import { PLUGIN_ABNORMAL_TERMINATION_CHECK, PROBE_PHASE, PROBE_PHASE_BEACON_PREFIX, pushHostFatal } from './contract.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -124,6 +124,10 @@ export function runHostProbe(options) {
     hostFatal: [],
     contract: {},
     probes: [],
+    // 探针是否**跑完**（探针结构化结果的 `runCompleted`；未输出结果时为 false）。
+    // 用途：区分「跑完但失败」与「中途被打断」——后者即便某次输出里恰好没有 fail check，
+    // 也绝不能当成通过（假绿比 AMBER 更危险，见 🔴 必修-1）。
+    runCompleted: false,
     probeExit: null,
     // 探针执行相位（异常归属依据；见 contract.mjs 的 PROBE_PHASE）。
     // 装配器自身的失败（离线缺缓存 / npm 失败 / 装配异常）**都是宿主装配相位**——
@@ -195,32 +199,7 @@ export function runHostProbe(options) {
       result.errors.push(`探针非零退出（status=${error.status ?? 'null'}${error.signal ? `, signal=${error.signal}` : ''}）`);
     }
 
-    const marker = stdout.split('\n').find((line) => line.startsWith('__DSH_PROBE__'));
-    if (!marker) {
-      pushHostFatal(result, `探针未输出结构化结果（探针自身崩溃 / 被宿主中断）：${stdout.slice(-600)}`);
-      return result;
-    }
-    let payload;
-    try {
-      payload = JSON.parse(marker.slice('__DSH_PROBE__'.length));
-    } catch (error) {
-      // 探针输出不可解析 = 探针自身（本仓文件）出问题 → 宿主侧，不甩锅插件
-      pushHostFatal(result, `探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
-      return result;
-    }
-    result.profile = payload.profile;
-    result.checks = payload.checks ?? [];
-    result.contract = payload.contract ?? {};
-    result.probes = payload.probes ?? [];
-    // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，透传给报告供排障。
-    // 探针未回报时保留装配器判定（host-assembly），不退化成 null（否则排障看不到归属依据）。
-    result.phase = payload.phase ?? result.phase;
-    // 🟢 同样归一：errors 是日志（不参与判据），但非数组也不该被 spread 成逐字符噪声。
-    if (Array.isArray(payload.errors)) result.errors.push(...payload.errors);
-    // 探针侧的结构化宿主致命信号**原样透传**（执行器判据只读这一处，不再扫 errors 文本）。
-    // 🟢 归一：只透传真正的数组元素——非数组（如畸形 payload 给字符串）不得被 spread 成逐字符噪声。
-    if (Array.isArray(payload.hostFatal)) result.hostFatal.push(...payload.hostFatal);
-    result.ok = payload.ok === true && result.errors.length === 0;
+    interpretProbeStdout(result, stdout);
     return result;
   } catch (error) {
     // 装配阶段兜底：一律宿主/环境侧（探针脚本未产出结构化结果前的失败不可能是插件造成）
@@ -230,4 +209,78 @@ export function runHostProbe(options) {
     result.durationMs = Date.now() - started;
     rmSync(workDir, { recursive: true, force: true });
   }
+}
+
+/**
+ * 把探针的 stdout **解释**进 `result`（纯函数，装配器与离线回归共用同一份）。
+ *
+ * 抽出来的理由：这段逻辑是本中台最容易「静默判错」的地方（判据字段 `hostFatal[]` 的写入端），
+ * 而它原先只被真宿主 E2E 覆盖（慢、要网）。抽成纯函数后，离线回归可以用**真实探针输出**
+ * （含 SIGKILL 这类不可捕获终止的产物）直接断言归因，不必等 CI 装宿主。
+ *
+ * 三种情形：
+ * 1. 有结构化结果 → 原样透传 `checks` / `hostFatal` / `phase` / `runCompleted`；
+ *    `ok` 必须**同时**要求「跑完」（完成位）与「无失败」（🔴 必修-1）。
+ * 2. 无结构化结果 + **有相位信标** → 不可捕获终止（SIGKILL / OOM）发生在**插件集成**相位
+ *    → 落插件侧 check `plugin.abnormal_termination`，`hostFatal[]` 保持为空（不甩锅上游）。
+ * 3. 无结构化结果 + 无信标 → 终止在宿主装配段 → `hostFatal[]`（真上游信号，不丢）。
+ *
+ * @param {object} result 装配器结果对象（就地写入）
+ * @param {string} stdout 探针 stdout
+ * @returns {object} 同一个 result（便于链式使用）
+ */
+export function interpretProbeStdout(result, stdout) {
+  const text = String(stdout ?? '');
+  const marker = text.split('\n').find((line) => line.startsWith('__DSH_PROBE__'));
+  if (!marker) {
+    // 探针没写出结构化结果 = 它被**不可捕获**地终止了（SIGKILL / OOM / 原生 abort）
+    // ——可捕获的四条出口（同步 / 异步 / 进程 exit / run() 被拖住）都由探针自己闭合，
+    // 会照常输出结构化结果。这里只能用**相位信标**按证据归因，不得无条件甩给上游：
+    //   有信标 ⇒ 终止发生在插件代码运行期间（`plugin-integration`）→ 落**插件侧 check**
+    //            （与探针内部「未知相位保守判插件侧」同一取向：宁可让人多看插件一眼，
+    //             也不让未确认的信号去开「上游漂移」这道门）；
+    //   无信标 ⇒ 终止在宿主装配段 → 宿主/环境侧 → `hostFatal[]`（真上游信号，不丢）。
+    // 探针没输出结构化结果 ⇒ 它**没跑完**（完成位显式置 false，不留给 undefined）：
+    // 判据据此把这次运行排除在「通过」之外（🔴 必修-1 的假绿防线）。
+    result.runCompleted = false;
+    const beaconLine = text.split('\n').find((line) => line.startsWith(PROBE_PHASE_BEACON_PREFIX));
+    const beaconPhase = beaconLine ? beaconLine.slice(PROBE_PHASE_BEACON_PREFIX.length).trim() : null;
+    const tail = text.slice(-600);
+    if (beaconPhase === PROBE_PHASE.PLUGIN_INTEGRATION) {
+      result.phase = PROBE_PHASE.PLUGIN_INTEGRATION;
+      result.checks.push({
+        name: PLUGIN_ABNORMAL_TERMINATION_CHECK,
+        status: 'fail',
+        detail: `探针在插件集成相位被不可捕获终止（SIGKILL / OOM / 原生 abort；相位信标=${beaconPhase}）：${tail}`,
+      });
+      result.errors.push(`${PLUGIN_ABNORMAL_TERMINATION_CHECK}: 探针被不可捕获终止（有相位信标，落插件侧 check，不写 hostFatal[]）`);
+    } else {
+      pushHostFatal(result, `探针未输出结构化结果（探针自身崩溃 / 被宿主中断）：${tail}`);
+    }
+    return result;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(marker.slice('__DSH_PROBE__'.length));
+  } catch (error) {
+    // 探针输出不可解析 = 探针自身（本仓文件）出问题 → 宿主侧，不甩锅插件
+    pushHostFatal(result, `探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
+    return result;
+  }
+  result.profile = payload.profile;
+  result.checks = payload.checks ?? [];
+  result.contract = payload.contract ?? {};
+  result.probes = payload.probes ?? [];
+  // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，透传给报告供排障。
+  // 探针未回报时保留装配器判定（host-assembly），不退化成 null（否则排障看不到归属依据）。
+  result.phase = payload.phase ?? result.phase;
+  // 🟢 同样归一：errors 是日志（不参与判据），但非数组也不该被 spread 成逐字符噪声。
+  if (Array.isArray(payload.errors)) result.errors.push(...payload.errors);
+  // 探针侧的结构化宿主致命信号**原样透传**（执行器判据只读这一处，不再扫 errors 文本）。
+  // 🟢 归一：只透传真正的数组元素——非数组（如畸形 payload 给字符串）不得被 spread 成逐字符噪声。
+  if (Array.isArray(payload.hostFatal)) result.hostFatal.push(...payload.hostFatal);
+  // 完成位**原样透传**（探针未给出时保持 false）：`ok` 必须同时要求「跑完」与「无失败」。
+  result.runCompleted = payload.runCompleted === true;
+  result.ok = result.runCompleted && payload.ok === true && result.errors.length === 0;
+  return result;
 }

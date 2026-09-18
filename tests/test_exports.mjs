@@ -180,6 +180,31 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
   ok('CHANGELOG 防线编号自述扫描完成', `已声明 ${claimed.size} 类，未登记 ${unknown.length} 类`);
 }
 
+// ---- 2b'''. 文档「另有 N 项条件检查」的 N 必须 == CONDITIONAL_PROBE_CHECKS 长度 ----
+// 为什么补：v0.1.9 把条件项从 2 项扩到 5 项（新增 exit / run_incomplete / abnormal_termination）。
+// 若文档仍写「另有 2 项」，读者会以为探针只兜两条出口——而「口径与实现不符」正是本轮
+// 被评审点名的问题（自订不变量在说谎）。故把「N」也变成可断言的机器事实。
+console.log("  [2b'''] 文档条件检查项计数 = 事实源长度");
+{
+  const { CONDITIONAL_PROBE_CHECKS } = await import('../src/harness/contract.mjs');
+  const expected = CONDITIONAL_PROBE_CHECKS.length;
+  for (const file of ['docs/INDEX.md', 'docs/ADAPTER_GUIDE.md', 'docs/ARCHITECTURE.md']) {
+    const text = readFileSync(path.join(ROOT, file), 'utf8');
+    const declared = [...text.matchAll(/另有\s*(\d+)\s*项条件检查/g)].map((m) => Number(m[1]));
+    if (declared.length === 0) { bad(`${file} 声明「另有 N 项条件检查」`, '未找到声明（口径必须写出来）'); continue; }
+    const wrong = declared.filter((n) => n !== expected);
+    if (wrong.length === 0) ok(`${file} 条件检查项计数 = 事实源（${expected} 项）`);
+    else bad(`${file} 条件检查项计数`, `声明 ${wrong.join(',')} 项 ≠ 事实源 ${expected} 项（CONDITIONAL_PROBE_CHECKS）`);
+  }
+  // 反向：事实源里的每一项都必须在两份清单文档里出现（新增出口时漏写文档即红）
+  for (const file of ['docs/INDEX.md', 'docs/ADAPTER_GUIDE.md']) {
+    const text = readFileSync(path.join(ROOT, file), 'utf8');
+    const missing = CONDITIONAL_PROBE_CHECKS.filter((name) => !text.includes(name));
+    if (missing.length === 0) ok(`${file} 覆盖全部 ${expected} 项条件检查名`);
+    else bad(`${file} 覆盖全部条件检查名`, `缺：${missing.join(', ')}`);
+  }
+}
+
 // ---- 2c. 文档自述版本 = package.json 版本（防「文档说 vX，实际是 vY」） ----
 console.log('  [2c] 文档头部版本与 package.json 一致');
 {

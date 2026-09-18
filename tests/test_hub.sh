@@ -98,6 +98,16 @@ else
   bad "归因端到端回归失败"; tail -30 /tmp/e2e.log
 fi
 
+step "4b. 插件侧错误不得进 hostFatal[]（四条出口 + 不可捕获边界 + 防过度修正）"
+# 为什么放进 test_hub.sh：这一步此前只存在于 .cnb.yml（CI 专属）⇒ 本地 `bash tests/test_hub.sh`
+# 跑不到，出问题只能等 CI。现在两处**共用同一份脚本**（tests/gate_plugin_side.sh），
+# 口径与夹具清单只有一处可写错（评审 🟢 重复项）。
+if DSH_PROBE_RUN_WATCHDOG_MS=5000 bash "$ROOT/tests/gate_plugin_side.sh" /tmp/gate > /tmp/gate.log 2>&1; then
+  ok "插件侧闸门全绿（$(count_of /tmp/gate.log) 项：四条出口 + SIGKILL 边界 + 健康插件 17/17）"
+else
+  bad "插件侧闸门失败"; tail -20 /tmp/gate.log
+fi
+
 step "5. 上游变更侦测"
 "$NODE_BIN" "$ROOT/src/cli.mjs" watch --json /tmp/watch.json > /tmp/watch.log 2>&1
 WATCH_EXIT=$?

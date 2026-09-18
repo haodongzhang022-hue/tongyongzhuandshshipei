@@ -29,6 +29,14 @@
  *    → 无条件 `pushHostFatal()` → `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**（整份报告消失）。
  *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.async_uncaught_exception`、
  *    `checks` 非空且已跑完的检查全在（报告不丢）、`probePhase = plugin-integration`。
+ * 9c. **🔴 必修-2/3（进程 exit 出口 / `run()` 被拖住）**：插件在 `apply()` 里调 `process.exit(0)`，
+ *    或返回一个**永不 resolve** 的 Promise——前者不抛异常（`catch` 与 `uncaughtException` 都接不到），
+ *    后者既无异常也无退出。历史缺陷：探针在写出结构化结果前消失 → `UPSTREAM_DRIFT`/AMBER + `checks` 归零；
+ *    更糟的是「顺手加个 exit 钩子但**不带完成位**」→ 剩余检查是 `skip` 不是 `fail` → **假绿**。
+ *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.early_exit` /
+ *    `plugin.run_incomplete`、`runCompleted = false`（**未跑完绝不给 ok**）、已跑完的 pass 项保留。
+ * 9d. **不可捕获终止（SIGKILL）**：探针来不及写报告，装配器按**相位信标**归因 →
+ *    `plugin.abnormal_termination`（插件侧）/ `hostFatal = []`；无信标则仍走 `hostFatal[]`（真漂移不丢）。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
@@ -133,7 +141,9 @@ function verify(pluginPath, tools, { tmp = SOURCE_CACHE, channelName = CHANNEL, 
   try {
     execFileSync('node', [path.join(scratch, 'src', 'cli.mjs'), 'verify', '--channel', channelName, '--plugin', pluginPath, '--tools', tools, '--json', out, ...(offline ? ['--offline'] : [])], {
       cwd: scratch,
-      env: { ...process.env, TMPDIR: tmp },
+      // 出口④（run() 被拖住）的回归加速：宿主侧**缩短**看门狗窗口（探针只许缩短、不许延长）。
+      // 不设的话该夹具要等默认 20s——慢，但**不会**假绿（那才是要害）。
+      env: { ...process.env, TMPDIR: tmp, DSH_PROBE_RUN_WATCHDOG_MS: process.env.DSH_PROBE_RUN_WATCHDOG_MS ?? '5000' },
       encoding: 'utf8',
       timeout: 600_000,
     });
@@ -302,6 +312,49 @@ try {
     eq(`${label}（重跑结论一致：同一归因）`, report.attribution, again.attribution);
     eq(`${label}（重跑报告形态一致：pass 数相同）`,
       checks.filter((c) => c.status === 'pass').length, (again.checks ?? []).filter((c) => c.status === 'pass').length);
+  }
+
+  // ---- 11c. 🔴 必修-2/3：进程 exit 出口 / run() 被拖住 / 不可捕获终止（真宿主） ----
+  // 为什么必须真宿主也跑：离线回归台用的是**假宿主**（只模拟探针用到的那点宿主面），
+  // 而「插件在真 ToolRuntime 装配下 process.exit」与「真宿主下挂住」的时序可能不同。
+  // 放行判据（总师 §三⑤）：异步路径 + 进程 exit 路径均 `hostFatal=[]`，且健康插件仍 17/17。
+  console.log('  [8c] 🔴 必修-2/3：四条出口在真宿主下均判插件、hostFatal 为空、未跑完不得假绿');
+  for (const [label, fixture, expectedCheck, expectedCompleted, expectsPass] of [
+    ['进程 exit（apply 内 process.exit(0)）', 'plugin-exit-plugin.mjs', 'plugin.early_exit', false, true],
+    ['run() 被拖住（apply 返回永不 resolve 的 Promise）', 'plugin-hang-plugin.mjs', 'plugin.run_incomplete', false, true],
+    ['不可捕获终止（SIGKILL）', 'plugin-sigkill-plugin.mjs', 'plugin.abnormal_termination', false, false],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    const checks = report.checks ?? [];
+    const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    // 核心不变量（🔴-D）：插件侧错误**永远**不进判据字段 hostFatal[]
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    eq(`${label}（失败项含 ${expectedCheck}）`, true, failed.includes(expectedCheck));
+    // 完成位（🔴 必修-1）：未跑完的运行**不得**判通过（假绿比 AMBER 更危险）
+    eq(`${label}（完成位 runCompleted=${expectedCompleted}）`, expectedCompleted, report.runCompleted);
+    eq(`${label}（未跑完不得判 GREEN/PASS）`, true, report.attribution !== 'PASS' && report.summary?.verdict !== 'GREEN');
+    // 失败项必须全在插件侧表内（不得出现宿主侧 check 失败 → 否则归因会被判据 1 抢走）
+    const pluginSide = new Set(PLUGIN_SIDE_CHECKS);
+    eq(`${label}（失败项全在插件侧，名单取自 PLUGIN_SIDE_CHECKS）`, true, failed.every((name) => pluginSide.has(name)));
+    // 报告完整性：**可捕获**出口必须保留已跑完的检查（历史缺陷下 checks 归零 = 整份报告消失）
+    eq(`${label}（已跑完的 pass 项保留——报告不丢）`, expectsPass, checks.some((c) => c.status === 'pass'));
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack（夹具路径 / at 帧）
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+    eq(`${label}（hostFatal 不含 stack 帧 'at '）`, false, /\n\s*at /.test(fatalText));
+  }
+  // 出口③ 的**假绿**反证（评审 🔴 必修-1 点名的实验）：同一夹具在「带完成位」的实现下必须 RED；
+  // 不带完成位时它会变 GREEN/checks=6 —— 这正是「用一个 HIGH 换一个 MEDIUM」的机制，
+  // 故这里额外断言「失败项存在」（不带完成位时失败项是 0 条，只有 skip）。
+  {
+    const exitReport = verify(path.join(ROOT, 'tests/fixtures', 'plugin-exit-plugin.mjs'), 'demo_echo');
+    const exitChecks = exitReport.checks ?? [];
+    eq('🔴 假绿反证：进程 exit 夹具**确实**产生了失败项（不是「只有 skip」的假绿形态）', true,
+      exitChecks.some((c) => c.status === 'fail'));
+    eq('🔴 假绿反证：进程 exit 夹具的 skip 项 > 0（未跑到的检查被如实标注，不是凭空消失）', true,
+      exitChecks.some((c) => c.status === 'skip'));
   }
 
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----
