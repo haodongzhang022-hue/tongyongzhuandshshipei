@@ -381,8 +381,8 @@ try {
   // 而离线回归台用的是假宿主 + 同一个装配器实现——真宿主能覆盖「真 ToolRuntime 装配下的时机差异」
   // （例如插件依赖在 import 期就动了 process 监听器）。两条都是**放行级假绿**，必须双跑。
   console.log('  [8e] v0.1.9d：R28 防线被顶替（真宿主，放行级假绿收口）');
-  // 注：R26 的**结构级**防线（`plugin.protocol_injection`）在真宿主下不可达（nonce 在插件代码前
-  // 已从 env 删除）⇒ 由离线 [9.11] 用合成输入断言；真宿主可达的 R26 形态（裸 marker 伪造）
+  // 注：R26 的**结构级**防线（`plugin.protocol_injection`）在真宿主下不可达（nonce 经 stdin
+  // 下发，插件读不到）⇒ 由离线 [9.11] 用合成输入断言；真宿主可达的 R26 形态（裸 marker 伪造）
   // 已由上面 [8d] 的 `plugin-forged-result-plugin` 覆盖。
   for (const [label, fixture, expectedCheck, expectedCompleted] of [
     ['R28 防线被顶替（摘掉探针兜底 + 装自己的）', 'plugin-defense-tamper-plugin.mjs', 'plugin.process_defense_tampered', true],

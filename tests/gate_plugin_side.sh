@@ -115,7 +115,7 @@ NEGATIVE_CASES=(
   # 这是「为什么必须用 stdin」的**可执行证据**（不是注释里的偏好）。
   "plugin-nonce-reverse-read-plugin|plugin.probe_result_forged|true|true|plugin.probe_result_forged"
   # R26 的**结构级**防线（`plugin.protocol_injection`）在真宿主下**不可达**：探针在**任何插件代码之前**
-  # 就把 nonce 从 `process.env` 删除 ⇒ 插件拿不到正确前缀 ⇒「匹配前缀的结果行 ≥2 条 / 出现在 stdout」
+  # 经 **stdin** 下发（插件读不到）⇒ 插件拿不到正确前缀 ⇒「匹配前缀的结果行 ≥2 条 / 出现在 stdout」
   # 无法构造。故该 check **不进闸门**，由离线 [9.11] 用**合成输入**断言（可达性边界见 docs/RISKS.md R26）。
   # ⚠️ `plugin-sync-loop-plugin`（R24）**不在**本清单：它的缺陷只在**有界 timeout** 下成立
   # （默认 timeoutMs=600s 时 3s 循环会正常跑完——那本身不是缺陷）。该形态由下方**专用 R24 段**

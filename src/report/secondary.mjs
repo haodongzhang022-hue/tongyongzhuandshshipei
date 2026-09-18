@@ -65,6 +65,8 @@ export function buildSecondary(report) {
       attributionReasons: channel.attributionReasons ?? [],
       durationMs: channel.durationMs,
       failedChecks: (channel.checks ?? []).filter((c) => c.status === 'fail').map((c) => ({ name: c.name, detail: c.detail })),
+      // nonce 带外通道形态（stdin / 其它）——R26 的口径可见性（排障时看得到「nonce 走哪条通道」）
+      probeNonceChannel: channel.probeNonceChannel ?? null,
       // 宿主/环境侧致命信号（**结构化**；归因判据只读它，errors 仅作日志——见 docs/RISKS.md R7/R13）
       hostFatal: channel.hostFatal ?? [],
       errors: channel.errors ?? [],

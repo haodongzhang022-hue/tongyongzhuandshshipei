@@ -56,6 +56,7 @@ import {
   recordProbeException,
   recordProbeRunIncomplete,
 } from '../src/harness/contract.mjs';
+import * as contractNs from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
 import { channelFingerprint, collectProbeResultLines, interpretProbeStdout, loadChannels, probeSpawnOptions, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
@@ -1145,14 +1146,14 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
     CONDITIONAL_PROBE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
 
   // 9.11f **可达性边界**（口径，必须显式声明）：结构级防线（`plugin.protocol_injection`）要求
-  // 「匹配 nonce 前缀的结果行 ≥2 条 / 出现在 stdout」——而探针在**任何插件代码之前**就把 nonce
-  // 从 `process.env` 删除 ⇒ **真宿主下插件无法构造**该输入。故：
+  // 「匹配 nonce 前缀的结果行 ≥2 条 / 出现在 stdout」——而 nonce 经 **stdin** 下发（插件读不到）
+  // ⇒ **真宿主下插件无法构造**该输入。故：
   // ① 该 check 由**离线合成输入**断言（9.11a/9.11b，已覆盖）；
   // ② 真宿主可达的 R26 形态是 `plugin-forged-result-plugin`（裸 marker / nonce 不匹配
   //    ⇒ `plugin.probe_result_forged`），它**进闸门**；
   // ③ 本项**不得**因「不可达」而从 `PLUGIN_SIDE_CHECKS` / `CONDITIONAL_PROBE_CHECKS` 摘除——
   //    它是**第二道防线**（nonce 机制一旦被改坏/绕过，结构不变量仍能兜住）。
-  eq('R26 可达性：结构级防线在真宿主不可达（nonce 在插件代码前已从 env 删除）⇒ 由离线合成输入断言',
+  eq('R26 可达性：结构级防线在真宿主不可达（nonce 经 stdin 下发，插件读不到）⇒ 由离线合成输入断言',
     true, PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
   eq('R26 可达性：真宿主可达形态是 plugin-forged-result-plugin（进闸门）', true,
     /plugin-forged-result-plugin\|plugin\.probe_result_forged/.test(readText(path.join(ROOT, 'tests/gate_plugin_side.sh'), 'utf8')));
@@ -1376,6 +1377,9 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     ['R26', '协议注入 → 放行级假绿（结果通道被注入伪造报告）'],
     ['R27', '口径守卫同义绕过 + 只守了错的命题'],
     ['R28', '修法 A 自检判据不可判定（has()||listenerCount>0 假阳性）'],
+    // v0.2.3（评审复评 §三）：两条新活口必须留痕（「已知活口不得静默」）
+    ['R29', '全局改写（猴子补丁 JSON.stringify）→ 放行级假绿（R26 同族，逐点补不可穷尽）'],
+    ['R30', '探针无 nonce 路径硬崩 → 甩锅上游（PROBE_RESULT_MARKER 未 import）'],
   ]) {
     eq(`口径守卫：RISKS 记录 ${id}（${label}）`, true, new RegExp(`\\|\\s*${id}\\s*\\|`).test(risks));
   }
@@ -1389,6 +1393,26 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     eq(`口径守卫：${label} 夹具存在且真的复现该形态`, true, marker.test(src));
     eq(`口径守卫：${label} 夹具自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
   }
+  // 🔴-A（评审复评）：探针**用到**的标识符必须真的 import —— 旧缺陷是 `probe-template.mjs` 在
+  // 无 nonce 分支用 `PROBE_RESULT_MARKER` 却没 import ⇒ 任何不带 nonce 的调用 `ReferenceError`
+  // 硬崩、无结构化结果、被归因成 `UPSTREAM_DRIFT`（探针自身缺陷甩锅上游）。
+  // 守卫按**标识符词元**判（不用 includes，防前缀包含绕过）——「用到的必须在 import 里」。
+  {
+    const probeSrcForImport = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+    const importBlock = probeSrcForImport.slice(0, probeSrcForImport.indexOf("} from './contract.mjs'"));
+    const bodyAfterImport = probeSrcForImport.slice(probeSrcForImport.indexOf("} from './contract.mjs'"));
+    const tokens = (text) => text.split(/[^A-Za-z0-9_$]+/).filter(Boolean);
+    const imported = new Set(tokens(importBlock));
+    // 判据范围 = **contract.mjs 真的导出**的名字（避免把本地 Symbol / 属性名误判为缺 import）
+    const contractExports = new Set(Object.keys(contractNs));
+    const used = new Set(tokens(bodyAfterImport).filter((t) => contractExports.has(t)));
+    const missing = [...used].filter((t) => !imported.has(t));
+    eq('🔴-A 源码守卫：探针用到的 PROBE_/PLUGIN_ 常量均已 import（缺失即 ReferenceError 硬崩）',
+      JSON.stringify([]), JSON.stringify(missing));
+    eq('🔴-A 源码守卫：PROBE_RESULT_MARKER 已在 import 列表内（旧缺陷点）', true,
+      imported.has('PROBE_RESULT_MARKER'));
+  }
+
   // 🆕 信任边界（🟡-4）必须**显式**登记：既有缺口（base 同样可复现）不得因「本 PR 未引入」而漏登记。
   // 断言三件套：① R26 行存在；② 显式前提「插件为可信代码」写明；③ 残留边界（进程隔离）写明。
   eq('🟡-4：RISKS R26 写明显式前提「插件为可信代码」（此前是隐式）', true, /插件为\*\*?可信代码|插件为可信代码/.test(risks));

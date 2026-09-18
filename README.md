@@ -48,7 +48,7 @@
 ✅ stable  (0.1.5-rc.2)      17/17 检查通过   flavor=modern
 ✅ dev     (0.1.6-alpha.2)   17/17 检查通过   flavor=modern
 ✅ legacy  (0.1.1-rc.2)      17/17 检查通过   flavor=legacy
-✅ 离线单测 128 项 + 归因离线回归 441 项 + 发布面自检 40 项 + 归因端到端回归 146 项
+✅ 离线单测 134 项 + 归因离线回归 445 项 + 发布面自检 43 项 + 归因端到端回归 146 项
 ✅ 负例插件被正确拦下（保留名冲突显式上报，不静默失效）
 ✅ 插件写错代码（未初始化字段 / 抛错 getter）→ 判插件且 `hostFatal[]` 为空（插件侧错误不进判据字段——**前提：探针进程内防线未被插件干预**，见 `docs/RISKS.md` R22/R23）
 ✅ 上游漂移侦测可用（基线只在通道 ok 时更新，失败不覆盖）
@@ -81,8 +81,8 @@ export function apply(ctx) {
 node src/cli.mjs matrix                                  # 看通道矩阵
 node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status --markdown
 node src/cli.mjs watch                                   # 上游有没有发新版
-bash tests/test_offline.sh                               # 离线单测（128 项，秒级）
-node tests/test_attribution.mjs                          # 归因离线回归（441 项，秒级）
+bash tests/test_offline.sh                               # 离线单测（134 项，秒级）
+node tests/test_attribution.mjs                          # 归因离线回归（445 项，秒级）
 node tests/test_exports.mjs                              # 发布面自检（exports 全解析 + 模板拷贝可用）
 ```
 
@@ -119,7 +119,7 @@ flowchart LR
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 架构八步：调研→拓扑→可行性→工程→分工→进度→索引→复盘 |
 | [`docs/ADAPTER_GUIDE.md`](docs/ADAPTER_GUIDE.md) | 插件 5 分钟接入 + 归因怎么读 |
 | [`docs/RISKS.md`](docs/RISKS.md) | 风险清单（等级/触发条件/规避/兜底）+ 待拍板项；**R26 = 架构前提（插件为可信代码）** |
-| [`docs/REDO-PROPOSAL.md`](docs/REDO-PROPOSAL.md) | 结构性重做一页方案（批 1 已落地 / 批 2 进程隔离**待拍板**） |
+| [`docs/REDO-PROPOSAL.md`](docs/REDO-PROPOSAL.md) | 结构性重做一页方案（批 1 已落地 / 批 2 进程隔离**已立项在办**） |
 | [`docs/INDEX.md`](docs/INDEX.md) | 一页找齐（产物/通道/检查项索引） |
 | [`registry/channels.json`](registry/channels.json) | ★ 通道钉版表（唯一事实源） |
 

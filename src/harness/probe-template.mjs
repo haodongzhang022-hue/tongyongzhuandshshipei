@@ -95,12 +95,11 @@ import { readFileSync, writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import {
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
-  PLUGIN_PROTOCOL_INJECTION_CHECK,
   PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
-  PROBE_NONCE_STDIN_CHANNEL,
+  PROBE_RESULT_MARKER,
   probeResultPrefix,
   collectContract,
   pushHostFatal,
@@ -113,13 +112,19 @@ import {
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
 
-// ---- 🆕 nonce 带外通道（侧信道收口） ----
-// 宿主每次运行生成随机 nonce 与**随机环境变量名**，经 argv 把「名字」传进来、
-// 经 env 把「值」传进来。探针只认这个值：输出的结构化结果前缀带 nonce，
-// 宿主也只认带 nonce 的行。这样「谁是探针」由宿主掌握的随机量判定，
-// 而不是靠公开字面量 `__DSH_PROBE__`——插件伪造裸 marker 会被宿主识别为伪造。
+// ---- 🆕 nonce 带外通道（侧信道收口；通道形态 = **stdin**） ----
+// 宿主每次运行生成随机 nonce，经 **stdin**（fd 0）下发（**不进 argv、不进 env**）。
+// 探针只认这个值：输出的结构化结果前缀带 nonce，宿主也只认带 nonce 的行。
+// 这样「谁是探针」由宿主掌握的随机量判定，而不是靠公开字面量 `__DSH_PROBE__`
+// ——插件伪造裸 marker 会被宿主识别为伪造。
 //
-// 纪律：读到后**立刻**从 `process.env` 删除（缩小插件侧的可见窗口）；
+// 为什么**不得**用 env / argv（实测依据，见 docs/RISKS.md R26）：
+// env 通道即使 `delete process.env[NAME]`，值仍留在内核的进程环境块里，同进程插件
+// 可从 `/proc/self/environ` 反读；argv 通道会出现在 `ps` / `/proc/self/cmdline`。
+// 两者都能让插件拿到 nonce 再伪造**被采信**的结果行（本仓实测：env 通道下判 GREEN 放行）。
+// stdin 的字节流不在进程环境块、也不在 argv 里 ⇒ 上述两条读取面都不成立。
+//
+// 纪律：读完**立刻** `process.stdin.destroy()`（否则插件可从 fd 0 再读一遍）；
 // 缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
 // 但宿主侧会按「无 nonce ⇒ 不可信」处理（见 host.mjs 的 interpretProbeStdout）。
 const nonceValue = (() => {
@@ -223,7 +228,7 @@ function writeResult(payload) {
   }
 }
 
-// ---- 进程内防线：wrap API + 收尾三重自检（H1 / R22 / R28）----
+// ---- 进程内防线：wrap API + 收尾四重自检（H1 / R22 / R28）----
 /**
  * 我们自己的两个进程级 handler（**身份检查**的锚点）。
  *

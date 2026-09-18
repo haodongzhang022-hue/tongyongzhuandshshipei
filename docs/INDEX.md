@@ -40,16 +40,16 @@
 | ★ 漂移影响面归因 | `src/triage/index.mjs` | 代码 | **唯一事实源**：`DRIFT_IMPACT`（漂移字段 → 受影响检查 → 责任方 → 中台改哪一处 → 插件义务）+ `triageUpstream()` |
 | 二级信息汇报 | `src/report/secondary.mjs` | 代码 | JSON + Markdown 双视图 |
 | ★ 架构前提（信任边界） | `docs/RISKS.md` R26 | 文档 | **显式前提：插件为可信代码**；前提被打破 ⇒ 结论不可信（本中台是验收工具，不是沙箱） |
-| 结构性重做一页方案 | `docs/REDO-PROPOSAL.md` | 文档 | 批 1（fd3 + nonce）**已落地** / 批 2（进程隔离）**待拍板** |
+| 结构性重做一页方案 | `docs/REDO-PROPOSAL.md` | 文档 | 批 1（fd3 + nonce）**已落地** / 批 2（进程隔离）**已立项在办**（总师裁定；R29 证逐点补不可穷尽） |
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 128 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🆕 nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**v0.1.9d R28/R26/R24 三形态 [18]**） |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 441 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **v0.1.9d [9.10] R28 判据 / [9.11] R26 协议注入 / [9.12] R24 行为级**（无网可跑） |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 134 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🆕 nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**v0.1.9d R28/R26/R24 三形态 [18]**） |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 445 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **v0.1.9d [9.10] R28 判据 / [9.11] R26 协议注入 / [9.12] R24 行为级**（无网可跑） |
 | 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 146 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d] 侧信道 / [8e] R28+R26 / [8f] R24** 场景，含 attribution + verdict + **完成位**三重断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 4b 步插件侧闸门 / 第 7 步「文档计数防漂移」） |
 | 插件侧闸门 | `tests/gate_plugin_side.sh` | 测试 | ★ 唯一事实源：四条出口 + SIGKILL 边界 + **防过度修正**（健康插件 17/17）；`.cnb.yml` push/PR 两段共用同一份 |
 | 离线探针回归台 | `tests/offline-probe-harness.mjs` | 测试 | 最小假宿主 + 真实探针子进程 + **装配器真实实现**解释输出（秒级覆盖四条出口；边界：假宿主通过 ≠ 真宿主适配通过） |
-| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索（40 项） |
+| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索（43 项） |
 | 示例插件 | `tests/fixtures/demo-plugin.mjs` | 测试 | 同时是接入模板 |
 | 负例插件 | `tests/fixtures/broken-plugin.mjs` | 测试 | 验证护栏不静默失效（声明保留名 → 插件侧硬证据） |
 | 负例插件（🔴-D 同步） | `tests/fixtures/plugin-side-throw-plugin.mjs` / `plugin-registry-throw-plugin.mjs` | 测试 | 插件侧**同步**异常（抛错 getter / 未初始化字段）→ `PLUGIN_REGRESSION` 且 `hostFatal=[]` |
