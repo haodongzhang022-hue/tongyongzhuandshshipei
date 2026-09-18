@@ -41,7 +41,9 @@
  * | ④ | `run()` 被拖住（挂住事件循环 / `apply()` 永不 resolve） | **无条件**看门狗 `RUN_WATCHDOG_MS` | `plugin.run_incomplete` |
  *
  * 四条出口的归属规则**只有一份**（`contract.mjs` 的 `probeFailureRoute()` /
- * `probeProcessFailureRoute()`），插件侧一律落 check、**绝不**写 `hostFatal[]`。
+ * `probeProcessFailureRoute()`）：插件侧落 check、不写 `hostFatal[]`
+ * （**口径前提**：探针进程内防线未被插件干预——见 R22/R23/R28；防线被干预时由收尾自检判
+ * `plugin.process_defense_tampered`，结果通道被注入时由装配器判 `plugin.protocol_injection`）。
  *
  * ### 完成位（`runCompleted`）——「已跑完」与「没跑完」必须可区分
  * `emit()` 的 `ok` 必须来自 `runCompleted && errors.length === 0`，而 `runCompleted`
@@ -69,12 +71,31 @@
  * 历史缺陷（🔴-C）：改用 `fatal(host)` 前缀后判据仍在**扫自由文本**——插件文件路径/错误文本里
  * 恰好含该字面量即再次翻案。故判据改为只读 `hostFatal[]` 结构化字段，`errors` 退化为纯日志。
  *
+ * ## 结果通道（R26：协议注入防线）
+ * 结构化结果**优先**写独立通道 fd3（`writeSync(3, ...)`）；fd3 不可用（直接跑探针 / 老装配器）
+ * 时回退 stdout。装配器据此把「stdout 里出现结果行」判为**篡改证据**（探针只写 fd3），
+ * 并对「结果行 ≥2 条」直接判插件侧 check `plugin.protocol_injection`（**放行级假绿**防线）。
+ *
+ * ## 进程内防线的**可判定性**（H1 / R22 / R28）
+ * 「探针装了兜底」≠「兜底有效」。插件可（`apply()` 内）单方面：
+ * `setUncaughtExceptionCaptureCallback()`（独占 API，设置后监听器**不再被调用**）、
+ * `removeAllListeners('uncaughtException')`、或**用自己的回调顶替**我们的。
+ * 故探针在**任何插件代码之前** wrap 这几个 API 记账（`wrapProcessDefenseApis()`），
+ * 收尾时做**四重自检**（`checkProcessDefense()`）：① API 调用台账（wrap 记账）；
+ * ② **身份检查**（我们的 handler 仍在 `process.listeners()` 里）；③ 独占 API 检测
+ * （`hasUncaughtExceptionCaptureCallback()` **作为独立篡改信号**，不与计数做 `||`）；
+ * ④ 行为级 canary（临时监听器 + 走 `process._fatalException` 的**真实派发路径**，
+ * 能区分「监听器还在但不会被调用」；该内部入口不可用时本层自动跳过，不误报）。
+ * ⚠️ **不得**用 `hasUncaughtExceptionCaptureCallback() || listenerCount > 0` 当判据（R28 已证假阳性：
+ * 插件用自己的回调顶替后 `has=true, count=1`，该式仍判「防线有效」）。
+ *
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
 import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import {
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
+  PLUGIN_PROTOCOL_INJECTION_CHECK,
   PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
@@ -147,11 +168,211 @@ function beacon(name) {
 }
 
 /**
+ * 结构化结果的**专用通道**（fd3）。
+ *
+ * 为什么需要（R26）：结果原先与日志共用 stdout，插件只要在 `apply()` 里先写一条伪造结果
+ * 就能抢到「第一条」位置（装配器 `find(startsWith(...))`），真报告被忽略 ⇒ **GREEN 放行**。
+ * 改走 fd3 后：① 探针结果不再与日志混流；② **stdout 里出现结果行本身就是篡改证据**。
+ * fd3 不可用（直接跑探针 / 老装配器 / 无该 fd）时回退 stdout——此时装配器按 2 参调用解释
+ * （与 v0.1.9c 行为一致，见 `host.mjs` 的 `interpretProbeStdout()`）。
+ *
+ * @type {number}
+ */
+const RESULT_FD = 3;
+/**
+ * 把结构化结果写到结果通道（**崩溃路径**：不得抛）。
+ *
+ * @param {string} payload 完整结果行（含 `__DSH_PROBE__` 前缀与换行）
+ * @returns {'fd3'|'stdout'} 实际使用的通道（供排障）
+ */
+function writeResult(payload) {
+  try {
+    writeSync(RESULT_FD, payload);
+    return 'fd3';
+  } catch {
+    try {
+      writeSync(1, payload);
+    } catch {
+      try { process.stdout.write(payload); } catch { /* 静默：崩溃路径上的兜底不得再崩 */ }
+    }
+    return 'stdout';
+  }
+}
+
+// ---- 进程内防线：wrap API + 收尾三重自检（H1 / R22 / R28）----
+/**
+ * 我们自己的两个进程级 handler（**身份检查**的锚点）。
+ *
+ * 为什么不能只数个数（R28 已证）：插件用自己的回调顶替后 `listenerCount` 仍为 1，
+ * `hasUncaughtExceptionCaptureCallback()` 仍为 true ⇒「计数判据」恒判「防线有效」（假阳性）。
+ * 只有**认出自己的 handler 还在不在**才能判「防线是否被替换」。
+ */
+const defenseHandlers = { uncaughtException: null, unhandledRejection: null };
+/** 插件对防线 API 的调用台账（wrap 后逐次记账；由 `apply()` 内的调用填充）。 */
+const defenseApiCalls = [];
+/**
+ * 台账的**记账范围**：只记 `plugin-integration` 相位（= 插件代码运行期间）的调用。
+ *
+ * 为什么按相位过滤：宿主装配段（`import('@deepseek-ai/cordis')` 等）里若上游库内部动了
+ * `process.removeListener('uncaughtException', ...)`，那不是**插件**的干预——记进来会
+ * 把健康插件误判成篡改（**过度修正**，闸门有反向断言守这一点）。
+ * 探针在插件集成相位**之前**就完成了 wrap，故插件（含其依赖，含 import 期顶层代码）的调用
+ * 全部落在记账范围内。
+ */
+let defenseCanaryActive = false;
+/**
+ * 在**任何插件代码运行之前**包装「可被插件用来撤销/静音防线」的 API，记录调用台账。
+ *
+ * 包装的四个面（都是插件实际会用到的写法）：
+ * - `process.setUncaughtExceptionCaptureCallback`（独占 API；设置后监听器**不再被调用**）；
+ * - `process.removeAllListeners('uncaughtException' | 'unhandledRejection')`（直接撤销）；
+ * - `process.removeListener` / `process.off`（精确摘除我们的 handler）。
+ *
+ * 纪律：wrap 自身**不得抛**（它跑在探针启动路径上），且**不改语义**（照常调用原实现并返回其返回值）
+ * ——把「探针的诊断能力」变成「插件的运行障碍」是必须避免的（见 R22 的取舍）。
+ *
+ * @returns {void}
+ */
+function wrapProcessDefenseApis() {
+  const targets = ['uncaughtException', 'unhandledRejection'];
+  const wrap = (name, describe) => {
+    const original = process[name];
+    if (typeof original !== 'function') return;
+    try {
+      process[name] = function wrapped(...args) {
+        try {
+          const note = describe(args);
+          // 只记插件集成相位的调用；canary 自己的 removeListener 不记账（否则自检变成「插件干预」）
+          if (note && !defenseCanaryActive && phase === PROBE_PHASE.PLUGIN_INTEGRATION) defenseApiCalls.push(note);
+        } catch { /* 记账失败不得影响原语义 */ }
+        return Reflect.apply(original, this, args);
+      };
+    } catch { /* 属性不可写（极少数运行时）：放弃记账，不影响其它判据 */ }
+  };
+  wrap('setUncaughtExceptionCaptureCallback', (args) => (typeof args[0] === 'function'
+    ? 'setUncaughtExceptionCaptureCallback（独占 API：capture callback 存在时 uncaughtException 监听器被停用）'
+    : null));
+  wrap('removeAllListeners', (args) => (targets.includes(args[0]) ? `removeAllListeners('${args[0]}')` : null));
+  wrap('removeListener', (args) => (targets.includes(args[0]) ? `removeListener('${args[0]}')` : null));
+  wrap('off', (args) => (targets.includes(args[0]) ? `off('${args[0]}')` : null));
+}
+
+/**
+ * canary 哨兵标记（**Symbol**，不可从外部伪造）。
+ *
+ * 为什么用 Symbol 而不是错误消息字符串：探针的两个进程级 handler 必须**忽略**自检哨兵
+ * （否则自检本身会被记账成「插件后台抛错」）。若用消息字符串判断，插件只要抛一个同名消息的
+ * 错误就能把自己的异步异常**静音**——那是「防线自身成为活口」。Symbol 不出现在任何导出面上，
+ * 插件无法构造带该标记的错误。
+ *
+ * @type {symbol}
+ */
+const PROBE_CANARY = Symbol('dsh-probe-defense-canary');
+
+/**
+ * 判定一个错误是否探针自检哨兵（我们的 handler 据此**不记账**）。
+ *
+ * @param {unknown} error 待判定对象
+ * @returns {boolean}
+ */
+function isProbeCanary(error) {
+  return Boolean(error && typeof error === 'object' && error[PROBE_CANARY] === true);
+}
+
+/**
+ * 行为级 canary：走**真实派发路径**验证「探针的 `uncaughtException` 监听器是否仍会被调用」。
+ *
+ * 为什么需要它（R28 的教训）：`listenerCount > 0` / `hasUncaughtExceptionCaptureCallback()`
+ * 这类**内省**判据只能说明「状态像是对的」，说明不了「监听器**会不会**被调用」。
+ * canary 挂一个探针自己的临时监听器，再触发一次**真实派发**，看它是否被调用。
+ *
+ * 派发入口的选择（两版实测对比，**这是本函数最容易写错的地方**）：
+ * - `process.emit('uncaughtException', e)`：**不可用**——实测在存在 capture callback 时
+ *   仍会调用监听器（Node 的 capture-callback 分支在**内部派发函数**里，不在 `emit` 里），
+ *   故对「被静音」无判别力（假阴性）；
+ * - `process._fatalException(e)`：Node 的**内部派发入口**（`emit` 之上的那一层），
+ *   实测能正确区分（有监听器 → canary 被调用；有 capture callback → canary **不被**调用）。
+ *
+ * 风险与边界（显式声明，不越权承诺）：
+ * 1. 依赖内部入口 ⇒ **不可用时本层自动跳过**（返回 null = 不误报，其余三层仍生效）；
+ * 2. 派发会调用**其它已注册监听器**（可能含插件自己的）⇒ 故只在 ①②③ 均干净时运行
+ *    （对已被判出篡改的插件不再触发其代码）；
+ * 3. 只覆盖 `uncaughtException`（capture callback 影响的就是这条派发路径）。
+ *
+ * @returns {string|null} 命中的人读证据；null = 防线完好 / 本层不可用（跳过）
+ */
+function runDefenseCanary() {
+  const fatal = process._fatalException;
+  if (typeof fatal !== 'function') return null;
+  const sentinel = Object.assign(new Error('probe defense canary'), { [PROBE_CANARY]: true });
+  let fired = false;
+  const canary = (error) => { if (error === sentinel) fired = true; };
+  try {
+    defenseCanaryActive = true;
+    process.on('uncaughtException', canary);
+    try {
+      fatal.call(process, sentinel);
+    } catch {
+      // 派发实现差异（非 Node / 版本差异）：本层跳过，绝不据此判篡改（防误报）
+      return null;
+    }
+    return fired
+      ? null
+      : 'canary：探针临时注册的 uncaughtException 监听器**未被调用**（真实派发路径被静音 / 拦截）';
+  } catch {
+    return null;
+  } finally {
+    try { process.removeListener('uncaughtException', canary); } catch { /* 收尾路径上不得抛 */ }
+    defenseCanaryActive = false;
+  }
+}
+
+/**
+ * 收尾自检：探针的进程内防线**是否仍然有效**（四重判据，缺一即被绕过）。
+ *
+ * | # | 判据 | 挡住的形态 |
+ * |---|---|---|
+ * | ① | API 调用台账非空（wrap 记账） | 插件抢占 capture API / 摘监听器（真实形态：Sentry / APM / 日志库） |
+ * | ② | **身份检查**：我们的 handler 仍在 `process.listeners(event)` 里 | 插件**用自己的回调顶替**我们的（计数判据在此**假阳性**，见 R28） |
+ * | ③ | 独占 API 存在（`hasUncaughtExceptionCaptureCallback()`，**独立**篡改信号） | 插件（或其依赖）抢占 capture callback ⇒ 监听器**不再被调用**（Node 官方语义） |
+ * | ④ | 行为级 canary（`runDefenseCanary()`，best-effort） | 「监听器还在但不会被调用」的形态（拦截真实派发路径） |
+ *
+ * ⚠️ 判据**不得**退化为 `hasUncaughtExceptionCaptureCallback() || listenerCount > 0`
+ * （R28 实测：插件顶替后该式恒真 = 形同虚设）。由 `tests/test_attribution.mjs` [9.4e] 源码守卫。
+ *
+ * 纪律：本函数运行在收尾路径上，**不得抛**。
+ *
+ * @returns {string[]} 命中的人读证据（空数组 = 防线完好）
+ */
+function checkProcessDefense() {
+  const tampered = [];
+  try {
+    if (defenseApiCalls.length > 0) tampered.push(...defenseApiCalls);
+    for (const event of ['uncaughtException', 'unhandledRejection']) {
+      const handler = defenseHandlers[event];
+      let present = false;
+      try { present = typeof handler === 'function' && process.listeners(event).includes(handler); } catch { present = true; }
+      if (!present) tampered.push(`探针的 ${event} 兜底 handler 已不在 process.listeners('${event}') 中（被插件摘除或顶替）`);
+    }
+    let capturePresent = false;
+    try { capturePresent = typeof process.hasUncaughtExceptionCaptureCallback === 'function' && process.hasUncaughtExceptionCaptureCallback() === true; } catch { capturePresent = false; }
+    if (capturePresent) tampered.push('setUncaughtExceptionCaptureCallback（独占 API 存在 ⇒ uncaughtException 监听器不再被调用）');
+    // ④ 行为级 canary：只在 ①②③ 均干净时跑（不对已判出篡改的插件再触发其监听器代码）
+    if (tampered.length === 0) {
+      const canary = runDefenseCanary();
+      if (canary) tampered.push(canary);
+    }
+  } catch { /* 收尾路径上不得抛 */ }
+  return [...new Set(tampered)];
+}
+
+/**
  * 结构化结果**只输出一次**（正常收尾 / 进程级兜底 两条路径共用）。
  *
- * 为什么用 `writeSync(1, ...)` 而不是 `process.stdout.write`：兜底路径随后立即
+ * 为什么用 `writeSync` 而不是 `process.stdout.write`：兜底路径随后立即
  * `process.exit()`，而 pipe 上的 `process.stdout.write` 是**异步**的——
  * 未 flush 就退出会让报告被截断（「探针未输出结构化结果」再次出现，等于没修）。
+ * 通道选择见 {@link writeResult}（R26：fd3 优先，stdout 仅作回退）。
  *
  * @returns {void}
  */
@@ -159,30 +380,21 @@ let emitted = false;
 function emit() {
   if (emitted) return;
   emitted = true;
-  // H1（复评，**放行级假绿**）收尾自检：插件是否把探针的进程内防线单方面撤销 / 静音了？
+  // H1 / R22 / R28（**放行级假绿**）收尾自检：插件是否把探针的进程内防线单方面撤销 / 静音了？
   // 必须在**写出报告之前**判，否则 GREEN 会被写出去（比 AMBER 更危险：AMBER 至少不放行）。
-  // 判据（两条都查，缺一即被绕过）：
-  //  ① `process.hasUncaughtExceptionCaptureCallback()` —— 插件（或其依赖如 Sentry / APM）
-  //     调过 `setUncaughtExceptionCaptureCallback()` ⇒ 出口② 的监听器**被 Node 停用**，
-  //     插件后台抛错完全不可见、`run()` 仍正常收尾、完成位仍真 ⇒ 整轮假绿；
-  //  ② 两个监听器仍在（`listenerCount`）——插件 `removeAllListeners('uncaughtException')`
-  //     也能摘掉兜底（见 plugin-detach-handlers 夹具）。
+  // 判据 = `checkProcessDefense()` 的**三重**自检（API 台账 + 身份检查 + 行为级 canary）。
+  // ⚠️ 不得退回 `hasUncaughtExceptionCaptureCallback() || listenerCount > 0`：
+  //    插件**用自己的回调顶替**我们的 handler 时，该式恒真（R28 实测假阳性 = 形同虚设）。
   // 只在 `plugin-integration` 相位判：宿主装配段探针自己还没装监听器/还没跑插件，判了会误报。
   // 纪律：本自检**不得抛**（运行在收尾路径上）。
   try {
     if (out.phase === PROBE_PHASE.PLUGIN_INTEGRATION) {
-      const tampered = [];
-      if (typeof process.hasUncaughtExceptionCaptureCallback === 'function' && process.hasUncaughtExceptionCaptureCallback()) {
-        tampered.push('setUncaughtExceptionCaptureCallback（capture callback 存在时 uncaughtException 监听器被停用）');
-      }
-      for (const event of ['uncaughtException', 'unhandledRejection']) {
-        if (process.listenerCount(event) === 0) tampered.push(`process.removeAllListeners('${event}')`);
-      }
+      const tampered = checkProcessDefense();
       if (tampered.length > 0 && !out.checks.some((check) => check.name === PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK)) {
         out.checks.push({
           name: PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
           status: 'fail',
-          detail: `插件撤销/静音了探针的进程级防线（${tampered.join('；')}）——后台抛错将不可见，本轮结果不可信`,
+          detail: `插件撤销/静音/顶替了探针的进程级防线（${tampered.join('；')}）——后台抛错将不可见，本轮结果不可信`,
         });
         out.errors.push(`${PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK}: 探针进程内防线被插件干预（${tampered.join('；')}）`);
       }
@@ -194,12 +406,8 @@ function emit() {
   // （`apply()` 里 process.exit(0) → 剩余检查是 skip 不是 fail → 只看 errors 就 GREEN）。
   out.ok = runCompleted && out.errors.length === 0;
   const payload = `__DSH_PROBE__${JSON.stringify(out)}\n`;
-  try {
-    writeSync(1, payload);
-  } catch {
-    // 极端情形（stdout 已关闭 / 非 fd 环境）退化为异步写——聊胜于无，绝不在此抛。
-    try { process.stdout.write(payload); } catch { /* 静默：崩溃路径上的兜底不得再崩 */ }
-  }
+  // R26：结果走**专用通道**（fd3 优先），stdout 只留日志 ⇒「stdout 里出现结果行」= 篡改证据。
+  writeResult(payload);
 }
 
 /** definitions 不可用时无法验证的检查项（第 9/10/11 段共用，避免两处清单各自漂移）。 */
@@ -590,8 +798,17 @@ function recordProcessEscape(record, label) {
 }
 
 // ---- 出口 ②：进程级异步异常 ----
-process.on('uncaughtException', (error) => recordProcessEscape(recordProbeAsyncException, `uncaughtException：${brief(error, 1200)}`));
-process.on('unhandledRejection', (reason) => recordProcessEscape(recordProbeAsyncException, `unhandledRejection：${brief(reason, 1200)}`));
+// 先 wrap 防线 API（在任何插件代码之前，探针启动即装）→ 插件对 capture API / 监听器的任何
+// 干预都会被**记账**；再挂我们自己的两个 handler 并**登记身份**（收尾身份检查的锚点，R28）。
+wrapProcessDefenseApis();
+defenseHandlers.uncaughtException = (error) => {
+  // 探针自检哨兵**不记账**（否则 canary 自己会变成一条「插件后台抛错」）；Symbol 标记不可伪造。
+  if (isProbeCanary(error)) return;
+  recordProcessEscape(recordProbeAsyncException, `uncaughtException：${brief(error, 1200)}`);
+};
+defenseHandlers.unhandledRejection = (reason) => recordProcessEscape(recordProbeAsyncException, `unhandledRejection：${brief(reason, 1200)}`);
+process.on('uncaughtException', defenseHandlers.uncaughtException);
+process.on('unhandledRejection', defenseHandlers.unhandledRejection);
 
 // ---- 出口 ③：进程 exit（插件调 process.exit() / 自杀式信号） ----
 // 为什么必须有 exit 钩子：`process.exit()` **不抛异常**，上面所有 try/catch 与 uncaughtException

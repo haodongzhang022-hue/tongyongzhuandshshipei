@@ -11,10 +11,10 @@
  * @module dsh-adapt-hub/harness/host
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { PLUGIN_ABNORMAL_TERMINATION_CHECK, PROBE_PHASE, PROBE_PHASE_BEACON_PREFIX, pushHostFatal } from './contract.mjs';
+import { PLUGIN_ABNORMAL_TERMINATION_CHECK, PLUGIN_PROTOCOL_INJECTION_CHECK, PROBE_PHASE, PROBE_PHASE_BEACON_PREFIX, pushHostFatal } from './contract.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -79,6 +79,33 @@ export function pruneHostCache(options = {}) {
     removed.push(entry);
   }
   return { removed, kept };
+}
+
+/**
+ * 探针子进程的执行参数（**唯一事实源**）。
+ *
+ * 抽出来的理由：`killSignal`（R24）与结果通道 fd3（R26）都是**安全相关**的固定取值，
+ * 散落在 `spawnSync(...)` 调用点上就没人守得住（改一行即静默失效，而失效的后果是
+ * 「CI 挂死」或「放行级假绿」）。抽成函数后离线单测可直接断言这两个不变量。
+ *
+ * @param {{hubRoot:string, pluginPath:string, expectedTools:string[], timeoutMs:number}} options 选项
+ * @returns {import('node:child_process').SpawnSyncOptionsWithStringEncoding} spawnSync 选项
+ */
+export function probeSpawnOptions(options) {
+  const { hubRoot, pluginPath, expectedTools, timeoutMs } = options;
+  return {
+    // 探针与其依赖同目录（probe.mjs / contract.mjs 由本模块拷入）
+    cwd: undefined,
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    // R24：不可捕获、不可屏蔽的二次终止。默认 SIGTERM 会被探针自己的出口③ 处理器吞掉
+    // （Node 默认终止行为被禁用）⇒ 插件同步死循环时宿主杀不掉探针（实测 30.3s / 永久挂死）。
+    killSignal: 'SIGKILL',
+    // R26：[stdin, stdout, stderr, fd3]；fd3 = 结构化结果专用通道（探针 `writeSync(3, ...)`）。
+    // 于是「stdout 里出现结果行」本身就是篡改证据（通道隔离）。
+    stdio: ['ignore', 'pipe', 'inherit', 'pipe'],
+    args: ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools)],
+  };
 }
 
 /**
@@ -184,13 +211,30 @@ export function runHostProbe(options) {
     cpSync(path.join(hubRoot, 'src', 'harness', 'probe-template.mjs'), path.join(workDir, 'probe.mjs'));
     cpSync(path.join(hubRoot, 'src', 'harness', 'contract.mjs'), path.join(workDir, 'contract.mjs'));
 
+    // R24（复评）：`execFileSync` 的 timeout 走 `killSignal`（默认 SIGTERM），而探针为出口③
+    // 装了 `SIGTERM` 处理器 ⇒ Node 的默认终止行为被**禁用** ⇒ 插件 `apply()` 同步死循环时
+    // 宿主**杀不掉**探针（实测：timeout=5000 却耗时 30.3s；`while(true)` 形态永久挂死，吃满 CI 额度）。
+    // 修法（一行）：`killSignal: 'SIGKILL'`——不可捕获、不可屏蔽（实测 5011ms 收口，零回归）。
+    // ⚠️ 代价（**显式声明**，见 `docs/RISKS.md` R24）：超时路径**失去优雅报告**——探针没机会写
+    //    结构化结果，只剩相位信标归因（`plugin.abnormal_termination`，插件侧、`hostFatal=0`）。
+    //    正常路径不受影响：探针自己的 `RUN_WATCHDOG_MS`（20s）先于 `timeoutMs`（600s）触发。
+    //
+    // R26（复评）：结果通道**隔离**——探针结构化结果走 **fd3**，stdout 只留日志。
+    // 于是「stdout 里出现结果行」本身就是篡改证据（第二条独立证据链），与「多 marker 判篡改」
+    // 互为补充（修法 B）。`spawnSync` 才拿得到 fd3（`execFileSync` 返回值只有 stdout）。
     let stdout = '';
+    let resultFd = '';
     try {
-      stdout = execFileSync('node', ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools)], {
-        cwd: workDir,
-        encoding: 'utf8',
-        timeout: timeoutMs,
-      });
+      const probeOptions = probeSpawnOptions({ hubRoot, pluginPath, expectedTools, timeoutMs });
+      const probeRun = spawnSync('node', probeOptions.args, { ...probeOptions, cwd: workDir });
+      stdout = `${probeRun.stdout ?? ''}`;
+      resultFd = `${probeRun.output?.[3] ?? ''}`;
+      // 超时（`ETIMEDOUT`）时 `spawnSync` **不抛异常**：它把实况放在 `error` / `signal` 上。
+      // 与旧 `execFileSync` 路径保持同一形状（`probeExit` + 一条 errors 日志），供断言与排障。
+      if (probeRun.error || probeRun.signal) {
+        result.probeExit = { status: probeRun.status ?? null, signal: probeRun.signal ?? null };
+        result.errors.push(`探针非零退出（status=${probeRun.status ?? 'null'}${probeRun.signal ? `, signal=${probeRun.signal}` : ''}${probeRun.error?.code ? `, error=${probeRun.error.code}` : ''}）`);
+      }
     } catch (error) {
       stdout = `${error.stdout ?? ''}`;
       // 注意：措辞里**不得**回显命令行与路径（历史缺陷：路径含 npm 时被归因判据误命中，
@@ -199,7 +243,7 @@ export function runHostProbe(options) {
       result.errors.push(`探针非零退出（status=${error.status ?? 'null'}${error.signal ? `, signal=${error.signal}` : ''}）`);
     }
 
-    interpretProbeStdout(result, stdout);
+    interpretProbeStdout(result, stdout, resultFd);
     return result;
   } catch (error) {
     // 装配阶段兜底：一律宿主/环境侧（探针脚本未产出结构化结果前的失败不可能是插件造成）
@@ -212,13 +256,35 @@ export function runHostProbe(options) {
 }
 
 /**
+ * 收集文本里的**结构化结果行**（`__DSH_PROBE__<json>`），返回全部命中（按出现顺序）。
+ *
+ * 为什么返回**全部**而不是第一条（R26）：旧实现用 `find(startsWith(...))` 取第一条，插件只要在
+ * `apply()` 里先写一条伪造结果就能抢到首位、让真报告被忽略（实测三种形态均判 GREEN 放行）。
+ * 「条数」本身是**结构不变量**：正常探针一次运行恒为 1 条（8 份夹具实测），≥2 条即篡改铁证。
+ *
+ * ⚠️ 命名纪律：相位信标 `__DSH_PROBE_PHASE__` 第 13 个字符是 `P`，而结果标记要求 `_`
+ * ⇒ 本函数**不会**误命中信标行（由 `tests/test_attribution.mjs` [9.9f] 断言）。
+ *
+ * @param {string} text 待扫描文本（stdout 或结果通道 fd3）
+ * @returns {string[]} 命中的结果行（原样，含前缀）
+ */
+export function collectProbeResultLines(text) {
+  return String(text ?? '')
+    .split('\n')
+    .filter((line) => line.startsWith('__DSH_PROBE__'));
+}
+
+/**
  * 把探针的 stdout **解释**进 `result`（纯函数，装配器与离线回归共用同一份）。
  *
  * 抽出来的理由：这段逻辑是本中台最容易「静默判错」的地方（判据字段 `hostFatal[]` 的写入端），
  * 而它原先只被真宿主 E2E 覆盖（慢、要网）。抽成纯函数后，离线回归可以用**真实探针输出**
  * （含 SIGKILL 这类不可捕获终止的产物）直接断言归因，不必等 CI 装宿主。
  *
- * 三种情形：
+ * 情形（**协议注入防线最优先**）：
+ * 0. **结果通道被篡改**（R26，放行级假绿）→ 结果行 ≥2 条，或结果走 fd3 而 stdout 里也出现结果行
+ *    → 落插件侧 check `plugin.protocol_injection`、`runCompleted=false`、`ok=false`、
+ *    `hostFatal[]` 为空。**不再**采信任何一条（`find(first)` 只作末位兼容，且只在多 marker 判完之后）。
  * 1. 有结构化结果 → 原样透传 `checks` / `hostFatal` / `phase` / `runCompleted`；
  *    `ok` 必须**同时**要求「跑完」（完成位）与「无失败」（🔴 必修-1）。
  * 2. 无结构化结果 + **有相位信标** → 不可捕获终止（SIGKILL / OOM）发生在**插件集成**相位
@@ -226,12 +292,44 @@ export function runHostProbe(options) {
  * 3. 无结构化结果 + 无信标 → 终止在宿主装配段 → `hostFatal[]`（真上游信号，不丢）。
  *
  * @param {object} result 装配器结果对象（就地写入）
- * @param {string} stdout 探针 stdout
+ * @param {string} stdout 探针 stdout（**只应含日志**；出现结果行即篡改证据）
+ * @param {string} [resultFd] 探针结构化结果通道（fd3）；为空时回退从 `stdout` 取（兼容直接跑探针）
  * @returns {object} 同一个 result（便于链式使用）
  */
-export function interpretProbeStdout(result, stdout) {
+export function interpretProbeStdout(result, stdout, resultFd = '') {
   const text = String(stdout ?? '');
-  const marker = text.split('\n').find((line) => line.startsWith('__DSH_PROBE__'));
+  const channelText = String(resultFd ?? '');
+  const channelMarkers = collectProbeResultLines(channelText);
+  const stdoutMarkers = collectProbeResultLines(text);
+  // 通道隔离（R26 修法 B）：结构化结果**只**认 fd3。fd3 不可用（离线回归台 / 直接跑探针 /
+  // 老装配器）时回退 stdout——此时 2 参调用行为与 v0.1.9c 完全一致（旧断言不破）。
+  const isolated = channelText.trim().length > 0;
+  const markers = isolated ? channelMarkers : stdoutMarkers;
+  const marker = markers.length > 0 ? markers[0] : null;
+  // ---- R26 协议注入防线（放行级假绿）----
+  // 结构不变量：正常探针一次运行**恒为 1 条**结果行。≥2 条即铁证是篡改（无需知道谁写的）；
+  // 通道隔离生效后，「stdout 里出现结果行」同样是铁证（探针的结果**只**走 fd3）。
+  const injectionEvidence = [];
+  if (markers.length > 1) injectionEvidence.push(`结果通道出现 ${markers.length} 条结果行（正常恒为 1 条）`);
+  if (isolated && stdoutMarkers.length > 0) {
+    injectionEvidence.push(`结果走独立 fd3，但 stdout 里出现 ${stdoutMarkers.length} 条结果行（探针只写 fd3）`);
+  }
+  if (injectionEvidence.length > 0) {
+    result.runCompleted = false;
+    result.checks = [];
+    result.errors = [];
+    result.hostFatal = [];
+    result.checks.push({
+      name: PLUGIN_PROTOCOL_INJECTION_CHECK,
+      status: 'fail',
+      detail: `探针结果通道被插件注入/篡改（${injectionEvidence.join('；')}）——真报告可能被伪造结果顶替，本轮结果不可信`,
+    });
+    result.errors.push(`${PLUGIN_PROTOCOL_INJECTION_CHECK}: 结果通道被插件篡改（${injectionEvidence.join('；')}）`);
+    // 末位兼容（契约要求）：多 marker 时**先判篡改**，不再用 `find(first)` 采信任何一条。
+    result.phase = PROBE_PHASE.PLUGIN_INTEGRATION;
+    result.ok = false;
+    return result;
+  }
   if (!marker) {
     // 探针没写出结构化结果 = 它被**不可捕获**地终止了（SIGKILL / OOM / 原生 abort）
     // ——可捕获的四条出口（同步 / 异步 / 进程 exit / run() 被拖住）都由探针自己闭合，

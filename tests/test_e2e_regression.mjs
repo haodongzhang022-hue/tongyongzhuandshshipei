@@ -46,9 +46,10 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, write
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { channelFingerprint, loadChannels } from '../src/harness/host.mjs';
+import { channelFingerprint, loadChannels, runHostProbe } from '../src/harness/host.mjs';
 // P2-8：插件侧 check 名单**从唯一事实源 import**（此前硬编码 12 项，表一改测试就不设防）
 import { PLUGIN_SIDE_CHECKS } from '../src/harness/contract.mjs';
+import { attributeFailure } from '../src/verify/runner.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -356,6 +357,79 @@ try {
       exitChecks.some((c) => c.status === 'fail'));
     eq('🔴 假绿反证：进程 exit 夹具的 skip 项 > 0（未跑到的检查被如实标注，不是凭空消失）', true,
       exitChecks.some((c) => c.status === 'skip'));
+  }
+
+  // ---- 11d. v0.1.9d 新增：R28 防线被顶替 / R26 协议注入（真宿主） ----
+  // 为什么必须真宿主也跑：这两条的判据分别在**探针收尾自检**（R28）与**装配器解释输出**（R26）里，
+  // 而离线回归台用的是假宿主 + 同一个装配器实现——真宿主能覆盖「真 ToolRuntime 装配下的时机差异」
+  // （例如插件依赖在 import 期就动了 process 监听器）。两条都是**放行级假绿**，必须双跑。
+  console.log('  [8d] v0.1.9d：R28 防线被顶替 / R26 协议注入（真宿主，放行级假绿收口）');
+  for (const [label, fixture, expectedCheck, expectedCompleted] of [
+    ['R28 防线被顶替（摘掉探针兜底 + 装自己的）', 'plugin-defense-tamper-plugin.mjs', 'plugin.process_defense_tampered', true],
+    ['R26 协议注入（伪造 17 项全绿 + 真缺陷 + 压回退出码）', 'plugin-protocol-injection-plugin.mjs', 'plugin.protocol_injection', false],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    const checks = report.checks ?? [];
+    const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，**绝不放行**）`, 'RED', report.summary?.verdict);
+    eq(`${label}（失败项含 ${expectedCheck}）`, true, failed.includes(expectedCheck));
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    eq(`${label}（完成位 runCompleted=${expectedCompleted}）`, expectedCompleted, report.runCompleted);
+    eq(`${label}（ok 不得为真——假绿防线）`, false, report.ok === true);
+    // R26 的关键性质：伪造的 17 项**不得**进入报告（否则报告在说谎）
+    if (expectedCheck === 'plugin.protocol_injection') {
+      eq(`${label}（伪造的 17 项未进入报告：checks 只有篡改证据这一条）`, 1, checks.length);
+      eq(`${label}（篡改后不采信任何一条结果 ⇒ 不得判 PASS）`, true, report.attribution !== 'PASS');
+    }
+    // R28 的关键性质：探针**确实跑完了**（它只是不知道防线被顶替）⇒ 完成位仍真、pass 项保留
+    if (expectedCheck === 'plugin.process_defense_tampered') {
+      eq(`${label}（探针确实跑完 ⇒ 已跑完的 pass 项保留）`, true, checks.some((c) => c.status === 'pass'));
+    }
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+  }
+
+  // ---- 11e. R24：同步死循环 → 宿主**二次终止**（真宿主 + 有界 timeout） ----
+  // 为什么单列（评审复评 R24）：默认 `timeoutMs=600s` 下 3s 同步循环会正常跑完（那本身不是缺陷），
+  // 本形态只在**有界 timeout** 下成立 ⇒ 用 `runHostProbe({ timeoutMs: 1000 })` 直接断言：
+  // 收口时间、`probeExit.signal`、归因落点、`hostFatal` 为空。
+  console.log('  [8e] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');
+  {
+    const registry = loadChannels(ROOT);
+    const started = Date.now();
+    const probe = runHostProbe({
+      channelName: CHANNEL,
+      channel: registry.channels[CHANNEL],
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-sync-loop-plugin.mjs'),
+      expectedTools: ['demo_echo'],
+      hubRoot: ROOT,
+      timeoutMs: 1000,
+    });
+    const elapsed = Date.now() - started;
+    const failed = (probe.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('R24（真宿主）：probeExit.signal = SIGKILL（SIGTERM 会被探针出口③ 处理器吞掉）', 'SIGKILL', probe.probeExit?.signal ?? null);
+    eq('R24（真宿主）：收口时间 < timeoutMs × 3（不得挂死 / 不得吃满额度）', true, elapsed < 1000 * 3);
+    eq('R24（真宿主）：落插件侧 plugin.abnormal_termination（相位信标）', true,
+      failed.includes('plugin.abnormal_termination'));
+    eq('R24（真宿主）：hostFatal 为空（有信标 ⇒ 不甩锅上游）', 0, (probe.hostFatal ?? []).length);
+    eq('R24（真宿主）：完成位 false（未跑完不得判通过）', false, probe.runCompleted);
+    eq('R24（真宿主）：归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
+      attributeFailure(probe, registry.channels[CHANNEL], CHANNEL));
+    // 反向护栏：同一 timeoutMs 下健康插件仍 17/17（防「把 timeout 调小」式过度修正）
+    const healthy = runHostProbe({
+      channelName: CHANNEL,
+      channel: registry.channels[CHANNEL],
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'),
+      expectedTools: ['demo_echo', 'demo_status'],
+      hubRoot: ROOT,
+      timeoutMs: 1000,
+    });
+    eq('R24 反向护栏（真宿主）：同一 timeoutMs 下健康插件仍 17/17 全绿', 17,
+      (healthy.checks ?? []).filter((c) => c.status === 'pass').length);
+    eq('R24 反向护栏（真宿主）：健康插件 hostFatal 为空 + 跑完', '0|true',
+      `${(healthy.hostFatal ?? []).length}|${healthy.runCompleted}`);
   }
 
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----

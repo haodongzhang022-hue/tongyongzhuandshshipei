@@ -37,6 +37,7 @@ import {
   PLUGIN_HARD_EVIDENCE,
   PLUGIN_PROBE_EXCEPTION_CHECK,
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
+  PLUGIN_PROTOCOL_INJECTION_CHECK,
   PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_SIDE_CHECKS,
   PLUGIN_SKIP_ON_PRECONDITION,
@@ -55,7 +56,9 @@ import {
 } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
-import { channelFingerprint, interpretProbeStdout, loadChannels, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
+import { channelFingerprint, collectProbeResultLines, interpretProbeStdout, loadChannels, probeSpawnOptions, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
+// R24/R28 的**行为级**断言（同步死循环收口）用离线探针回归台：假宿主 + 真实探针 + 真实装配器实现
+import { runOfflineProbe } from './offline-probe-harness.mjs';
 // 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
 import { codeOnly, stripComments } from './source-scan.mjs';
 import { DRIFT_FIELDS, DRIFT_IMPACT, classifyDrift, diffReservedNames, triageUpstream } from '../src/triage/index.mjs';
@@ -621,10 +624,10 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
   {
     // 变异：在**兜底区**（`// ---- 进程级兜底` 段）内插入一行裸 `pushHostFatal`。
     // 锚点取该段内的第一条语句（`process.on('uncaughtException'` 钩子），与实现细节解耦。
-    const mutated = probeSrc.replace(
-      "process.on('uncaughtException'",
-      'pushHostFatal(out, "变异注入");\nprocess.on(\'uncaughtException\'',
-    );
+    // 锚点用**兜底区标记自身**（v0.1.9d）：此前锚在 `process.on('uncaughtException'` 的**首现位置**，
+    // 而 v0.1.9d 在探针前段新增了 `runDefenseCanary()`（内部也注册 `process.on('uncaughtException', canary)`）
+    // ⇒ 变异被插到**兜底区之外**，反证自己失效（守卫的锚点必须与实现解耦，否则实现一动就空转）。
+    const mutated = probeSrc.replace(fallbackMarker, `${fallbackMarker}\npushHostFatal(out, "变异注入");`);
     const oldSlice = codeOnly(mutated.slice(mutated.lastIndexOf('try {\n  await run();')));
     const newSlice = codeOnly(mutated.slice(mutated.indexOf(fallbackMarker)));
     eq('🟡-3 反证：旧切片（自顶层 catch 起切）漏检兜底区内的 pushHostFatal', false, /\bpushHostFatal\b/.test(oldSlice));
@@ -655,9 +658,13 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
     /process\.on\('unhandledRejection'/.test(probeSrc));
   // v0.1.9：写入端统一收敛到 recordProcessEscape() 包装（三条出口共用同一条收尾路径），
   // 故这里断言的是「两个处理器都经统一入口走到 recordProbeAsyncException」，而不是旧的字面调用式。
+  // v0.1.9d 结构：两个 handler 先赋给 `defenseHandlers`（**身份检查**的锚点，R28），再注册；
+  // 断言两处都走统一入口 `recordProcessEscape(recordProbeAsyncException)`（不直接 pushHostFatal）。
   eq('🔴-D：两个处理器都经统一入口走 recordProbeAsyncException（按相位归因，不直接 pushHostFatal）', true,
-    /process\.on\('uncaughtException'[^\n]*recordProcessEscape\(recordProbeAsyncException/.test(probeSrc)
-    && /process\.on\('unhandledRejection'[^\n]*recordProcessEscape\(recordProbeAsyncException/.test(probeSrc));
+    /defenseHandlers\.uncaughtException = [\s\S]{0,200}recordProcessEscape\(recordProbeAsyncException/.test(probeSrc)
+    && /defenseHandlers\.unhandledRejection = [\s\S]{0,200}recordProcessEscape\(recordProbeAsyncException/.test(probeSrc)
+    && /process\.on\('uncaughtException', defenseHandlers\.uncaughtException\)/.test(probeSrc)
+    && /process\.on\('unhandledRejection', defenseHandlers\.unhandledRejection\)/.test(probeSrc));
   // 结构化结果必须用 writeSync 落盘：兜底后立即 process.exit()，异步 stdout 会被截断
   // （截断 = 装配器又看到「探针未输出结构化结果」= 等于没修）
   eq('🔴-D：结构化结果用 writeSync 输出（防 exit 截断 stdout → 报告整份消失）', true,
@@ -673,8 +680,10 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
   // 删掉自检、或只查 capture callback 不查监听器计数（两个都能被单方面绕过）→ 即红。
   eq('H1 源码守卫：收尾自检 capture callback（独占 API 被插件抢占 → 监听器被停用）', true,
     /hasUncaughtExceptionCaptureCallback/.test(probeSrc));
-  eq('H1 源码守卫：收尾自检两个监听器仍在（removeAllListeners 也能摘掉兜底）', true,
-    /for \(const event of \['uncaughtException', 'unhandledRejection'\]\)[\s\S]{0,200}listenerCount\(event\)/.test(probeSrc));
+  // R28 收口：判据从「计数」升级为「**身份检查**」——数个数挡不住「插件用自己的回调顶替我们的」
+  // （实测：插件顶替后 `listenerCount === 1`、`has() === true`，计数判据恒判「防线有效」= 假阳性）。
+  eq('H1/R28 源码守卫：收尾自检做**身份检查**（我们的 handler 仍在 process.listeners() 内）', true,
+    /for \(const event of \['uncaughtException', 'unhandledRejection'\]\)[\s\S]{0,400}process\.listeners\(event\)\.includes\(handler\)/.test(probeSrc));
   eq('H1 源码守卫：自检在 emit() 内、且在 `out.ok` 判定**之前**（否则 GREEN 会被写出去）', true,
     (() => {
       const body = probeSrc.slice(probeSrc.indexOf('function emit()'), probeSrc.indexOf('/** definitions 不可用时'));
@@ -683,7 +692,10 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
       return tamper > 0 && okAssign > tamper;
     })());
   eq('H1 源码守卫：自检只在插件集成相位判（宿主装配段判会误报）', true,
-    /out\.phase === PROBE_PHASE\.PLUGIN_INTEGRATION[\s\S]{0,400}hasUncaughtExceptionCaptureCallback/.test(probeSrc));
+    /out\.phase === PROBE_PHASE\.PLUGIN_INTEGRATION[\s\S]{0,400}checkProcessDefense\(\)/.test(probeSrc));
+  // 独占 API 作为**独立**篡改信号（不得与计数做 `||`——那正是 R28 的假阳性写法）
+  eq('H1/R28 源码守卫：独占 API 作为独立篡改信号（不与计数做 ||）', true,
+    /hasUncaughtExceptionCaptureCallback\(\) === true/.test(probeSrc));
   eq('H1：落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
     PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK));
   // 夹具自检：H1 夹具必须真的**抢占独占 API**（否则离线/E2E/闸门断言空转）
@@ -983,6 +995,180 @@ console.log('  [9.9] 🔴 四条出口 + 完成位（进程 exit / run() 被拖�
   }
 }
 
+// ---- 9.10. R28：防线自检**不得**退回「has() || listenerCount>0」（实测假阳性） ----
+// 为什么单列一段（评审复评 R28）：R22 的修法 A 写的自检判据
+// `hasUncaughtExceptionCaptureCallback() || listenerCount('uncaughtException') > 0` **不可判定**——
+// 插件把我们的 handler 换成**自己的**之后：has=true、count=1 ⇒ 该式恒真 ⇒ 判「防线有效」（假阳性），
+// 而实际上探针的兜底已经被顶替（后台抛错被插件 handler 吞掉）。本段把「为什么必须换判据」写成断言。
+console.log('  [9.10] R28 防线自检判据（身份检查 + 行为级 canary；计数判据已证假阳性）');
+{
+  const defenseSrc = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+  // 1. 判据不得是 `has(...) || listenerCount(...)` 这类**或**式内省判据
+  eq('R28 源码守卫：自检判据不得写成 has() || listenerCount>0（假阳性写法，回退即红）', false,
+    /hasUncaughtExceptionCaptureCallback\(\)\s*\|\|/.test(codeOnly(defenseSrc))
+    || /listenerCount\('?\w+\'?\)\s*>\s*0\s*\|\|/.test(codeOnly(defenseSrc)));
+  // 2. 三重判据必须齐备
+  eq('R28 源码守卫：① API 调用台账（wrap 记账）', true,
+    /wrapProcessDefenseApis\(\)/.test(defenseSrc) && /defenseApiCalls\.push\(note\)/.test(defenseSrc));
+  eq('R28 源码守卫：② 身份检查（我们的 handler 仍在 process.listeners() 内）', true,
+    /process\.listeners\(event\)\.includes\(handler\)/.test(defenseSrc));
+  eq('R28 源码守卫：③ 行为级 canary 走真实派发路径（process._fatalException）', true,
+    /process\._fatalException/.test(defenseSrc) && /runDefenseCanary\(\)/.test(defenseSrc));
+  eq('R28 源码守卫：canary 哨兵用 Symbol 标记（不可从外部伪造 ⇒ 插件无法据此静音自己）', true,
+    /Symbol\('dsh-probe-defense-canary'\)/.test(defenseSrc) && /isProbeCanary\(error\)/.test(defenseSrc));
+  // 3. wrap 必须在**任何插件代码之前**（探针启动即装）：位于兜底区，且早于相位切到 plugin-integration
+  {
+    // 锚点用 `await run();`（探针**唯一**的插件代码入口）：wrap 必须在它之前**模块级**执行。
+    // 不用 `phase = PROBE_PHASE.PLUGIN_INTEGRATION;` 做锚：那句在 `run()` **函数体内**，
+    // 文本位置在 wrap 之前，但**执行**在 wrap 之后——用文本序判会把正确实现判红（守卫自己空转/误报）。
+    const wrapIdx = defenseSrc.indexOf('wrapProcessDefenseApis();');
+    const runCallIdx = defenseSrc.indexOf('await run();');
+    eq('R28 源码守卫：wrap 在插件代码运行之前安装（早于唯一入口 `await run()`）', true,
+      wrapIdx > 0 && runCallIdx > 0 && wrapIdx < runCallIdx);
+  }
+  // 4. 行为级反证：计数判据确实判不出「被顶替」（把「为什么必须换」写成断言）
+  {
+    const log = [];
+    const mine = () => log.push('mine');
+    process.on('uncaughtException', mine);
+    process.removeListener('uncaughtException', mine);
+    process.on('uncaughtException', () => log.push('plugin'));
+    eq('R28 反证：插件顶替后 listenerCount 仍为 1（计数判据看不出防线已被顶替）', 1,
+      process.listenerCount('uncaughtException'));
+    eq('R28 反证：身份检查能看出我们的 handler 已不在 listeners 内', false,
+      process.listeners('uncaughtException').includes(mine));
+    process.removeAllListeners('uncaughtException');
+  }
+  // 5. 夹具自检：新夹具必须真的复现「摘掉 + 装自己的」（计数不为 0，旧判据假阳性）
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-defense-tamper-plugin.mjs'), 'utf8');
+    eq('R28 夹具：先摘掉探针兜底（removeAllListeners）', true, /process\.removeAllListeners\('uncaughtException'\)/.test(src));
+    eq('R28 夹具：再装**自己的** handler（计数不为 0 ⇒ 计数判据假阳性）', true,
+      /process\.on\('uncaughtException', \(\) =>/.test(src));
+    eq('R28 夹具：后台抛错（被自己的 handler 吞掉）', true, /setTimeout\([\s\S]{0,200}throw new Error/.test(src));
+    eq('R28 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+    eq('R28 夹具：声明期望的工具清单（供闸门/回归取用）', true, /export const expectedTools = \['demo_echo'\]/.test(src));
+  }
+}
+
+// ---- 9.11. R26：协议注入防线（多 marker 判篡改 + 结果通道隔离） ----
+// 为什么单列（评审复评 R26，**放行级假绿**）：装配器原先 `find(startsWith('__DSH_PROBE__'))` 取**第一条**，
+// 插件在 `apply()` 里写一条伪造结果即抢首位（真报告被忽略）；实测三种形态在真宿主下均判 GREEN 放行。
+// 本段把两条修法（A 结构不变量 / B 通道隔离）都钉住，并给出**反向护栏**（正常路径恒 1 条不得误判）。
+console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）');
+{
+  const okProbe = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly', runCompleted: false };
+  const forged = `__DSH_PROBE__${JSON.stringify({ checks: [], errors: [], hostFatal: [], ok: true, runCompleted: true })}`;
+
+  // 9.11a 多 marker 即篡改（修法 A）：正常路径恒 1 条，≥2 条是**结构铁证**
+  {
+    const r = { ...okProbe, checks: [], errors: [], hostFatal: [] };
+    interpretProbeStdout(r, `${forged}\n${forged}\n`);
+    eq('R26-A：结果行 ≥2 条 → 落插件侧 check plugin.protocol_injection', PLUGIN_PROTOCOL_INJECTION_CHECK, r.checks[0]?.name);
+    eq('R26-A：≥2 条 → hostFatal 为空（不甩锅上游）', 0, r.hostFatal.length);
+    eq('R26-A：≥2 条 → 完成位 false（不放行）', false, r.runCompleted);
+    eq('R26-A：≥2 条 → ok=false（不判通过）', false, r.ok);
+    eq('R26-A：≥2 条 → 归因 PLUGIN_REGRESSION（不放行）', 'PLUGIN_REGRESSION',
+      attributeFailure(r, channel, 'dev'));
+    eq('R26-A：≥2 条 → **不采信任何一条**（checks 只留这一条篡改证据，伪造的 17 项不入报告）', 1, r.checks.length);
+  }
+
+  // 9.11b 通道隔离（修法 B）：结果走 fd3 时，stdout 里出现结果行 = 篡改证据
+  {
+    const real = `__DSH_PROBE__${JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true })}`;
+    const r = { ...okProbe, checks: [], errors: [], hostFatal: [] };
+    interpretProbeStdout(r, `${forged}\n`, real);
+    eq('R26-B：结果走 fd3 而 stdout 里也出现结果行 → 判篡改', PLUGIN_PROTOCOL_INJECTION_CHECK, r.checks[0]?.name);
+    eq('R26-B：判篡改后不采信 fd3 里的真报告（本轮结果不可信）', false, r.ok);
+  }
+  {
+    // 正向：正常路径（fd3 只有 1 条、stdout 只有日志）必须**不**误判（防过度修正）
+    const real = `__DSH_PROBE__${JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true })}`;
+    const r = { ...okProbe, checks: [], errors: [], hostFatal: [] };
+    interpretProbeStdout(r, '__DSH_PROBE_PHASE__plugin-integration\n日志行\n', real);
+    eq('R26-B 反向护栏：正常路径（fd3 1 条 / stdout 只有日志）不误判篡改', 'host.tools_ready', r.checks[0]?.name);
+    eq('R26-B 反向护栏：正常路径 ok=true（不因新增防线而误伤）', true, r.ok);
+  }
+
+  // 9.11c 向后兼容：fd3 不可用时回退 stdout，2 参调用行为与 v0.1.9c 一致（旧断言不破）
+  {
+    const r = { ...okProbe, checks: [], errors: [], hostFatal: [] };
+    interpretProbeStdout(r, `${forged}\n`);
+    eq('R26 兼容：fd3 缺省（2 参调用）时从 stdout 取结果（老装配器/直接跑探针）', true, r.ok);
+    eq('R26 兼容：单条结果不判篡改（回退路径的正常形态）', 0, r.checks.length);
+  }
+
+  // 9.11d 相位信标不得被误当结果行（命名纪律）
+  eq('R26：相位信标不被 collectProbeResultLines 命中（第 13 字符错开）', 0,
+    collectProbeResultLines(`${PROBE_PHASE_BEACON_PREFIX}${PROBE_PHASE.PLUGIN_INTEGRATION}\n`).length);
+  eq('R26：collectProbeResultLines 返回**全部**命中（≥2 条即篡改铁证）', 2,
+    collectProbeResultLines(`${forged}\n${forged}\n`).length);
+
+  // 9.11e 宿主侧不变量：探针 spawn 参数必须带 killSignal:SIGKILL（R24）+ fd3 通道（R26-B）
+  {
+    const opts = probeSpawnOptions({ hubRoot: ROOT, pluginPath: '/tmp/p.mjs', expectedTools: ['a'], timeoutMs: 1000 });
+    eq('R24 源码守卫：探针 spawn 带 killSignal:SIGKILL（默认 SIGTERM 会被探针出口③ 处理器吞掉）', 'SIGKILL', opts.killSignal);
+    eq('R26-B 源码守卫：探针 spawn 开 fd3（stdio 第 4 位为 pipe）', 'pipe', opts.stdio?.[3]);
+    eq('R26-B 源码守卫：stdout 仍为 pipe（只留日志；出现结果行即篡改证据）', 'pipe', opts.stdio?.[1]);
+    eq('R24 源码守卫：timeout 语义 = 探针硬上限（原样透传）', 1000, opts.timeout);
+  }
+  eq('R26：落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
+    PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+  eq('R26：落点 check 已登记进 CONDITIONAL_PROBE_CHECKS（条件项计数随之 +1）', true,
+    CONDITIONAL_PROBE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+
+  // 9.11f 夹具自检：注入夹具必须真的**不注册工具 + 伪造全绿 + 压回退出码**
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-protocol-injection-plugin.mjs'), 'utf8');
+    eq('R26 夹具：真的向结果通道写伪造结果（writeSync + __DSH_PROBE__）', true,
+      /writeSync\(1, `__DSH_PROBE__/.test(src));
+    eq('R26 夹具：伪造的是「17 项全绿」报告（否则篡改无收益）', true, /runCompleted: true/.test(src) && /ok: true/.test(src));
+    eq('R26 夹具：真缺陷 = 不注册工具（registry.exact 本应 fail）', true, /不\*\*注册任何工具|不\*\*注册/.test(src));
+    eq('R26 夹具：压回退出码（让退出码兜底也失效）', true, /process\.on\('exit', \(\) => \{ try \{ process\.exitCode = 0;/.test(src));
+    eq('R26 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+  }
+}
+
+// ---- 9.12. R24：同步死循环 → 宿主二次终止（killSignal 语义 + 收口时间） ----
+// 为什么单列（评审复评 R24）：探针的看门狗 / 信号处理器都是事件循环上的回调，插件 `apply()`
+// 同步占满事件循环后两者都不执行；而探针为出口③ 装了 SIGTERM 处理器 ⇒ Node 默认终止行为被禁用
+// ⇒ 宿主杀不掉探针（实测 30.3s / 永久挂死）。本段在**离线**把 killSignal 语义钉住（真宿主闸门另有断言）。
+console.log('  [9.12] R24 同步死循环（宿主二次终止 + 相位信标归因）');
+{
+  const t = Date.now();
+  const { result, attribution, exit } = runOfflineProbe({
+    pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-sync-loop-plugin.mjs'),
+    expectedTools: ['demo_echo'],
+    timeoutMs: 1500,
+  });
+  const elapsed = Date.now() - t;
+  eq('R24：同步死循环被宿主二次终止（probeExit.signal=SIGKILL）', 'SIGKILL', exit.signal);
+  eq('R24：收口时间 < timeoutMs × 3（不得挂死 / 不得吃满额度）', true, elapsed < 1500 * 3);
+  eq('R24：按相位信标归因插件侧（plugin.abnormal_termination）', PLUGIN_ABNORMAL_TERMINATION_CHECK,
+    result.checks[0]?.name);
+  eq('R24：归因 PLUGIN_REGRESSION（有信标 ⇒ 不判 UPSTREAM_DRIFT，不甩锅上游）', 'PLUGIN_REGRESSION', attribution);
+  eq('R24：hostFatal 为空（插件侧）', 0, result.hostFatal.length);
+  eq('R24：完成位 false（未跑完，不得判通过）', false, result.runCompleted);
+  // 夹具自检：循环时长必须**短**（3s 级），否则 CI 会被吃满
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-sync-loop-plugin.mjs'), 'utf8');
+    eq('R24 夹具：同步循环在 apply() 内（占满事件循环）', true, /Date\.now\(\) \+ 3000/.test(src));
+    eq('R24 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+  }
+  // 反向护栏：健康插件在同一参数下必须仍 17/17（防「把 timeout 调小」式过度修正）
+  {
+    const healthy = runOfflineProbe({
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'),
+      expectedTools: ['demo_echo', 'demo_status'],
+      timeoutMs: 1500,
+    });
+    eq('R24 反向护栏：同一 timeoutMs 下健康插件仍 17/17 全绿', 17,
+      healthy.result.checks.filter((c) => c.status === 'pass').length);
+    eq('R24 反向护栏：健康插件不被新防线误伤（hostFatal 为空 + 跑完）', '0|true',
+      `${healthy.result.hostFatal.length}|${healthy.result.runCompleted}`);
+  }
+}
+
 // ---- 10. P2-10：判据源码守卫加固（别名绕过也拦得住，且不误报注释/文案） ----
 console.log('  [10] P2-10 判据源码守卫加固（别名绕过也拦得住）');
 {
@@ -1037,27 +1223,108 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
 {
   // 允许的**收窄口径**关键词：出现它即视为已收窄（本守卫只拦绝对化措辞）。
   const NARROW = '防线未被插件干预';
-  // 绝对口径写法：`插件侧…永远/永不…hostFatal`（同句内），且**不含**收窄前提。
-  const ABSOLUTE = /插件侧[^。；\n]{0,40}(永远|永不)[^。；\n]{0,40}hostFatal/;
+  /**
+   * 绝对口径命题（**R27 扩条**）。
+   *
+   * 为什么必须扩：旧守卫只守「插件侧错误…永远/永不…hostFatal」这**一个**命题，
+   * 而 H1/R26/R28 推翻的其实是**另一条**——「插件侧一律落 check」这条**完整性主张**
+   * （H1：captureCallback 静音后插件侧错误**不再**落 check；R26：结果通道被注入）。
+   * 只守前者 ⇒ 后者可以随便写，而它才是被实证推翻的那条。
+   *
+   * 同义词组：`永远|永不|绝不|决不|从不|一律不` 与 `一律|都|必然|一定`；
+   * 主谓倒置（`hostFatal[] 里永远不会有插件侧错误`）与英文（`Plugin-side errors never enter hostFatal[]`）
+   * 也必须覆盖——否则「换个说法」就绕过（评审实测的 ④⑤ 两形态）。
+   */
+  const ABSOLUTE_PROPS = [
+    // ① 插件侧错误/异常/信号…（绝对副词）…hostFatal
+    /插件侧(错误|异常|信号|失败)[^。；]{0,40}(永远|永不|绝不|决不|从不|一律不)[^。；]{0,40}hostFatal/,
+    // ② 插件侧…（一律/都/必然/一定）…落/进/写…check（完整性主张：H1 真正推翻的那条）
+    /插件侧[^。；]{0,30}(一律|都|必然|一定)[^。；]{0,20}(落|进|写)[^。；]{0,12}check/,
+    // ③ 主谓倒置：hostFatal[] …（绝对副词）…插件侧
+    /hostFatal[^。；]{0,40}(永远|永不|绝不|决不|从不)[^。；]{0,40}插件侧/,
+    // ④ 英文
+    /Plugin-side\s+(errors?|failures?)[^.\n]{0,60}never[^.\n]{0,40}hostFatal/i,
+  ];
+  /**
+   * 绝对口径判定：命中断言 **且** 所在**段落**（空行分隔）不含收窄前提。
+   *
+   * ⚠️ R27 的两处加固（相对 v0.1.9c 的旧守卫）：
+   * 1. **去豁免词**：旧守卫把「收窄前提」与「豁免词」写成 `||` 关系 ⇒ 只要句子里有「不得」就放行，
+   *    于是 `插件侧错误永远不进 hostFatal[]（不得有例外）` 这种**同义绕过**骗过守卫
+   *    ——**正是它要防的东西**。现在只认**同段出现收窄前提**。
+   * 2. **同段而非逐行**：旧守卫逐行判（正则 `[^。；\n]` 限死单行）⇒ 前提写在上一行、主张写在
+   *    下一行就漏（`docs/ADAPTER_GUIDE.md` 实测形态）。现在按**空行分隔的段落**判，且段落内
+   *    换行归一为空格（跨行主张同样命中）。
+   *
+   * @param {string} source 待判文本（源码 / 文档 / 闸门脚本）
+   * @returns {string[]} 违规段落里的人读摘要（空数组 = 无绝对口径）
+   */
+  // 收窄前提 / 措辞纠正的**判定词**（R27：`不得` 这类**单独豁免词已取消**——
+  // 旧守卫把豁免词与前提写成 `||`，于是「…永远不进 hostFatal[]（**不得**有例外）」能骗过守卫，
+  // **正是它要防的东西**）。现在只认两类：
+  // ① 明确写出收窄前提（`防线未被插件干预` / `口径前提` / `收窄前提`）；
+  // ② 明确**纠正措辞本身**（`不得宣称…` / `不得再写…` / `不成立` / `已作废` / `推翻` / `口径收窄` / `准确口径`）。
+  // 二者都**不可能**被用来加强一个绝对主张（`（不得有例外）` 不在其中 ⇒ 仍判违规）。
+  const NARROW_TOKENS = [
+    NARROW, '口径前提', '收窄前提',
+    '不得宣称', '不得再写', '不成立', '已作废', '推翻', '口径收窄', '准确口径',
+  ];
+  /**
+   * 把文本切成**段落**（空行与空注释行均为分隔符）。
+   *
+   * 为什么不用「按空行切」：源码里的 JSDoc 是**连续**的 ` *` 行，中间的空行写作
+   * ` *`（不是真正的空行）⇒ 整块文件头会变成一个巨型「段落」，断言退化成「整文件含不含」，
+   * 既误报又失去定位力。按「空注释行」切分后，段落 = 文档意义上的**小节**。
+   *
+   * @param {string} source 待切文本
+   * @returns {string[]} 段落（换行归一为空格）
+   */
+  const paragraphsOf = (source) => {
+    const out = [];
+    let cur = [];
+    for (const line of String(source).split('\n')) {
+      const trimmed = line.trim();
+      // Markdown **表格行**也是段落边界：RISKS 的大表整块不含空行，若不按行切，
+      // 「整表一个段落」⇒ 断言退化成「整文件含不含绝对口径」（任一格命中即整表判违规，无定位力）。
+      const isSeparator = trimmed === '' || trimmed === '*' || trimmed === '*/' || trimmed === '/**'
+        || (trimmed.startsWith('|') && cur.length > 0);
+      if (isSeparator) {
+        if (cur.length > 0) { out.push(cur.join(' ')); cur = []; }
+        continue;
+      }
+      if (trimmed.startsWith('|') && cur.length > 0) { out.push(cur.join(' ')); cur = []; }
+      cur.push(trimmed.replace(/^\*\s?/, ''));
+    }
+    if (cur.length > 0) out.push(cur.join(' '));
+    return out;
+  };
+  const absoluteOffenders = (source) => {
+    const out = [];
+    for (const flat of paragraphsOf(source)) {
+      if (!ABSOLUTE_PROPS.some((re) => re.test(flat))) continue;
+      if (NARROW_TOKENS.some((token) => flat.includes(token))) continue;
+      out.push(flat.slice(0, 110));
+    }
+    return out;
+  };
+  // DOC_FILES（R27：增 `docs/INDEX.md` 与 `src/harness/host.mjs`——前者不在表内=漏守，
+  // 后者是**装配器**：它写「取第一条结果行」的注释即 R26 的成因，必须一起守）
   const DOC_FILES = [
     'src/harness/contract.mjs',
     'src/harness/probe-template.mjs',
+    'src/harness/host.mjs',
     'docs/RISKS.md',
     'docs/ARCHITECTURE.md',
     'docs/ADAPTER_GUIDE.md',
+    'docs/INDEX.md',
     'README.md',
     '.cnb.yml',
     'tests/gate_plugin_side.sh',
   ];
   for (const file of DOC_FILES) {
     const src = readText(path.join(ROOT, file), 'utf8');
-    // 逐行判：**说明性**行（纠正历史口径 / 明确禁止）不算违规，但必须同时出现收窄前提或否定词。
-    const offenders = src.split('\n').filter((line) => {
-      if (!ABSOLUTE.test(line)) return false;
-      const explanatory = line.includes(NARROW) || /不得|已收窄|不成立|已作废|更正|推翻|口径收窄/.test(line);
-      return !explanatory;
-    });
-    eq(`口径守卫：${file} 无「插件侧错误永远/永不进 hostFatal」绝对口径`, [], offenders.map((l) => l.slice(0, 90)));
+    eq(`口径守卫：${file} 无绝对口径（不进 hostFatal / 一律落 check 均须带同段收窄前提）`, [],
+      absoluteOffenders(src));
   }
   // 收窄口径必须真的落在唯一事实源（`contract.mjs` 的 HOST_FATAL_FIELD JSDoc）里
   const contractSrc = readText(path.join(ROOT, 'src/harness/contract.mjs'), 'utf8');
@@ -1069,8 +1336,22 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     ['R23', '探针进程内防线可被插件单方面撤销/静音'],
     ['R24', '宿主 execFileSync(timeout) 对同步死循环失效'],
     ['R25', '延迟抛错（排空窗口之外）→ 该插件判 GREEN 的后果'],
+    // v0.1.9d（评审复评 §4）：三条新发现必须留痕（「已知活口不得静默」）
+    ['R26', '协议注入 → 放行级假绿（结果通道被注入伪造报告）'],
+    ['R27', '口径守卫同义绕过 + 只守了错的命题'],
+    ['R28', '修法 A 自检判据不可判定（has()||listenerCount>0 假阳性）'],
   ]) {
     eq(`口径守卫：RISKS 记录 ${id}（${label}）`, true, new RegExp(`\\|\\s*${id}\\s*\\|`).test(risks));
+  }
+  // v0.1.9d：三份新夹具必须固化在仓库里（删掉即红 = 「已知活口不得静默消失」）
+  for (const [fixture, marker, label] of [
+    ['plugin-defense-tamper-plugin.mjs', /removeAllListeners\('uncaughtException'\)/, 'R28 防线被顶替'],
+    ['plugin-protocol-injection-plugin.mjs', /__DSH_PROBE__/, 'R26 协议注入'],
+    ['plugin-sync-loop-plugin.mjs', /Date\.now\(\) \+ 3000/, 'R24 同步死循环'],
+  ]) {
+    const src = readText(path.join(ROOT, 'tests/fixtures', fixture), 'utf8');
+    eq(`口径守卫：${label} 夹具存在且真的复现该形态`, true, marker.test(src));
+    eq(`口径守卫：${label} 夹具自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
   }
   // H1 复现夹具必须固化在仓库里（v0.1.9 修法 A 的验收资产；删掉即红 = 「已知活口不得静默消失」）
   const h1Fixture = readText(path.join(ROOT, 'tests/fixtures/plugin-capture-callback-plugin.mjs'), 'utf8');
@@ -1084,15 +1365,30 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     h1Fixture.includes('GREEN') && h1Fixture.includes('PLUGIN_REGRESSION'));
   eq('口径守卫：H1 夹具**不得**再自称「当前仍是活口」（v0.1.9c 已收口）', false,
     /当前形态下它被判 GREEN/.test(h1Fixture));
-  // 守卫自证：绝对口径样例必须被抓到，收窄口径样例不得误报
+  // 守卫自证（R27：把评审实测**逃逸**的形态全部写成断言，防后人改回旧守卫）
   for (const [label, sample] of Object.entries({
-    '原 v0.1.7/v0.1.8 口径': '插件侧错误**永远**不进该字段 hostFatal[]（插件侧一律落 check）。',
+    '原 v0.1.7/v0.1.8 口径': '插件侧错误**永远**不进该字段 hostFatal[]。',
     '同义改写': '插件侧错误永不进 hostFatal[]。',
+    '① 带「不得」的绝对口径（旧守卫豁免词漏洞）': '插件侧错误**永远**不进 hostFatal[]（不得有例外）',
+    '② 说明性行里的新绝对主张': '更正说明：插件侧错误永不进 hostFatal[]。',
+    '③ 同义词 决不 / 从不会 / 一律不': '插件侧错误决不进 hostFatal[]。',
+    '③b 同义词 从不会': '插件侧错误从不会进 hostFatal[]。',
+    '③c 同义词 一律不': '插件侧错误一律不进 hostFatal[]。',
+    '④ 主谓倒置': 'hostFatal[] 里永远不会有插件侧错误',
+    '⑤ 英文': 'Plugin-side errors never enter hostFatal[].',
+    '⑥ 跨行（旧守卫 [^。；\\n] 限死单行 ⇒ 漏）': '插件侧错误永远\n不进 hostFatal[]。',
+    '⑦ 完整性主张「一律落 check」（H1 真正推翻的那条）': '插件侧一律落 check。',
+    '⑧ 完整性主张同义词「都 / 必然」': '插件侧错误都落插件侧 check。',
   })) {
-    eq(`口径守卫自证：${label} 被抓到`, true, ABSOLUTE.test(sample) && !sample.includes(NARROW));
+    eq(`口径守卫自证：${label} 被抓到`, 1, absoluteOffenders(sample).length);
   }
-  eq('口径守卫自证：收窄口径不误报', false,
-    ABSOLUTE.test('在探针进程内防线未被插件干预的前提下，插件侧错误不进 hostFatal[]'));
+  eq('口径守卫自证：收窄口径（同段带前提）不误报', [], absoluteOffenders('在探针进程内防线未被插件干预的前提下，插件侧错误不进 hostFatal[]。'));
+  eq('口径守卫自证：旧守卫的豁免词写法**现在会被抓到**（不得 + 绝对口径）', 1,
+    absoluteOffenders('插件侧错误**永远**不进 hostFatal[]（不得有例外）').length);
+  eq('口径守卫自证：段落级（前提在别段 ⇒ 仍判违规；前提在同段 ⇒ 放行）', 'flagged|clean',
+    `${absoluteOffenders('插件侧错误永远不进 hostFatal[]。\n\n（准确口径见下节。）').length > 0 ? 'flagged' : 'missed'}|${absoluteOffenders('插件侧错误永远不进 hostFatal[]。\n（前提：防线未被插件干预。）').length === 0 ? 'clean' : 'flagged'}`);
+  eq('口径守卫自证：路由设计说明（「未知相位按插件侧处理，绝不写 hostFatal[]」）不误报', [],
+    absoluteOffenders('保守取向：未知相位按插件侧处理（绝不写 hostFatal[]）。'));
 }
 
 console.log();

@@ -1,5 +1,100 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.1.9d · **放行级假绿收口（续）** —— R26 协议注入 + R28 防线自检判据 + R24 宿主二次终止 + R27 口径守卫加固
+
+> 承接 v0.1.9c（H1 收口）。评审复评 @ `ab85c82` 裁定：**R26 与 H1 同级**（都是**放行级**假绿），
+> 必须一起排进 v0.1.9；R24 的修法从「`worker_threads` 大改」**降级为一行 `killSignal`**（根因定位后）。
+> 本版按 **M1 → M3 → M2 → M5 → M4 → M6** 落地，**不改架构**，只补防线与口径。
+
+### 🔴 M3 · R26 协议注入 → 放行级假绿（**与 H1 同级**）
+
+| 项 | 内容 |
+|---|---|
+| 机理 | 装配器 `stdout.split('\n').find(l => l.startsWith('__DSH_PROBE__'))` 取**第一条**结果行，而结果与日志**共用 stdout** ⇒ 插件在 `apply()` 里 `writeSync(1, …)` 一条伪造报告即**抢到首位**，探针的真报告被忽略；且装配器**不校验结果行条数**（正常恒为 1 条） |
+| 实测 | ① 天真伪造 ② 伪造 + 真缺陷（不注册工具）+ 压回 `exitCode=0` ③ 伪造**合法**报告（用文档公开的 17 个真 check 名）→ 真宿主下均 **GREEN / PASS / 17 项（放行）**；④⑤ 伪造 `hostFatal[]` / 畸形 marker → AMBER（甩锅上游） |
+| 修法 **A**（结构不变量） | `interpretProbeStdout()` 统计结果行条数：**≥2 条即判篡改** → 插件侧 check **`plugin.protocol_injection`**（进 `PLUGIN_SIDE_CHECKS` + `CONDITIONAL_PROBE_CHECKS`，条件项 6 → **7**）、`runCompleted=false`、`ok=false`、`hostFatal[]` 为空、**不采信任何一条**（`find(first)` 只作末位兼容） |
+| 修法 **B**（通道隔离） | 探针结果改走**独立 fd3**（`host.mjs` 由 `execFileSync` 改 `spawnSync` + `stdio: ['ignore','pipe','inherit','pipe']`，`writeSync(3, …)`；fd3 不可用时回退 stdout）⇒「stdout 里出现结果行」**本身**即篡改证据（第二条独立证据链） |
+| 为什么 C/D 不作防线 | **C**（一次性 nonce）挡不住同进程读 `process.argv` 的有心插件（评审实测）；**D**（check 名白名单）挡不住用**公开真名**的伪造（形态③） |
+| 反向护栏 | 正常路径（fd3 1 条 / stdout 只有日志）**不误判**；fd3 缺省（2 参调用）时行为与 v0.1.9c **完全一致**（老装配器 / 直接跑探针不破）；相位信标不被误当结果行 |
+
+### 🔴 M1 · R28 防线自检判据不可判定（H1 修法 A 的**假阳性**）
+
+评审实测：`hasUncaughtExceptionCaptureCallback() || listenerCount('uncaughtException') > 0` 在插件
+**用自己的回调顶替**我们的 handler 后：`has=true`、`count=1` ⇒ 该式**恒真** ⇒ 判「防线有效」，
+而实际后台抛错已被插件自己的 handler 吞掉。⇒ 判据升级为**四重**（`checkProcessDefense()`）：
+
+| # | 判据 | 挡住的形态 |
+|---|---|---|
+| ① | **wrap** `setUncaughtExceptionCaptureCallback` / `removeAllListeners` / `removeListener` / `off` **记账**（探针启动、任何插件代码之前；只记**插件集成相位**，防误伤宿主装配段） | 插件抢占 capture API / 摘监听器（真实形态：Sentry / APM / 日志库） |
+| ② | **身份检查**：我们的 handler 仍在 `process.listeners(event)` 内 | 插件**用自己的回调顶替**我们的（**计数判据在此假阳性**） |
+| ③ | 独占 API 存在（`hasUncaughtExceptionCaptureCallback()`，**独立**篡改信号，**不与计数做 `\|\|`**） | capture callback 存在 ⇒ 监听器不再被调用（Node 官方语义） |
+| ④ | **行为级 canary**：临时监听器 + `process._fatalException`（**真实派发路径**） | 「监听器还在但不会被调用」的形态；不可用时**自动跳过**（不误报） |
+
+- canary 哨兵用 **Symbol** 标记（不可外部伪造）⇒ 避免「插件抛一个同名消息的错误即可静音自己」的新活口；
+- **为什么不用 `process.emit('uncaughtException', …)`**：实测在存在 capture callback 时**仍会调用监听器**
+  （capture-callback 分支在内部派发函数里）⇒ 对「被静音」**无判别力**（假阴性）。改用 `_fatalException`
+  并显式声明依赖内部入口（不可用即跳过）。
+- 新夹具 **`plugin-defense-tamper-plugin.mjs`**：摘掉探针兜底后**再装自己的**（`listenerCount === 1`，
+  旧判据假阳性）→ 收口后判 `plugin.process_defense_tampered`、`hostFatal=0`、完成位仍 `true`。
+
+### 🟠 M2 · R24 宿主二次终止（**一行** + 影响列更正）
+
+- `host.mjs` 抽出 `probeSpawnOptions()`（**唯一事实源**）并在其中加 **`killSignal: 'SIGKILL'`**：
+  根因是**探针自己装了 `SIGTERM` 处理器**（出口③）⇒ Node 默认终止行为被禁用 ⇒ SIGTERM 杀不掉探针
+  （实测 timeout=5000 却耗时 30.3s；`while(true)` 形态永久挂死）。
+- **影响列就地更正**：有相位信标时**不会**判 `UPSTREAM_DRIFT`（死循环在 `apply()` 内、信标已打）
+  → `PLUGIN_REGRESSION` / `plugin.abnormal_termination`；只有「插件**模块顶层**死循环」才落 `UPSTREAM_DRIFT`。
+- **取舍显式声明**：超时路径**失去优雅报告**（只剩信标归因）；正常路径不受影响（`RUN_WATCHDOG_MS` 20s
+  先于 `timeoutMs` 600s）。
+- 新夹具 `plugin-sync-loop-plugin.mjs`（**3s** 循环，不吃满 CI）。
+
+### 🟡 M5 · 归因落点口径（闸门断言不再写死 check 名）
+
+闸门期望从「固定 check 名」改为「失败项 **⊆** `PLUGIN_SIDE_CHECKS`」（名单**从唯一事实源 import**），
+并把「必须命中的那一项」降为**可选**加强断言（`-` 表示该夹具落点不固定）。
+理由：`process.exit(0)` 的落点实测是 **`plugin.apply_ok`**（不是 `plugin.early_exit`），
+固定名断言依赖**夹具细节**（`plugin-exit-plugin` 因先注册健康工具才恰好命中）。
+
+### 🟡 M4 · R27 口径守卫加固
+
+- **命题扩为两条**：`不进 hostFatal` **与** `一律/都/必然 落 check`（后者才是 H1/R26/R28 推翻的**完整性主张**）；
+  另覆盖**主谓倒置**与**英文**形态；
+- **同义词组**：`永远|永不|绝不|决不|从不|一律不` / `一律|都|必然|一定`；
+- **豁免改为「必须同段引用收窄前提」**——去掉 `不得` 这类单独豁免词（旧守卫把豁免词与前提写成 `\|\|`，
+  于是 `…永远不进 hostFatal[]（不得有例外）` 能骗过守卫，**正是它要防的东西**）；
+- **段落级**（而非逐行）：前提写在上一行、主张写在下一行不再漏（按空行 / 空注释行 / Markdown 表行切段）；
+- `DOC_FILES` 增 **`docs/INDEX.md`**（此前不在表内 = 漏守）与 **`src/harness/host.mjs`**（**装配器**——
+  R26 的成因就在它的注释里）。
+
+### 测试项数（本版）
+
+- `tests/test_attribution.mjs`：314 → **387 项**（[9.10] R28 判据 / 反证 / 夹具自检；[9.11] R26 协议注入
+  （A 行为 + B 通道隔离 + 向后兼容 + 信标不误命中 + spawn 参数 + 夹具自检）；[9.12] R24 行为级
+  （SIGKILL 收口 + 信标归因 + 反向护栏）；[11] 口径守卫扩条：命题 1 → **2**（新增「一律落 check」完整性主张）、
+  同义词组、主谓倒置 / 英文形态、**同段前提**（去 `不得` 豁免词）、`DOC_FILES` 8 → **10**，含 12 种绕过形态逐条自证）
+- `tests/test_offline.sh`：103 → **113 项**（[16] 新增 R28 / R26 / R24 三形态 × 10 条）
+- `tests/test_e2e_regression.mjs`：124 → **149 项**（[8d] R28 / R26 真宿主 × 11 + [8e] R24 真宿主 8 条）
+- `tests/gate_plugin_side.sh`：11 → **20 项**（负例 10 → **12 份**（+`plugin-defense-tamper` / `plugin-protocol-injection`）
+  + **R24 专用段 6 条**（含反向护栏）+ 防过度修正）
+- `tests/test_exports.mjs`：**40 项**（不变；条件项计数 6 → 7 由既有守卫自动跟随）
+- `tests/test_hub.sh`：**PASS=25 FAIL=0**（含 113 / 387 / 149 三处计数对齐）
+
+### 兼容性
+
+- `contract.mjs` 新增导出 `PLUGIN_PROTOCOL_INJECTION_CHECK`；`CONDITIONAL_PROBE_CHECKS` 6 → **7 项**；
+  `PLUGIN_SIDE_CHECKS` 新增一项；`host.mjs` 新增导出 `collectProbeResultLines` / `probeSpawnOptions`。
+- **行为变更（预期）**：① 向结果通道注入伪造结果的插件，从此判 `PLUGIN_REGRESSION`/RED（此前 **GREEN 放行**）；
+  ② 摘掉探针兜底再装自己的插件，从此判 RED（此前**放行**）；③ 同步死循环插件在**有界 timeout** 下
+  按 `SIGKILL` 收口（此前挂死/吃满额度）。三条都是**修复**，不是回归。
+- 健康插件**不受影响**（闸门含防过度修正断言：`demo-plugin` 仍 17/17 GREEN / 完成位 true）。
+
+### 口径（**不得**恢复绝对措辞）
+
+H1 已收口，但 R23（防线可被单方面撤销）是**结构性**事实，本版又新增 R26（协议注入）与 R28（自检判据），
+故「**在探针进程内防线未被插件干预的前提下**」这一前提**永久保留**；CHANGELOG / 文档 / 代码注释
+**不得**出现「永远 / 永不」类绝对口径（由 [11] 守卫）。
+
+
 ## v0.1.9c · **H1 放行级假绿收口** —— 探针收尾自检进程内防线 + 夹具进闸门
 
 > 承接 v0.1.9b（口径收窄）。v0.1.9b 把 H1 记为**已知活口**（`docs/RISKS.md` R22，夹具不进闸门）。

@@ -6,8 +6,8 @@
 # 而「两段口径不一致」正是闸门静默失效的经典形态（一处加了新夹具、另一处忘了）。
 # 抽成一份后：夹具清单、断言口径、防过度修正断言**只有一处可写错**。
 #
-# ## 覆盖的五条出口 + 一份防过度修正
-# | 夹具 | 出口 | 期望失败项 | 完成位 |
+# ## 覆盖的出口 + 防线 + 一份防过度修正
+# | 夹具 | 出口 / 防线 | 期望失败项 | 完成位 |
 # |---|---|---|---|
 # | `plugin-side-throw-plugin` | ① 同步异常（读插件侧数据抛错 getter） | `guard.reserved_rejected` | true |
 # | `plugin-registry-throw-plugin` | ① 同步异常（注册项 getter 抛错） | `registry.exact` | true |
@@ -16,13 +16,24 @@
 # | `plugin-exit-plugin` | ③ 进程 exit（插件 `process.exit(0)`） | `plugin.early_exit` | **false** |
 # | `plugin-hang-plugin` | ④ `run()` 被拖住（永不 resolve） | `plugin.run_incomplete` | **false** |
 # | `plugin-sigkill-plugin` | 边界：不可捕获终止（`SIGKILL`） | `plugin.abnormal_termination` | **false** |
+# | `plugin-detach-handlers-plugin` | 对抗：先摘掉全部监听器再抛错 | 插件侧（不固定名，见下） | false |
+# | `plugin-busy-loop-plugin` | 对抗：后台任务同步占死事件循环 | `plugin.async_uncaught_exception` | true |
+# | `plugin-process-exit-plugin` | 对抗：后台定时器里 `process.exit` | 插件侧 | false |
+# | `plugin-capture-callback-plugin` | H1/R22：抢占 `setUncaughtExceptionCaptureCallback` | `plugin.process_defense_tampered` | true |
+# | `plugin-defense-tamper-plugin` | H1/R28：摘掉探针兜底 + 装**自己的**（计数假阳性形态） | `plugin.process_defense_tampered` | true |
+# | `plugin-protocol-injection-plugin` | R26：向结果通道注入伪造结果（放行级假绿） | `plugin.protocol_injection` | **false** |
+# | `plugin-sync-loop-plugin` | R24：`apply()` 内同步死循环（宿主二次终止） | `plugin.abnormal_termination` | **false** |
 # | `demo-plugin`（健康） | —— | 无（必须 GREEN 17/17） | true |
 #
-# ## 三条断言纪律（都是踩过的坑）
+# ## 四条断言纪律（都是踩过的坑）
 # 1. **只看退出码不够**：AMBER 漂移窗口内负例也会 fail → 必须同时断言 `attribution` 与 `verdict`；
 # 2. **只看 attribution 不够**：必须同时断言 `hostFatal` **为空**（判据字段的写入端不变量）；
 # 3. **必须有防过度修正**：健康插件在同一次运行里必须仍 GREEN 17/17——
-#    否则「把所有失败都判插件」也能让上面的断言全绿（把护栏变成噪声源）。
+#    否则「把所有失败都判插件」也能让上面的断言全绿（把护栏变成噪声源）；
+# 4. **期望项不得写成「固定 check 名」**（M5，评审复评 §2）：`process.exit(0)` 的落点实测是
+#    `plugin.apply_ok`（不是 `plugin.early_exit`）——固定名断言依赖**夹具细节**（`plugin-exit-plugin`
+#    因先注册健康工具才恰好命中）。改为断言「失败项 **⊆** `PLUGIN_SIDE_CHECKS`」（从唯一事实源 import），
+#    并把「必须命中的那一项」作为**可选**加强断言（`*` 后缀表示该夹具**不得**只判固定名）。
 #
 # 用法：`bash tests/gate_plugin_side.sh [workdir]`
 # 退出码：0 = 全部通过；1 = 有断言失败。
@@ -40,6 +51,17 @@ FAIL=0
 ok() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 
+# 插件侧 check 名单**从唯一事实源 import**（M5）：此前断言写死单个 check 名，
+# 而落点随夹具细节浮动（`process.exit(0)` 实测落 plugin.apply_ok）⇒ 固定名断言是**假精度**。
+# 从 `contract.mjs` 取名单后，「失败项 ⊆ 插件侧」才是可判定的不变量（且名单新增一项即自动生效）。
+PLUGIN_SIDE_CHECKS_JSON="$("$NODE_BIN" --input-type=module -e "
+import { PLUGIN_SIDE_CHECKS } from '$ROOT/src/harness/contract.mjs';
+console.log(JSON.stringify(PLUGIN_SIDE_CHECKS));
+")"
+if [[ -z "$PLUGIN_SIDE_CHECKS_JSON" ]]; then
+  echo "❌ 无法从 src/harness/contract.mjs 读取 PLUGIN_SIDE_CHECKS（唯一事实源）"; exit 1
+fi
+
 mkdir -p "$WORK"
 echo "▶ 插件侧错误不得进 hostFatal[]（闸门：四条出口 + 不可捕获边界 + 防过度修正）"
 
@@ -48,26 +70,37 @@ echo "▶ 插件侧错误不得进 hostFatal[]（闸门：四条出口 + 不可�
 # 最后一列为什么对 SIGKILL 是 false：**不可捕获终止**的定义就是「探针来不及写结构化结果」，
 # 故报告里只有装配器按相位信标补的那一条 fail（没有 pass 可保留）。其余四条出口都由探针自己
 # 闭合，必须保留已跑完的检查——「报告整份消失」正是本族历史缺陷最狠的地方。
+# 字段：夹具|期望**必含**失败项（`-` = 只要求「失败项 ⊆ 插件侧」）|期望完成位|是否保留已跑完的 pass 项
 NEGATIVE_CASES=(
   "plugin-side-throw-plugin|guard.reserved_rejected|true|true"
   "plugin-registry-throw-plugin|registry.exact|true|true"
   "plugin-async-throw-plugin|plugin.async_uncaught_exception|true|true"
   "plugin-async-reject-plugin|plugin.async_uncaught_exception|true|true"
-  "plugin-exit-plugin|plugin.early_exit|false|true"
-  "plugin-hang-plugin|plugin.run_incomplete|false|true"
-  "plugin-sigkill-plugin|plugin.abnormal_termination|false|false"
+  # M5：落点**不固定**（实测 `process.exit(0)` 落在 plugin.apply_ok，视注册时机而定）⇒ 期望项用 `-`
+  "plugin-exit-plugin|-|false|true"
+  "plugin-hang-plugin|-|false|true"
+  "plugin-sigkill-plugin|-|false|false"
   # 本分支补的**对抗形态**（评审 🔴-D′ 原始复现的变体；每份都实测过，见 CHANGELOG v0.1.9）：
   # - detach-handlers：插件先摘掉 `process` 上的**全部**相关监听器再抛错
   #   （「探针内任何兜底都不是安全网」——归因只能靠出口钩子/相位信标）；
   # - busy-loop：后台任务**同步占死**事件循环（看门狗排不上 → 占死结束后收尾）；
   # - process-exit：与 plugin-exit 同族但走**后台定时器**（不是 apply 内直接调）。
-  "plugin-detach-handlers-plugin|plugin.early_exit|false|true"
+  "plugin-detach-handlers-plugin|-|false|true"
   "plugin-busy-loop-plugin|plugin.async_uncaught_exception|true|true"
-  "plugin-process-exit-plugin|plugin.early_exit|false|true"
+  "plugin-process-exit-plugin|-|false|true"
   # H1（复评）：插件抢占 `setUncaughtExceptionCaptureCallback` → 探针兜底被**静音**，
   # 旧行为判 **GREEN 放行**（比 AMBER 更危险）。收口后必须判插件侧、完成位仍为 true
   # （探针确实跑完了——它只是**不知道**自己被静音了）。
   "plugin-capture-callback-plugin|plugin.process_defense_tampered|true|true"
+  # R28（复评）：摘掉探针兜底后**装一个自己的** —— 计数判据（`listenerCount>0`）在此**假阳性**，
+  # 只有「身份检查」能判出。同一族、不同机理，必须各有夹具（否则修法回退无人发现）。
+  "plugin-defense-tamper-plugin|plugin.process_defense_tampered|true|true"
+  # R26（复评，**放行级假绿**）：向结果通道注入「17 项全绿」的伪造报告 + 压回退出码。
+  # 收口前实测判 **GREEN / PASS / 17 项（放行）**；收口后必须 RED / 插件侧 / hostFatal 为空。
+  "plugin-protocol-injection-plugin|plugin.protocol_injection|false|false"
+  # ⚠️ `plugin-sync-loop-plugin`（R24）**不在**本清单：它的缺陷只在**有界 timeout** 下成立
+  # （默认 timeoutMs=600s 时 3s 循环会正常跑完——那本身不是缺陷）。该形态由下方**专用 R24 段**
+  # 用 `runHostProbe({ timeoutMs: 1000 })` 断言（含收口时间与 `probeExit.signal`）。
 )
 
 for entry in "${NEGATIVE_CASES[@]}"; do
@@ -80,7 +113,8 @@ for entry in "${NEGATIVE_CASES[@]}"; do
     continue
   fi
   "$NODE_BIN" -e '
-    const [file, fixture, expectedCheck, expectedCompleted, expectsPass] = process.argv.slice(1);
+    const [file, fixture, expectedCheck, expectedCompleted, expectsPass, pluginSideChecksJson] = process.argv.slice(1);
+    const pluginSide = new Set(JSON.parse(pluginSideChecksJson));
     const r = require(file);
     const c = r.channels[0] ?? {};
     const checks = c.checks ?? [];
@@ -92,18 +126,81 @@ for entry in "${NEGATIVE_CASES[@]}"; do
     if (checks.length === 0) bad.push("checks 为空（报告整份消失——旧缺陷形态）");
     // 「已跑完的 pass 项必须保留」只对**可捕获**出口成立（不可捕获终止时探针没机会写报告）
     if (expectsPass === "true" && !checks.some((x) => x.status === "pass")) bad.push("无 pass 项（已跑完的检查被丢弃）");
-    // 反向：可捕获出口若**没有** pass 项，说明报告形态退化成「整份消失」，必须红
+    // 反向：不可捕获出口若**出现** pass 项，说明报告形态异常，必须红
     if (expectsPass === "false" && checks.some((x) => x.status === "pass")) bad.push("不可捕获终止却出现 pass 项（形态异常）");
-    if (!failed.includes(expectedCheck)) bad.push("失败项不含 " + expectedCheck + "（实得：" + failed.join(",") + "）");
+    // M5（口径收窄，评审复评 §2）：**失败项必须全部落在插件侧名单内**（从唯一事实源 import 的名单），
+    // 而不是断言某个固定名字 —— `process.exit(0)` 的落点实测是 plugin.apply_ok（非 plugin.early_exit），
+    // 固定名断言依赖夹具细节。名单外的失败项 = 归因表漏登记（会退化成 UNKNOWN）或宿主侧信号混入。
+    const offList = failed.filter((x) => !pluginSide.has(x));
+    if (offList.length > 0) bad.push("失败项不在插件侧名单内：" + offList.join(","));
+    // 加强断言：夹具**必须**命中某一项时（字段 != "-"）才校验固定名
+    if (expectedCheck !== "-" && !failed.includes(expectedCheck)) bad.push("失败项不含 " + expectedCheck + "（实得：" + failed.join(",") + "）");
     // 完成位：未跑完的运行**不得**判通过（假绿比 AMBER 更危险，🔴 必修-1）
     const completed = c.runCompleted === true;
     if (String(completed) !== expectedCompleted) bad.push("完成位 runCompleted=" + completed + "（期望 " + expectedCompleted + "）");
     if (completed === false && r.summary.verdict === "GREEN") bad.push("未跑完却判 GREEN（假绿）");
     if (bad.length) { console.error("❌ 闸门失败：" + bad.join("；")); process.exit(1); }
-    console.log("✅ " + fixture + "：PLUGIN_REGRESSION / hostFatal 为空 / checks=" + checks.length + " / 完成位=" + completed + " / verdict=" + r.summary.verdict);
-  ' "$out" "$fixture" "$expectedCheck" "$expectedCompleted" "$expectsPass"
+    console.log("✅ " + fixture + "：PLUGIN_REGRESSION / hostFatal 为空 / 失败项均在插件侧名单 / checks=" + checks.length + " / 完成位=" + completed + " / verdict=" + r.summary.verdict);
+  ' "$out" "$fixture" "$expectedCheck" "$expectedCompleted" "$expectsPass" "$PLUGIN_SIDE_CHECKS_JSON"
   if [[ $? -eq 0 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 done
+
+# ---- R24：同步死循环 → 宿主**二次终止**（`killSignal: 'SIGKILL'`） ----
+# 为什么单列（评审复评 R24）：探针的看门狗 / 信号处理器都是事件循环上的回调，插件 `apply()`
+# 同步占满事件循环后两者都不执行；而探针为出口③ 装了 `SIGTERM` 处理器 ⇒ Node 默认终止行为被禁用
+# ⇒ 宿主**杀不掉**探针（实测 timeout=5000 却耗时 30.3s；`while(true)` 形态永久挂死，吃满 CI 额度）。
+# 断言四条：① 收口时间 < timeoutMs × 3；② `probeExit.signal === 'SIGKILL'`；
+# ③ 归因插件侧（相位信标）；④ `hostFatal` 为空。**外加反向护栏**：默认超时未被压小（健康插件仍 17/17）。
+echo
+echo "▶ R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因）"
+R24_OUT="$("$NODE_BIN" --input-type=module -e "
+import path from 'node:path';
+import { runHostProbe, loadChannels } from '$ROOT/src/harness/host.mjs';
+import { attributeFailure } from '$ROOT/src/verify/runner.mjs';
+const registry = loadChannels('$ROOT');
+const channel = registry.channels['$CHANNEL'];
+const t = Date.now();
+const probe = runHostProbe({
+  channelName: '$CHANNEL', channel,
+  pluginPath: path.join('$ROOT', 'tests/fixtures/plugin-sync-loop-plugin.mjs'),
+  expectedTools: ['demo_echo'], hubRoot: '$ROOT', timeoutMs: 1000,
+});
+const elapsed = Date.now() - t;
+const fails = (probe.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+console.log(JSON.stringify({
+  elapsed,
+  signal: probe.probeExit?.signal ?? null,
+  status: probe.probeExit?.status ?? null,
+  attribution: attributeFailure(probe, channel, '$CHANNEL'),
+  hostFatal: (probe.hostFatal ?? []).length,
+  completed: probe.runCompleted === true,
+  fails,
+}));
+" 2>/dev/null || echo '{}')"
+r24() { echo "$R24_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);console.log(eval('r$1'))})"; }
+assert_r24() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1（期望 $3 / 实得 $2）"; fi; }
+assert_r24 "R24：同步死循环被宿主二次终止（probeExit.signal=SIGKILL）" "$(r24 '.signal')" "SIGKILL"
+assert_r24 "R24：收口时间 < timeoutMs × 3（不得挂死 / 不得吃满额度）" "$(r24 '.elapsed < 3000')" "true"
+assert_r24 "R24：按相位信标归因插件侧（plugin.abnormal_termination）" "$(r24 '.fails.includes("plugin.abnormal_termination")')" "true"
+assert_r24 "R24：归因 PLUGIN_REGRESSION（有信标 ⇒ 不判 UPSTREAM_DRIFT）" "$(r24 '.attribution')" "PLUGIN_REGRESSION"
+assert_r24 "R24：hostFatal 为空 + 完成位 false（插件侧 / 不放行）" "$(r24 '.hostFatal + "|" + r.completed')" "0|false"
+# 反向护栏（防「把 timeout 调小」式过度修正）：默认超时下健康插件仍 17/17。
+R24_HEALTHY="$("$NODE_BIN" --input-type=module -e "
+import path from 'node:path';
+import { runHostProbe, loadChannels } from '$ROOT/src/harness/host.mjs';
+const registry = loadChannels('$ROOT');
+const probe = runHostProbe({
+  channelName: '$CHANNEL', channel: registry.channels['$CHANNEL'],
+  pluginPath: path.join('$ROOT', 'tests/fixtures/demo-plugin.mjs'),
+  expectedTools: ['demo_echo', 'demo_status'], hubRoot: '$ROOT',
+});
+console.log(JSON.stringify({
+  pass: (probe.checks ?? []).filter((c) => c.status === 'pass').length,
+  fails: (probe.checks ?? []).filter((c) => c.status === 'fail').length,
+  completed: probe.runCompleted === true, hostFatal: (probe.hostFatal ?? []).length,
+}));
+" 2>/dev/null || echo '{}')"
+assert_r24 "R24 反向护栏：默认超时未被压小（健康插件仍 17/17 全绿）" "$(echo "$R24_HEALTHY" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);console.log(r.pass+'|'+r.fails+'|'+r.completed+'|'+r.hostFatal)})")" "17|0|true|0"
 
 # ---- 防过度修正：健康插件必须仍 GREEN 17/17（否则「全判插件」也能让上面全绿） ----
 healthy="$WORK/verify-healthy.json"

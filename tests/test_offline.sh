@@ -393,8 +393,8 @@ EXIT_OUT="$("$NODE_BIN" --input-type=module -e "
 import path from 'node:path';
 import { runOfflineProbe } from '$ROOT/tests/offline-probe-harness.mjs';
 const root = '$ROOT';
-const probe = (fixture, tools, watchdogMs) => {
-  const r = runOfflineProbe({ pluginPath: path.join(root, 'tests/fixtures', fixture), expectedTools: tools, watchdogMs });
+const probe = (fixture, tools, watchdogMs, timeoutMs) => {
+  const r = runOfflineProbe({ pluginPath: path.join(root, 'tests/fixtures', fixture), expectedTools: tools, watchdogMs, ...(timeoutMs ? { timeoutMs } : {}) });
   const checks = r.result.checks;
   const fails = checks.filter((c) => c.status === 'fail').map((c) => c.name);
   return {
@@ -406,6 +406,7 @@ const probe = (fixture, tools, watchdogMs) => {
     fails,
     phase: r.result.phase,
     exitStatus: r.exit.status,
+    exitSignal: r.exit.signal,
   };
 };
 const cases = {
@@ -415,6 +416,10 @@ const cases = {
   exit0: probe('plugin-exit-plugin.mjs', ['demo_echo']),
   hang: probe('plugin-hang-plugin.mjs', ['demo_echo'], 2000),
   sigkill: probe('plugin-sigkill-plugin.mjs', ['demo_echo']),
+  // v0.1.9d 新增（评审复评 R24 / R26 / R28）
+  defenseTamper: probe('plugin-defense-tamper-plugin.mjs', ['demo_echo']),
+  injection: probe('plugin-protocol-injection-plugin.mjs', ['demo_echo']),
+  syncLoop: probe('plugin-sync-loop-plugin.mjs', ['demo_echo'], undefined, 1500),
 };
 console.log(JSON.stringify(cases));
 ")"
@@ -446,6 +451,18 @@ interpretProbeStdout(r, 'Killed（无相位信标：终止发生在宿主装配�
 console.log(r.hostFatal.length + '|' + r.checks.length);
 ")"
 assert "反向护栏：无相位信标（宿主装配段被终止）→ 仍写 hostFatal[]（真上游信号不丢）" "1|0" "$NOBEACON_OUT"
+
+# v0.1.9d 新增三形态（评审复评 R24 / R26 / R28）——都是**离线**可判的（秒级，不吃 CI 额度）
+assert "R28 防线被顶替：判插件侧 plugin.process_defense_tampered" "true" "$(j defenseTamper '.fails.includes("plugin.process_defense_tampered")')"
+assert "R28 防线被顶替：hostFatal 为空 + 完成位仍 true（探针跑完了，只是不知道）" "0|true" "$(j defenseTamper '.hostFatal+"|"+c.completed')"
+assert "R28 防线被顶替：归因 PLUGIN_REGRESSION（不放行）" "PLUGIN_REGRESSION" "$(j defenseTamper '.attribution')"
+assert "R26 协议注入：判插件侧 plugin.protocol_injection" "true" "$(j injection '.fails.includes("plugin.protocol_injection")')"
+assert "R26 协议注入：hostFatal 为空 + 完成位 false（不放行）" "0|false" "$(j injection '.hostFatal+"|"+c.completed')"
+assert "R26 协议注入：**不得假绿**（ok=false）" "false" "$(j injection '.ok')"
+assert "R24 同步死循环：宿主二次终止（probeExit.signal=SIGKILL）" "SIGKILL" "$(j syncLoop '.exitSignal')"
+assert "R24 同步死循环：按相位信标归因插件侧 + hostFatal 为空" "true|0" "$(j syncLoop '.fails.includes("plugin.abnormal_termination")+"|"+c.hostFatal')"
+assert "R24 同步死循环：完成位 false（未跑完不得判通过）" "false" "$(j syncLoop '.completed')"
+assert "R24 同步死循环：归因 PLUGIN_REGRESSION（有信标 ⇒ 不判上游漂移）" "PLUGIN_REGRESSION" "$(j syncLoop '.attribution')"
 
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"

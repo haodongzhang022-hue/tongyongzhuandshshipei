@@ -201,7 +201,7 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
-**另有 6 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
+**另有 7 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
 
 | 条件检查 | 出口 | 触发场景 | 归因 |
 |---|---|---|---|
@@ -210,7 +210,8 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 | `plugin.early_exit` | ③ 进程 exit | 插件在验收完成前调 `process.exit()` / 自杀式信号（`SIGTERM` 等）——`process.exit()` **不抛异常**，前两条出口都接不到 | `PLUGIN_REGRESSION` |
 | `plugin.run_incomplete` | ④ `run()` 被拖住 | 插件挂住事件循环，或 `apply()` 返回一个**永不 resolve** 的 Promise（无异常、无退出） | `PLUGIN_REGRESSION` |
 | `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort`）——探针来不及写报告，装配器按**相位信标**归因 | `PLUGIN_REGRESSION` |
-| `plugin.process_defense_tampered` | ⑤ 防线被静音 | 插件抢占 `setUncaughtExceptionCaptureCallback`（真实形态：Sentry / APM / 错误上报库）或摘掉 `uncaughtException` 监听器 ⇒ 探针兜底被**静音**、后台抛错不可见、完成位仍真 → **假绿放行**。探针收尾自检（capture callback 为空 + 两监听器仍在）判本项 | `PLUGIN_REGRESSION` |
+| `plugin.process_defense_tampered` | ⑤ 防线被静音 | 插件抢占 `setUncaughtExceptionCaptureCallback`（真实形态：Sentry / APM / 错误上报库）或摘掉 `uncaughtException` 监听器 ⇒ 探针兜底被**静音**、后台抛错不可见、完成位仍真 → **假绿放行**。探针收尾自检（API 调用台账 + **身份检查** + 独占 API 检测 + 行为级 canary；**不得**用 `has()||listenerCount>0`——插件顶替后该式假阳性）判本项 | `PLUGIN_REGRESSION` |
+| `plugin.protocol_injection` | ⑥ 结果通道被注入 | 插件向探针的**结果通道**写入伪造结果（抢首位 / 多结果行 / 在结果走独立通道时仍写 stdout）⇒ 真报告被顶替 → 装配器 `interpretProbeStdout()` 判本项（结构不变量 + 通道隔离，**防放行级假绿**） | `PLUGIN_REGRESSION` |
 
 **为什么四条出口都要兜**（本中台被返工最多的一条线）：插件侧错误逃出探针 `run()` 的调用栈有
 **四条**出口，每条都会让旧探针在写出结构化结果前消失 → 装配器只看到「探针未输出结构化结果」

@@ -237,6 +237,26 @@ export const PLUGIN_ABNORMAL_TERMINATION_CHECK = 'plugin.abnormal_termination';
 export const PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK = 'plugin.process_defense_tampered';
 
 /**
+ * 「探针的**结果通道**被插件篡改（协议注入）」在插件集成相位的落点 check 名
+ * （已登记进 {@link PLUGIN_SIDE_CHECKS}）。
+ *
+ * 为什么必须有它（评审复评 R26，**放行级假绿**）：装配器原先用
+ * `stdout.split('\n').find((l) => l.startsWith('__DSH_PROBE__'))` 取**第一条**结果行。
+ * 插件在 `apply()` 里 `writeSync(1, '__DSH_PROBE__{...}')` 写一条**伪造**结果（17 项全 pass /
+ * `hostFatal[]` 清空 / 退出码压回 0），就能抢到首位——探针自己随后输出的**真报告被忽略**。
+ * 实测三种形态（天真伪造 / 伪造+真缺陷 / 伪造合法报告）在真宿主下均判
+ * **GREEN / PASS / 17 项**（放行），比 AMBER 危险得多。
+ *
+ * 归因的**结构不变量**：正常探针在一次运行里**恒为 1 条**结果行（实测 8 份夹具全为 1）。
+ * ⇒ **≥2 条即铁证是篡改**（无需知道谁写的）；配合结果通道隔离（`spawnSync` 的 fd3，
+ * 见 `host.mjs`）后，**stdout 里出现的任何结果行都是篡改证据**（第二条独立证据链）。
+ *
+ * ⚠️ 口径（与 {@link HOST_FATAL_FIELD} 的收窄一致）：本项判的是**装配器可见的输出通道**；
+ * 插件若同时让探针整个进程消失，则由出口③④ 或相位信标归因（见 R21）。
+ */
+export const PLUGIN_PROTOCOL_INJECTION_CHECK = 'plugin.protocol_injection';
+
+/**
  * 进程级异常归属路由（**唯一事实源**，探针的进程级兜底与离线回归共用）。
  *
  * 语义与 {@link probeFailureRoute} **完全一致**（按相位、未知相位保守判插件侧），
@@ -465,8 +485,11 @@ export const PLUGIN_SIDE_CHECKS = [
   'plugin.abnormal_termination',
   // H1（复评）：插件抢占 `setUncaughtExceptionCaptureCallback` / 摘掉监听器 → 探针的
   // 进程级兜底被**静音** ⇒ 插件后台抛错不可见、完成位仍真 ⇒ **GREEN 放行**（比 AMBER 更危险）。
-  // 由探针收尾自检 `process.hasUncaughtExceptionCaptureCallback()` + 监听器计数判本项。
+  // 由探针收尾自检（wrap API 记账 + 身份检查 + 行为级 canary，见 R28）判本项。
   'plugin.process_defense_tampered',
+  // R26（复评）：插件向探针的结果通道**注入伪造结果**（抢首位 / 多 marker / 走错通道）⇒
+  // 真报告被忽略 ⇒ 整轮假绿。由装配器 `interpretProbeStdout()` 判本项（结构不变量 + 通道隔离）。
+  'plugin.protocol_injection',
 ];
 
 /**
@@ -477,10 +500,13 @@ export const PLUGIN_SIDE_CHECKS = [
  * 为什么单独成表：`PROBE_CHECK_ORDER` 与「条件项」必须能互相推出，
  * 否则「17 项」的口径会随新增条件项悄悄变成 18 项而无人发现。
  *
- * 五条出口各占一项：同步异常（`plugin.unexpected_exception`）/ 异步异常
- * （`plugin.async_uncaught_exception`）/ 进程 exit（`plugin.early_exit`）/
- * `run()` 被拖住（`plugin.run_incomplete`）/ 不可捕获终止
- * （`plugin.abnormal_termination`，由装配器按相位信标归因）。
+ * 七项条件检查，各占一项（**条数由本表长度决定**，文档里的「另有 N 项」由
+ * `tests/test_exports.mjs` [2b'''] 反推，改一处漏一处即红）：
+ * 同步异常（`plugin.unexpected_exception`）/ 异步异常（`plugin.async_uncaught_exception`）/
+ * 进程 exit（`plugin.early_exit`）/ `run()` 被拖住（`plugin.run_incomplete`）/
+ * 不可捕获终止（`plugin.abnormal_termination`，由装配器按相位信标归因）/
+ * 进程内防线被插件干预（`plugin.process_defense_tampered`）/
+ * 结果通道被插件注入伪造结果（`plugin.protocol_injection`，由装配器判）。
  */
 export const CONDITIONAL_PROBE_CHECKS = [
   PLUGIN_PROBE_EXCEPTION_CHECK,
@@ -489,14 +515,15 @@ export const CONDITIONAL_PROBE_CHECKS = [
   PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_ABNORMAL_TERMINATION_CHECK,
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
+  PLUGIN_PROTOCOL_INJECTION_CHECK,
 ];
 
 /**
  * 「前置失败时该标 `skip` 的插件侧检查项」= {@link PLUGIN_SIDE_CHECKS} **减去**条件项。
  *
- * 为什么必须减去：条件项（同步/异步异常、进程 exit、`run()` 被拖住、不可捕获终止）按口径
+ * 为什么必须减去：条件项（同步/异步异常、进程 exit、`run()` 被拖住、不可捕获终止、防线干预、协议注入）按口径
  * **仅在异常路径出现**（见 {@link CONDITIONAL_PROBE_CHECKS} 的文档说明）。若把它们也塞进
- * 「前置失败 → skipAll」的清单，那么每个普通的插件失败报告里都会多出 5 条
+ * 「前置失败 → skipAll」的清单，那么每个普通的插件失败报告里都会多出若干条
  * `skip`（`plugin.early_exit` / `plugin.run_incomplete` / …）——报告噪声，且与
  * 「17 项 + N 条件项」的口径不符（人会以为探针真的验过这些出口）。
  *
