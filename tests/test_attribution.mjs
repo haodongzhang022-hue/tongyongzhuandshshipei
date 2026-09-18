@@ -36,6 +36,7 @@ import {
   PLUGIN_EARLY_EXIT_CHECK,
   PLUGIN_HARD_EVIDENCE,
   PLUGIN_PROBE_EXCEPTION_CHECK,
+  PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
   PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_SIDE_CHECKS,
   PLUGIN_SKIP_ON_PRECONDITION,
@@ -665,6 +666,34 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
     /if \(emitted\) return;/.test(probeSrc));
   eq('🔴-D：兜底中断时把未验项按规范顺序标 skip（报告里看得见「哪些没验」）', true,
     /skipPendingChecks\(/.test(probeSrc) && /PROBE_CHECK_ORDER/.test(probeSrc));
+
+  // 9.4e H1（复评，**放行级假绿**）源码守卫：探针收尾必须自检「进程内防线是否被插件撤销/静音」。
+  // 为什么必须有源码级断言：H1 的失败模式是**假绿**（判 GREEN 放行），比 AMBER 危险得多——
+  // 而行为级断言（真宿主 E2E / 闸门）需要 CI 装宿主才跑。本守卫让**离线**就能红：
+  // 删掉自检、或只查 capture callback 不查监听器计数（两个都能被单方面绕过）→ 即红。
+  eq('H1 源码守卫：收尾自检 capture callback（独占 API 被插件抢占 → 监听器被停用）', true,
+    /hasUncaughtExceptionCaptureCallback/.test(probeSrc));
+  eq('H1 源码守卫：收尾自检两个监听器仍在（removeAllListeners 也能摘掉兜底）', true,
+    /for \(const event of \['uncaughtException', 'unhandledRejection'\]\)[\s\S]{0,200}listenerCount\(event\)/.test(probeSrc));
+  eq('H1 源码守卫：自检在 emit() 内、且在 `out.ok` 判定**之前**（否则 GREEN 会被写出去）', true,
+    (() => {
+      const body = probeSrc.slice(probeSrc.indexOf('function emit()'), probeSrc.indexOf('/** definitions 不可用时'));
+      const tamper = body.indexOf('PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK');
+      const okAssign = body.indexOf('out.ok =');
+      return tamper > 0 && okAssign > tamper;
+    })());
+  eq('H1 源码守卫：自检只在插件集成相位判（宿主装配段判会误报）', true,
+    /out\.phase === PROBE_PHASE\.PLUGIN_INTEGRATION[\s\S]{0,400}hasUncaughtExceptionCaptureCallback/.test(probeSrc));
+  eq('H1：落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
+    PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK));
+  // 夹具自检：H1 夹具必须真的**抢占独占 API**（否则离线/E2E/闸门断言空转）
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-capture-callback-plugin.mjs'), 'utf8');
+    eq('H1 夹具：真的调 setUncaughtExceptionCaptureCallback（独占 API 抢占）', true,
+      /process\.setUncaughtExceptionCaptureCallback\(/.test(src));
+    eq('H1 夹具：抢占后仍排后台抛错（否则「静音」无意义）', true, /queueMicrotask\([\s\S]{0,120}throw /.test(src));
+    eq('H1 夹具：自述「绝不放行」（不变量写在夹具里）', true, src.includes('不放行'));
+  }
 
   // 9.4d 报告完整性（本轮实测发现的同族漏洞）：任何一次运行，17 项**一项都不能少**。
   // 为什么必须有：探针第 10 段（生命周期）的 catch 曾只标 `lifecycle.registered` / `lifecycle.dispose`，

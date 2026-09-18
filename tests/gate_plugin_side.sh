@@ -64,6 +64,10 @@ NEGATIVE_CASES=(
   "plugin-detach-handlers-plugin|plugin.early_exit|false|true"
   "plugin-busy-loop-plugin|plugin.async_uncaught_exception|true|true"
   "plugin-process-exit-plugin|plugin.early_exit|false|true"
+  # H1（复评）：插件抢占 `setUncaughtExceptionCaptureCallback` → 探针兜底被**静音**，
+  # 旧行为判 **GREEN 放行**（比 AMBER 更危险）。收口后必须判插件侧、完成位仍为 true
+  # （探针确实跑完了——它只是**不知道**自己被静音了）。
+  "plugin-capture-callback-plugin|plugin.process_defense_tampered|true|true"
 )
 
 for entry in "${NEGATIVE_CASES[@]}"; do

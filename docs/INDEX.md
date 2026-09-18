@@ -41,12 +41,12 @@
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
 | 离线单测 | `tests/test_offline.sh` | 测试 | 103 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 [16]**） |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 286 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9]（无网可跑） |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 294 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9]（无网可跑） |
 | 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 124 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** 场景，含 attribution + verdict + **完成位**三重断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 4b 步插件侧闸门 / 第 7 步「文档计数防漂移」） |
 | 插件侧闸门 | `tests/gate_plugin_side.sh` | 测试 | ★ 唯一事实源：四条出口 + SIGKILL 边界 + **防过度修正**（健康插件 17/17）；`.cnb.yml` push/PR 两段共用同一份 |
 | 离线探针回归台 | `tests/offline-probe-harness.mjs` | 测试 | 最小假宿主 + 真实探针子进程 + **装配器真实实现**解释输出（秒级覆盖四条出口；边界：假宿主通过 ≠ 真宿主适配通过） |
-| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索（38 项） |
+| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索（40 项） |
 | 示例插件 | `tests/fixtures/demo-plugin.mjs` | 测试 | 同时是接入模板 |
 | 负例插件 | `tests/fixtures/broken-plugin.mjs` | 测试 | 验证护栏不静默失效（声明保留名 → 插件侧硬证据） |
 | 负例插件（🔴-D 同步） | `tests/fixtures/plugin-side-throw-plugin.mjs` / `plugin-registry-throw-plugin.mjs` | 测试 | 插件侧**同步**异常（抛错 getter / 未初始化字段）→ `PLUGIN_REGRESSION` 且 `hostFatal=[]` |
@@ -91,7 +91,7 @@
 > 序号 = **探针实际输出顺序**（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
 
-**另有 5 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `src/harness/contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS`）：
+**另有 6 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `src/harness/contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS`）：
 
 | 条件检查 | 出口 | 触发场景 |
 |---|---|---|
@@ -100,6 +100,7 @@
 | `plugin.early_exit` | ③ 进程 exit | 插件在验收完成前调 `process.exit()` / 自杀式信号（`process.on('exit')` 钩子接住） |
 | `plugin.run_incomplete` | ④ `run()` 被拖住 | 插件挂住事件循环 / `apply()` 返回永不 resolve 的 Promise（**无条件**看门狗接住） |
 | `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM）——探针来不及写报告，装配器按**相位信标**归因 |
+| `plugin.process_defense_tampered` | ⑤ 防线被静音 | 插件抢占 `setUncaughtExceptionCaptureCallback`（Sentry / APM / 日志库常见）或 `removeAllListeners` ⇒ 探针进程级兜底被**静音**，后台抛错不可见 → 探针收尾自检判本项（**防放行级假绿**） |
 
 > 本表项数由 `tests/test_exports.mjs` 断言与 `CONDITIONAL_PROBE_CHECKS.length` 相等（改一处漏一处即红）。
 > 「17 项 ∪ 条件项 == 三张 check 表并集」与「`PROBE_CHECK_ORDER` == 探针实际输出顺序」由

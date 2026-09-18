@@ -198,10 +198,28 @@ console.log("  [2b'''] 文档「另有 N 项条件检查」与 CONDITIONAL_PROBE
   eq('🟡-4 守卫自证：未变异的表不缺项（反证断言非空转）', JSON.stringify([]),
     JSON.stringify(CONDITIONAL_PROBE_CHECKS.filter((name) => !idxTable.includes(name))));
   // 反证（把「为什么必须按段落变异」写成断言，防后人改回整份文档 replace）：
-  // 整份文档 replace 只改到第一处 → `includes()` 仍命中 → 旧自证漏检。
-  const mutatedWhole = idxText.replace(dropped, '`some_other_check`');
-  eq('🟡-4 反证：整份文档 replace 会漏检（条件项名在别处也出现）', false,
-    CONDITIONAL_PROBE_CHECKS.every((name) => mutatedWhole.includes(name)) === false);
+  // 整份文档 replace 只改到**第一处**；若同一 check 名在别处（如索引行）也出现，
+  // `includes()` 仍命中 → 旧自证**空转**（这正是上一版实测逃逸的形态）。
+  // ⚠️ 反证必须**自造**一个「名字出现两次」的文本，不能依赖当前文档恰好如此——
+  // 否则文档一改（如新增一行索引）反证就自己变红/变绿，成为新的漂移源。
+  {
+    // 造一段「名字出现两次」的文本：条件检查表里一次 + 别处索引行一次。
+    const synthetic = [
+      '**另有 1 项条件检查**：',
+      '',
+      '| 条件检查 | 出口 |',
+      '|---|---|',
+      `| \`${dropped}\` | ⑤ |`,
+      '',
+      `另见索引：\`${dropped}\``,
+      '',
+    ].join('\n');
+    eq('🟡-4 反证：自造文本可被段落切出（否则下面的反证空转）', true, tableOf(synthetic).includes(dropped));
+    const wholeReplace = synthetic.replace(dropped, '`some_other_check`');
+    const tableOnly = tableOf(synthetic).replace(dropped, '`some_other_check`');
+    eq('🟡-4 反证：整份文档 replace 只改第一处 → 仍命中（旧自证空转）', true, wholeReplace.includes(dropped));
+    eq('🟡-4 反证：按段落变异则真的丢掉该项（新自证有效）', false, tableOnly.includes(dropped));
+  }
   // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷）
   // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷：JSDoc 写「1 项」、文档写「2 项」）。
   // 只判**代码**视图：JSDoc 里为了说明历史而引用「另有 1 项条件检查」这句原文不算违规

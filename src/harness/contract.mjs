@@ -204,6 +204,30 @@ export const PLUGIN_RUN_INCOMPLETE_CHECK = 'plugin.run_incomplete';
 export const PLUGIN_ABNORMAL_TERMINATION_CHECK = 'plugin.abnormal_termination';
 
 /**
+ * 「探针的**进程内防线**被插件单方面撤销 / 静音」在插件集成相位的落点 check 名
+ * （已登记进 {@link PLUGIN_SIDE_CHECKS}）。
+ *
+ * 为什么必须有它（评审复评 H1，放行级假绿）：探针出口②（异步异常）靠
+ * `process.on('uncaughtException' / 'unhandledRejection')` 两个监听器兜底。但 Node 的
+ * `process.setUncaughtExceptionCaptureCallback(cb)` 一旦被调用，**监听器不再被调用**
+ * （官方语义：capture callback 存在时监听器被停用）。插件（或其依赖）在 `apply()` 里设一次
+ * 回调，探针的兜底就被**静音**：插件后台抛错完全不可见、`run()` 仍正常收尾、完成位仍为真
+ * ⇒ 整轮判 **GREEN / PASS（放行）**。
+ *
+ * 真实形态很常见：插件引入 Sentry / APM / 错误上报 / 日志库，这些库初始化时会抢占该独占 API
+ * ——**不是**刻意攻击，是普通工程实践。这比「判 AMBER」危险得多（AMBER 至少不放行）。
+ *
+ * 同理，插件 `process.removeAllListeners('uncaughtException')` 也能把探针的监听器摘掉
+ * （见 `tests/fixtures/plugin-detach-handlers-plugin.mjs`）。故收尾时**自检**：
+ * capture callback 为空 **且** 两个监听器仍在 → 否则判插件侧 check（本名）。
+ *
+ * ⚠️ 口径（与 {@link HOST_FATAL_FIELD} 的收窄一致）：本项**只能在探针还活着时**判。
+ * 插件若让探针**整个进程**消失（`SIGKILL` / `exit` / 挂住），本项同样来不及判——那时
+ * 由出口③④ 或装配器按相位信标归因。
+ */
+export const PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK = 'plugin.process_defense_tampered';
+
+/**
  * 进程级异常归属路由（**唯一事实源**，探针的进程级兜底与离线回归共用）。
  *
  * 语义与 {@link probeFailureRoute} **完全一致**（按相位、未知相位保守判插件侧），
@@ -430,6 +454,10 @@ export const PLUGIN_SIDE_CHECKS = [
   'plugin.run_incomplete',
   // 🔴 必修-2 边界：不可捕获终止（SIGKILL / OOM）由装配器按相位信标归因（有信标 → 本 check）。
   'plugin.abnormal_termination',
+  // H1（复评）：插件抢占 `setUncaughtExceptionCaptureCallback` / 摘掉监听器 → 探针的
+  // 进程级兜底被**静音** ⇒ 插件后台抛错不可见、完成位仍真 ⇒ **GREEN 放行**（比 AMBER 更危险）。
+  // 由探针收尾自检 `process.hasUncaughtExceptionCaptureCallback()` + 监听器计数判本项。
+  'plugin.process_defense_tampered',
 ];
 
 /**
@@ -451,6 +479,7 @@ export const CONDITIONAL_PROBE_CHECKS = [
   PLUGIN_EARLY_EXIT_CHECK,
   PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_ABNORMAL_TERMINATION_CHECK,
+  PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
 ];
 
 /**

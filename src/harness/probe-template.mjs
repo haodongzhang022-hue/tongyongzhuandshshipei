@@ -74,6 +74,7 @@
 import { writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import {
+  PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
   PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
@@ -158,6 +159,35 @@ let emitted = false;
 function emit() {
   if (emitted) return;
   emitted = true;
+  // H1（复评，**放行级假绿**）收尾自检：插件是否把探针的进程内防线单方面撤销 / 静音了？
+  // 必须在**写出报告之前**判，否则 GREEN 会被写出去（比 AMBER 更危险：AMBER 至少不放行）。
+  // 判据（两条都查，缺一即被绕过）：
+  //  ① `process.hasUncaughtExceptionCaptureCallback()` —— 插件（或其依赖如 Sentry / APM）
+  //     调过 `setUncaughtExceptionCaptureCallback()` ⇒ 出口② 的监听器**被 Node 停用**，
+  //     插件后台抛错完全不可见、`run()` 仍正常收尾、完成位仍真 ⇒ 整轮假绿；
+  //  ② 两个监听器仍在（`listenerCount`）——插件 `removeAllListeners('uncaughtException')`
+  //     也能摘掉兜底（见 plugin-detach-handlers 夹具）。
+  // 只在 `plugin-integration` 相位判：宿主装配段探针自己还没装监听器/还没跑插件，判了会误报。
+  // 纪律：本自检**不得抛**（运行在收尾路径上）。
+  try {
+    if (out.phase === PROBE_PHASE.PLUGIN_INTEGRATION) {
+      const tampered = [];
+      if (typeof process.hasUncaughtExceptionCaptureCallback === 'function' && process.hasUncaughtExceptionCaptureCallback()) {
+        tampered.push('setUncaughtExceptionCaptureCallback（capture callback 存在时 uncaughtException 监听器被停用）');
+      }
+      for (const event of ['uncaughtException', 'unhandledRejection']) {
+        if (process.listenerCount(event) === 0) tampered.push(`process.removeAllListeners('${event}')`);
+      }
+      if (tampered.length > 0 && !out.checks.some((check) => check.name === PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK)) {
+        out.checks.push({
+          name: PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
+          status: 'fail',
+          detail: `插件撤销/静音了探针的进程级防线（${tampered.join('；')}）——后台抛错将不可见，本轮结果不可信`,
+        });
+        out.errors.push(`${PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK}: 探针进程内防线被插件干预（${tampered.join('；')}）`);
+      }
+    }
+  } catch { /* 收尾路径上不得再抛 */ }
   // 完成位落进结构化结果（排障与断言都看得见「这次到底跑完了没有」）。
   out.runCompleted = runCompleted;
   // 🔴 必修-1：`ok` 必须**同时**要求「跑完」与「无失败」——否则出口 ③ 的中途报告会假绿

@@ -57,13 +57,33 @@
 ### 测试项数
 
 - `tests/test_offline.sh`：85 → **103 项**（新增 [16] 四条出口 18 条；[14] 改派生不增减）
-- `tests/test_attribution.mjs`：209 → **286 项**（新增 [9.9] 四条出口 + 完成位 65 条；[9.4] 增 🟡-3 兜底区切片守卫 6 条 + [9.4d] 报告完整性 3 条）
+- `tests/test_attribution.mjs`：209 → **294 项**（新增 [9.9] 四条出口 + 完成位 65 条；[9.4] 增 🟡-3 兜底区切片守卫 6 条 + [9.4d] 报告完整性 3 条 + [9.4e] H1 防线静音守卫 8 条）
 - `tests/test_e2e_regression.mjs`：92 → **124 项**（新增 [8c] 三条出口 × 10 + 假绿反证 2）
 - `tests/test_exports.mjs`：28 → **38 项**（新增 [2b'''] 文档条件项计数 = 事实源长度 + 段落级自证 10 条）
 - 新增夹具：`tests/fixtures/plugin-exit-plugin.mjs`、`tests/fixtures/plugin-hang-plugin.mjs`、`tests/fixtures/plugin-sigkill-plugin.mjs`
 - 新增脚本：`tests/gate_plugin_side.sh`（闸门唯一事实源）、`tests/offline-probe-harness.mjs`（离线探针回归台）
 - `tests/test_hub.sh`：新增第 4b 步（插件侧闸门，含防过度修正）
-- `.cnb.yml`：push / PR 的 `plugin-error-not-host-signal` 改为**共用** `tests/gate_plugin_side.sh`（夹具 4 → 7 份 + 健康插件防过度修正断言）
+- `.cnb.yml`：push / PR 的 `plugin-error-not-host-signal` 改为**共用** `tests/gate_plugin_side.sh`（夹具 4 → **10 份** + 健康插件防过度修正断言）
+- 新增夹具：`plugin-detach-handlers-plugin.mjs`（摘掉全部相关监听器）/ `plugin-busy-loop-plugin.mjs`（同步占死事件循环）/ `plugin-process-exit-plugin.mjs`（后台定时器里 exit）/ `plugin-capture-callback-plugin.mjs`（H1 抢占捕获回调）
+
+### H1（复评）：**放行级假绿** —— 插件静音探针的进程内防线（本轮已收口）
+
+评审复评指出：v0.1.9 的四条出口都**跑在探针进程内**，而插件可以**单方面撤销**它们。
+其中 **H1 是放行级假绿**（比 AMBER 更危险——AMBER 至少不放行）：
+
+| 形态 | 机理（Node 语义） | 旧行为 | 收口 |
+|---|---|---|---|
+| 插件调 `process.setUncaughtExceptionCaptureCallback(cb)` | capture callback 一旦设置，`uncaughtException` **监听器不再被调用**（官方语义）⇒ 探针出口② 被静音 | 插件后台抛错**完全不可见**、`run()` 正常收尾、完成位仍真 ⇒ **GREEN / PASS 放行** | 探针收尾（`emit()` 内、**写出报告之前**）自检 `process.hasUncaughtExceptionCaptureCallback()` + 两个监听器 `listenerCount > 0` → 判插件侧 check `plugin.process_defense_tampered` |
+| 插件 `removeAllListeners('uncaughtException'/'unhandledRejection')` | 监听器被摘掉 | 同上（出口② 失效） | 同上（**两条都查**，缺一即被绕过） |
+
+- 真实形态很常见：插件引入 Sentry / APM / 错误上报 / 日志库，初始化时会抢占该**独占** API
+  ——**不是**刻意攻击，是普通工程实践。
+- 新增夹具 `tests/fixtures/plugin-capture-callback-plugin.mjs`（H1 一行复现）+ 进闸门（10 负例）。
+- 防线：闸门（判插件侧 / `hostFatal` 为空 / **verdict=RED 不得 GREEN** / 完成位仍 `true`——探针确实跑完了，它只是**不知道**自己被静音了）；
+  离线 [9.4e] 源码守卫（自检存在 / **两条都查** / 在 `out.ok` 之前 / 只在插件集成相位判 / 落点已登记）+ 夹具自检；
+  删掉任一检查即红（已实测）。
+- **口径（不越权承诺）**：本项**只能在探针还活着时**判。插件若让探针**整个进程**消失
+  （`SIGKILL` / `process.exit` / 挂住），本项同样来不及判——那时由出口③④ 或装配器按相位信标归因。
 
 ### 放行判据（总师 §三⑤，不变）
 
