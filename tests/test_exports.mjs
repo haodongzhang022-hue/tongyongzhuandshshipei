@@ -12,6 +12,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, copyFileSy
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONDITIONAL_PROBE_CHECKS } from '../src/harness/contract.mjs';
+import { codeOnly } from './source-scan.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -146,6 +148,43 @@ console.log("  [2b'] INDEX 清单标题/序号列/注脚结构");
   eq('INDEX 注脚写明「序号 = 探针实际输出顺序」', true, /序号\s*=\s*\*\*探针实际输出顺序\*\*/.test(foot));
   eq('INDEX 注脚声明顺序由 tests/test_exports.mjs [2b] 守住', true,
     foot.includes('test_exports.mjs') && foot.includes('[2b]'));
+}
+
+// ---- 2b'''. 「另有 N 项条件检查」的 N 由 CONDITIONAL_PROBE_CHECKS 长度反推（复测 🟡-4） ----
+// 为什么补（评审 🟡-4）：`src/harness/contract.mjs` 的 JSDoc 曾写死「另有 1 项条件检查」，
+// 而两份文档早已改成 2 项——代码与文档各说各话；更糟的是「另有 N 项」这句**无守卫**
+// （`tests/` 搜「另有」0 命中）：改文档不改代码、或反之，都静默通过（与 🟡-2「删声明即静默」同族）。
+// 现在把 N 从**唯一事实源**（`CONDITIONAL_PROBE_CHECKS.length`）反推，两份文档必须一致，
+// 且每一条条件检查名都要在文档表里出现（防止「N 对但名单少了一项」）。
+console.log("  [2b'''] 文档「另有 N 项条件检查」与 CONDITIONAL_PROBE_CHECKS 一致");
+{
+  const N = CONDITIONAL_PROBE_CHECKS.length;
+  for (const file of ['docs/ADAPTER_GUIDE.md', 'docs/INDEX.md']) {
+    const text = readFileSync(path.join(ROOT, file), 'utf8');
+    const declared = /另有\s*(\d+)\s*项条件检查/.exec(text);
+    if (!declared) { bad(`${file} 声明「另有 N 项条件检查」`, '未找到该声明（声明本身是必需项）'); continue; }
+    eq(`${file} 的「另有 N 项条件检查」N = CONDITIONAL_PROBE_CHECKS.length`, String(N), declared[1]);
+    const missing = CONDITIONAL_PROBE_CHECKS.filter((name) => !text.includes(name));
+    eq(`${file} 条件检查表覆盖全部条件项（名单取自唯一事实源）`, JSON.stringify([]), JSON.stringify(missing));
+  }
+  // 守卫自证：N 改字即红（把两份文档的 N 改掉，断言必须不成立）
+  const idxText = readFileSync(path.join(ROOT, 'docs/INDEX.md'), 'utf8');
+  const mutated = idxText.replace(/另有\s*\d+\s*项条件检查/, `另有 ${N + 1} 项条件检查`);
+  eq('🟡-4 守卫自证：N 被改字即红', false, /另有\s*(\d+)\s*项条件检查/.exec(mutated)?.[1] === String(N));
+  // 守卫自证：条件项名单被删一项即红（用**同一段断言逻辑**跑一份「删掉最后一条」的假文档）
+  const dropped = CONDITIONAL_PROBE_CHECKS[CONDITIONAL_PROBE_CHECKS.length - 1];
+  const mutatedName = idxText.replace(dropped, '`some_other_check`');
+  const missingInMutated = CONDITIONAL_PROBE_CHECKS.filter((name) => !mutatedName.includes(name));
+  eq('🟡-4 守卫自证：条件项名单缺一项即红', JSON.stringify([dropped]), JSON.stringify(missingInMutated));
+  eq('🟡-4 守卫自证：未变异的文档不缺项（反证断言非空转）', JSON.stringify([]),
+    JSON.stringify(CONDITIONAL_PROBE_CHECKS.filter((name) => !idxText.includes(name))));
+  // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷）
+  // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷：JSDoc 写「1 项」、文档写「2 项」）。
+  // 只判**代码**视图：JSDoc 里为了说明历史而引用「另有 1 项条件检查」这句原文不算违规
+  // （否则守卫会因文档而红，逼人把历史说明删掉——那正是「文档即防线」要保留的东西）。
+  const contractSrc = readFileSync(path.join(ROOT, 'src/harness/contract.mjs'), 'utf8');
+  eq('🟡-4：contract.mjs 的条件项 JSDoc 不再写死 N（改由本守卫反推）', false,
+    /另有\s*\d+\s*项条件检查/.test(codeOnly(contractSrc)));
 }
 
 // ---- 2b''. CHANGELOG 对防线编号的自述必须可检索到真实断言（复测 🟡P2-新-3） ----

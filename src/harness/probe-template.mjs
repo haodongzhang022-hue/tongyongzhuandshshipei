@@ -51,12 +51,13 @@
  *
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
-import { writeSync } from 'node:fs';
+import { writeFileSync, writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import {
   PLUGIN_SIDE_CHECKS,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
+  PROBE_PHASE_FILE,
   collectContract,
   pushHostFatal,
   recordProbeAsyncException,
@@ -77,6 +78,32 @@ const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}
  */
 let phase = PROBE_PHASE.HOST_ASSEMBLY;
 out.phase = phase;
+
+/**
+ * 把当前相位写进**侧信道文件**（评审 🔴-D′：探针被杀时唯一还活着的证据）。
+ *
+ * 为什么必须落盘、且**每次切相位就写**：插件能把探针整个弄死（`apply()` 永不 settle →
+ * Node 以 unsettled top-level await 退出；后台任务 `process.exit()`；先摘
+ * `uncaughtException` / `unhandledRejection` 处理器再抛；占死事件循环）。这四种情形下
+ * 探针内的兜底处理器与看门狗**都来不及跑**，「异常归属」随之丢失 → 装配器只看到
+ * 「没有 `__DSH_PROBE__`」→ 旧行为一律判宿主侧（上游漂移）。
+ *
+ * 落盘文件不受进程内事件循环影响：**已经写下**的相位在探针死后依然可读，
+ * 装配器据此判「探针死在插件集成相位 = 插件侧行为」。
+ *
+ * 纪律：本函数**不得抛**（它运行在验收主路径上，写不进去只说明环境只读——
+ * 那就退回「装配器读不到侧信道 → 按宿主侧保守处理」，绝不能因此把整份验收搞崩）。
+ *
+ * @param {string} next 见 {@link PROBE_PHASE}
+ * @returns {void}
+ */
+function writePhaseSideChannel(next) {
+  try {
+    writeFileSync(PROBE_PHASE_FILE, `${next}\n`);
+  } catch { /* 侧信道写不进去：装配器读不到 → 按宿主侧保守处理，不阻断验收 */ }
+}
+// 启动即落盘宿主装配相位：装配器读不到文件（如探针根本没起来）与读到 host-assembly 同义。
+writePhaseSideChannel(phase);
 const check = (name, ok, detail) => {
   out.checks.push({ name, status: ok ? 'pass' : 'fail', detail: detail === undefined ? '' : String(detail).slice(0, 600) });
   if (!ok) out.errors.push(`${name}: ${detail ?? ''}`);
@@ -226,6 +253,8 @@ async function run() {
   // 绝不写 hostFatal[]（否则插件 bug 会被判成上游漂移，并盖掉插件侧已失败的 check）。
   phase = PROBE_PHASE.PLUGIN_INTEGRATION;
   out.phase = phase;
+  // 侧信道同步落盘：此后的任何「探针被杀」都仍能被装配器正确归因（插件侧）。
+  writePhaseSideChannel(phase);
   let plugin = null;
   try {
     plugin = await import(pathToFileURL(pluginPath).href);
@@ -346,7 +375,10 @@ async function run() {
     check('lifecycle.dispose', after.length === 0, after.length === 0 ? '卸载后无残留' : '卸载后仍残留：' + after.join(','));
   } catch (error) {
     check('lifecycle.registered', false, `生命周期路径执行抛错（插件定义不可注册）：${brief(error)}`);
-    skip('lifecycle.dispose', '生命周期路径未完成，跳过');
+    // 报告完整性（本轮闸门发现的**同族**漏洞）：`lifecycle.disposer_count` 的 `check()` 在
+    // 抛错点**之前**，异常打断后它既没 pass 也没 fail——报告里就少了一项（17 → 16），
+    // 人分不清「没验」与「验过了」。`skipAll` 只补未记录项，故不会与已记录的 fail/skip 重复。
+    skipAll(['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose'], '生命周期路径未完成（抛错），该项未验证');
   }
 
   // ---- 11. 保留名冲突：既不得静默丢弃，也不得被放行（插件须改名） ----
@@ -455,8 +487,16 @@ function onProcessLevelException(kind, error) {
     } catch { /* 崩溃路径上不再抛 */ }
     finish(1);
   }, ASYNC_WATCHDOG_MS);
-  // unref：run() 正常跑完时看门狗不该拖住进程（收尾走下面的 finish）。
-  watchdog.unref?.();
+  // ⚠️ 纪律（评审 🔴-D′ 必修中的必修）：**绝不可**在此 `watchdog.unref()`。
+  // 历史缺陷：这一行让「看门狗兜住 run() 被拖住」这条声明在**它被写出来的那个场景里不可达**——
+  // 插件让 apply() 永不 settle 时事件循环已空，unref 的定时器不算「有活儿」→ Node 直接以
+  // 「unsettled top-level await」退出（exit 13），看门狗永远排不上，报告整份消失。
+  // 现在定时器保持 ref：run() 被拖住 → 10s 后强制收尾并输出结构化结果（报告不丢）。
+  // 代价可接受：run() 正常跑完时走 finish() → process.exit()，不会多等。
+  // 防线：`tests/test_attribution.mjs` [9.8g]（源码级「不得出现 watchdog.unref」）+
+  // `tests/test_e2e_regression.mjs` [8c]（行为级：挂起 + 后台抛错 → 失败项必须是
+  // 探针侧 `plugin.async_uncaught_exception`，而不是装配器侧 `plugin.probe_aborted`——
+  // 把 unref 写回去即红）。
 }
 process.on('uncaughtException', (error) => onProcessLevelException('uncaughtException', error));
 process.on('unhandledRejection', (reason) => onProcessLevelException('unhandledRejection', reason));

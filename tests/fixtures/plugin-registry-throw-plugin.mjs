@@ -27,7 +27,10 @@ const definition = {
   get parameters() {
     return this.config.properties;
   },
-  output: { schema: { type: 'object', properties: { text: { type: 'string' } } }, render: () => [] },
+  // 真实 render（评审 🟡-5：`render: () => []` 会让 dispatch.render_projected / echo_payload
+  // 额外失败，噪声掩盖「失败点精确留在读插件侧数据」的自述）。本夹具**直接**调宿主
+  // `ctx.tools.register()`（不过中台适配器 → 没有 defaultRender 兜底），故 render 必须真给。
+  output: { schema: { type: 'object', properties: { text: { type: 'string' } } }, render: (args, value) => [{ type: 'text', text: String(value?.text ?? '') }] },
   execute: async (args) => ({ text: `echo: ${args?.text ?? ''}` }),
 };
 

@@ -68,39 +68,20 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D 闸门：插件写错代码（未初始化类字段 / 抛错 getter / **后台任务异步抛错**）
-            # → 必须判插件，且 hostFatal[] 必须为空（插件侧错误**永远**不进判据字段）。
-            # 只看 attribution 不够：AMBER 漂移窗口下也可能 fail，必须同时断言 hostFatal 为空。
+            # 🔴-D / 🔴-D′ 闸门：插件侧异常与**插件侧中断**都不得进判据字段 hostFatal[]。
+            # 断言口径与夹具清单**只有一处**（tests/gate_plugin_side.mjs）——push 段与 PR 段
+            # 原先各抄一份同样的 inline 断言，两处一旦漂移，其中一处会静默失效（闸门失效比没有
+            # 闸门更危险：它给人「已守住」的错觉）。
             #
-            # 异步两例（plugin-async-throw / plugin-async-reject）是本轮补的**同族活口**：
-            # 异常不在 run() 调用栈上，顶层 catch 接不到——旧探针会在写出结构化结果前被杀，
-            # 装配器看到「探针未输出结构化结果」→ 无条件 pushHostFatal() → 判漂移且 checks 归零。
-            # 故这里额外断言 checks 非空（报告没丢）与失败项是插件侧异步 check。
-            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin plugin-async-throw-plugin plugin-async-reject-plugin; do
-              if node src/cli.mjs verify --channel stable \
-                   --plugin ./tests/fixtures/$fixture.mjs \
-                   --tools demo_echo --json ./.ci/verify-$fixture.json; then
-                echo "❌ $fixture 被误判为通过"; exit 1
-              fi
-              node -e '
-                const file = process.argv[1];
-                const r = require(file);
-                const c = r.channels[0];
-                const bad = [];
-                if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因不是 PLUGIN_REGRESSION（实得 " + c.attribution + "）");
-                if ((c.hostFatal || []).length !== 0) bad.push("hostFatal 非空（插件侧错误写进了判据字段）：" + JSON.stringify(c.hostFatal));
-                if (r.summary.verdict === "AMBER") bad.push("判决为 AMBER（插件 bug 被甩给上游）");
-                // 报告完整性：旧缺陷下 checks 会归零（整份报告消失）——这里必须非空且含 pass
-                const checks = c.checks || [];
-                if (checks.length === 0) bad.push("checks 为空（报告整份消失——旧缺陷形态）");
-                if (!checks.some((x) => x.status === "pass")) bad.push("无 pass 项（已跑完的检查被丢弃）");
-                if (/async/.test(file) && !checks.some((x) => x.name === "plugin.async_uncaught_exception")) {
-                  bad.push("异步夹具未落插件侧异步 check（plugin.async_uncaught_exception）");
-                }
-                if (bad.length) { console.error("❌ 🔴-D 闸门失败：" + bad.join("；")); process.exit(1); }
-                console.log("✅ " + file + "：PLUGIN_REGRESSION / hostFatal 为空 / checks=" + checks.length + " / verdict=" + r.summary.verdict);
-              ' ./.ci/verify-$fixture.json
-            done
+            # 覆盖 8 份夹具、三种形态：
+            #  ① 探针活着·同步异常（plugin-side-throw / plugin-registry-throw）
+            #  ② 探针活着·异步异常（plugin-async-throw / plugin-async-reject）
+            #  ③ **探针被插件杀掉**（plugin-hang / plugin-process-exit / plugin-detach-handlers /
+            #     plugin-busy-loop）——探针内任何兜底都来不及跑，由**装配器**读带外侧信道相位
+            #     （probe-phase.txt）归因；失败项 plugin.probe_aborted / plugin.async_uncaught_exception。
+            # 每份都断言：attribution=PLUGIN_REGRESSION、hostFatal 为空、verdict≠AMBER、
+            # checks 非空且 17 项一项不缺、失败项全在 PLUGIN_SIDE_CHECKS 内、期望失败项确实出现。
+            node tests/gate_plugin_side.mjs --channel stable --json-dir ./.ci
     - name: upstream-watch
       docker:
         image: node:22
@@ -153,27 +134,10 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D 闸门（同 push）：插件侧异常不得进 hostFatal[]——含**异步**两例
-            # （后台任务抛错 / 预取 promise 拒绝：不在 run() 调用栈上，旧探针会整份报告消失）
-            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin plugin-async-throw-plugin plugin-async-reject-plugin; do
-              node src/cli.mjs verify --channel stable \
-                --plugin ./tests/fixtures/$fixture.mjs \
-                --tools demo_echo --json ./.ci/verify-$fixture.json && { echo "❌ $fixture 被误判为通过"; exit 1; }
-              node -e '
-                const r = require(process.argv[1]);
-                const c = r.channels[0];
-                const checks = c.checks || [];
-                const bad = [];
-                if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因 " + c.attribution);
-                if ((c.hostFatal || []).length !== 0) bad.push("hostFatal=" + JSON.stringify(c.hostFatal));
-                if (checks.length === 0) bad.push("checks 为空（报告整份消失）");
-                if (bad.length) {
-                  console.error("❌ 🔴-D 闸门失败：" + bad.join(" / "));
-                  process.exit(1);
-                }
-                console.log("✅ " + process.argv[1] + "：PLUGIN_REGRESSION / hostFatal 为空 / checks=" + checks.length);
-              ' ./.ci/verify-$fixture.json
-            done
+            # 🔴-D / 🔴-D′ 闸门（与 push 段同一脚本：口径与夹具清单只有一处，防两段漂移后
+            # 其中一处静默失效）。8 份夹具 / 三种形态：探针活着·同步、探针活着·异步、
+            # **探针被插件杀掉**（挂起 / process.exit / 摘处理器 / 占死事件循环）。
+            node tests/gate_plugin_side.mjs --channel stable --json-dir ./.ci
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
     - name: upstream-drift-scan

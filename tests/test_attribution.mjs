@@ -32,17 +32,21 @@ import {
   CONTRACT_SIDE_CHECKS,
   HOST_SIDE_CHECKS,
   PLUGIN_ASYNC_EXCEPTION_CHECK,
+  PLUGIN_PROBE_ABORTED_CHECK,
   PLUGIN_HARD_EVIDENCE,
   PLUGIN_PROBE_EXCEPTION_CHECK,
   PLUGIN_SIDE_CHECKS,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
   collectContract,
+  probeAbortRoute,
   probeAsyncFailureRoute,
   probeFailureRoute,
   pushHostFatal,
+  recordProbeAbort,
   recordProbeAsyncException,
   recordProbeException,
+  skipPendingProbeChecks,
 } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
@@ -543,6 +547,13 @@ console.log('  [8] 装配器结构化宿主信号（runHostProbe 离线缺缓存
     // 反向证明：把结构化字段清空（只留日志文本）→ 不再判漂移，说明判据**没有**偷偷读 errors
     eq('离线缺缓存：清空 hostFatal 后判据不再命中（证明未读 errors 文本）', 'UNKNOWN',
       attributeFailure({ ...probe, hostFatal: [] }, registry.channels.stable, 'stable'));
+    // 🔴-D′ 反向护栏（离线可跑）：探针**根本没起来** → 侧信道读不到 → 归因仍走宿主侧。
+    // 收窄的只有「侧信道明确写着插件集成相位」；这条断言防后人把缺省分支也收窄成插件侧
+    // （那会让「宿主包缺失 / 环境只读」被判成插件 bug —— 真漂移被收窄，比误判插件更危险）。
+    eq('🔴-D′：探针未执行 → 侧信道相位为 null（读不到即未写下）', null, probe.sideChannelPhase);
+    eq('🔴-D′：探针未执行 → checks 为空（装配器不替探针补项：探针从未回报）', 0, (probe.checks ?? []).length);
+    eq('🔴-D′：探针未执行 → 归因 UPSTREAM_DRIFT（真漂移不得被收窄）', 'UPSTREAM_DRIFT',
+      attributeFailure(probe, registry.channels.stable, 'stable'));
   } finally {
     rmSync(emptyCache, { recursive: true, force: true });
   }
@@ -589,8 +600,37 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
   //   (b) 别名 `const pf = pushHostFatal; pf(out, ...)` 不命中 `pushHostFatal\(`。
   // 修法：改用 `codeOnly`（去注释 + 去字符串/模板**文本**，保留 `${...}` 插值代码——与 [10] 口径统一）
   // 并按**标识符**判（`\bpushHostFatal\b`）。主防线仍是行为反证（真宿主 E2E 断言 hostFatal 为空）。
-  const catchBody = codeOnly(probeSrc.slice(probeSrc.lastIndexOf('try {\n  await run();')));
-  eq('🔴-D：顶层 catch 体内无裸 pushHostFatal（按标识符判，交由按相位路由）', false, /\bpushHostFatal\b/.test(catchBody));
+  // 切片范围（🟡-3，评审实测盲区）：上一版从 `try {\n  await run();` 起切——**兜底处理器区域
+  // （进程级 handler + 收尾）不在视野内**。评审用「保留 `recordProbeAsyncException` 诱饵 +
+  // 另加一行 `pushHostFatal`」变异，源码守卫**漏检**（只有行为级 E2E 抓到）。
+  // 修法：切片起点上移到**兜底区首行**（`// ---- 进程级兜底` 段标记），覆盖
+  // 「进程级 handler + 顶层 catch + finish」整块崩溃路径——那里是唯一可能被写回
+  // 裸 `pushHostFatal` 的地方（其余位置按相位路由，已由 9.2/9.3 的行为断言覆盖）。
+  const fallbackMarker = '// ---- 进程级兜底';
+  const fallbackIdx = probeSrc.indexOf(fallbackMarker);
+  eq('🟡-3：探针源码存在兜底区段标记（切片锚点，改名即红）', true, fallbackIdx > 0);
+  const fallbackBody = codeOnly(fallbackIdx > 0 ? probeSrc.slice(fallbackIdx) : probeSrc.slice(probeSrc.lastIndexOf('try {\n  await run();')));
+  eq('🔴-D：兜底区（进程级 handler + 顶层 catch + finish）内无裸 pushHostFatal（按标识符判，交由按相位路由）', false, /\bpushHostFatal\b/.test(fallbackBody));
+  // 🟡-3 守卫自证：评审实测逃逸的变异形态，现在必须被抓到
+  const fallbackSamples = {
+    '兜底区内另加一行 pushHostFatal（评审变异：诱饵保留 recordProbeAsyncException）': 'recordProbeAsyncException(out, phase, detail);\npushHostFatal(out, "探针异步异常");',
+    '兜底区内别名调用': 'const pf = pushHostFatal; pf(out, "x");',
+    '兜底区内模板插值调用': 'out.errors.push(`${pushHostFatal(out, "x")}`);',
+  };
+  for (const [label, sample] of Object.entries(fallbackSamples)) {
+    eq(`🟡-3 守卫自证：${label} 被抓到`, true, /\bpushHostFatal\b/.test(codeOnly(sample)));
+  }
+  // 🟡-3 反证：旧切片确实漏检——把「兜底区内加了 pushHostFatal」的假源码喂给**旧**切片方式
+  {
+    const mutated = probeSrc.replace(
+      '    recordProbeAsyncException(out, phase, detail);',
+      '    recordProbeAsyncException(out, phase, detail);\n    pushHostFatal(out, "变异注入");',
+    );
+    const oldSlice = codeOnly(mutated.slice(mutated.lastIndexOf('try {\n  await run();')));
+    const newSlice = codeOnly(mutated.slice(mutated.indexOf(fallbackMarker)));
+    eq('🟡-3 反证：旧切片（自顶层 catch 起切）漏检兜底区内的 pushHostFatal', false, /\bpushHostFatal\b/.test(oldSlice));
+    eq('🟡-3 反证：新切片（自兜底区起切）抓到同一变异', true, /\bpushHostFatal\b/.test(newSlice));
+  }
   // 🟡-1 守卫自证：上一版实测逃逸的两种写法，现在必须被抓到
   const guardSamples = {
     '同行含 `//` 的字符串（stripComments 盲区）': 'const u = "probe:///x"; pushHostFatal(out, "x");',
@@ -715,6 +755,80 @@ console.log('  [9.8] 🔴-D 异步活口（进程级兜底 + 双路径不变量�
   eq('🔴-D 异步：17 项 ∪ 条件项 == 三张 check 表并集（新增 check 必须同时登记，否则红）', JSON.stringify(tableUnion), JSON.stringify(declaredUnion));
   eq('🔴-D 异步：条件项不计入 17 项（口径：17 项 + N 条件项）', 0,
     CONDITIONAL_PROBE_CHECKS.filter((name) => PROBE_CHECK_ORDER.includes(name)).length);
+
+  // 9.8g 看门狗**能红**断言（评审 🔴-D′ 要求「给看门狗补一条能红的断言，把 unref 删掉即红那种」）
+  // 为什么源码级也要一条：行为级断言（真宿主 E2E [8c] / 闸门 plugin-hang）能抓到「unref 写回去」，
+  // 但它们需要真宿主（慢、CI 才跑）。本守卫让**离线**就能红：删掉 unref 即绿、写回即红。
+  // 切片纪律：只判**代码**（codeOnly），且只判 `watchdog` 这个标识符上的 `.unref`——
+  // 注释里说明「绝不可 unref」不算违规（否则守卫会因文档而红，逼人删掉解释）。
+  {
+    // 源码取本地变量 `orderProbeSrc`（[9.8e] 已读同一文件）——跨块作用域不共享 `probeSrc`。
+    const watchdogSource = orderProbeSrc;
+    const watchdogCode = codeOnly(watchdogSource);
+    eq('🔴-D′：看门狗定时器**保持 ref**（不得 `watchdog.unref()`——空事件循环下它永不触发）', false,
+      /\bwatchdog\s*\.\s*unref\b/.test(watchdogCode));
+    // 守卫自证：写回该行必须被抓到（防「守卫写松了但没人知道」）
+    eq('🔴-D′ 守卫自证：`watchdog.unref?.()` 写回即红', true,
+      /\bwatchdog\s*\.\s*unref\b/.test(codeOnly('const watchdog = setTimeout(fn, 10_000);\nwatchdog.unref?.();')));
+    // 反证：注释里的说明不误报（codeOnly 去注释）
+    eq('🔴-D′ 守卫自证：注释里的 `watchdog.unref()` 不误报', false,
+      /\bwatchdog\s*\.\s*unref\b/.test(codeOnly('// 绝不可 watchdog.unref()：空事件循环下看门狗永不触发\nconst a = 1;')));
+    // 看门狗本身必须存在且**保持 ref**（删掉整段 setTimeout 也是失效——不是只有 unref 一种坏法）
+    eq('🔴-D′：看门狗窗口常量为正数（存在可读的兜底时长）', true, /const ASYNC_WATCHDOG_MS = \d[\d_]*;/.test(watchdogSource));
+    eq('🔴-D′：兜底路径确实挂了看门狗（setTimeout + finish，run() 被拖住也能收尾）', true,
+      /setTimeout\(\(\) => \{[\s\S]{0,400}finish\(1\);/.test(watchdogSource));
+  }
+
+  // 9.8h 装配器侧带外相位分流的**源码守卫**（🔴-D′ 的写入端纪律：三处都不得回退）
+  // 为什么源码级也要：行为级断言（闸门 / E2E）需要真宿主；本守卫让**离线**就能红，
+  // 且能守住那些「行为等价但纪律已破」的改法（例如把侧信道文件删掉改成每次覆盖写）。
+  {
+    const hostSrc = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
+    const hostCode = codeOnly(hostSrc);
+    // ① marker 缺失分支必须走 recordProbeAbort（按侧信道分流），不得回到无条件 pushHostFatal
+    eq('🔴-D′：装配器 marker 缺失分支走 recordProbeAbort（按带外相位分流）', true, /\brecordProbeAbort\s*\(/.test(hostCode));
+    eq('🔴-D′：装配器读侧信道相位（PROBE_PHASE_FILE）', true, /\bPROBE_PHASE_FILE\b/.test(hostCode));
+    // ② 跑探针前必须先删侧信道文件（否则同 workDir 复用时，上一轮的相位会让「这次探针没起来」
+    //    被误判成插件侧 = 真漂移被收窄）。这条纪律没有任何行为级断言能覆盖（E2E 每次新目录）。
+    eq('🔴-D′：跑探针前先删侧信道文件（防同 workDir 复用的陈旧相位把真漂移收窄）', true,
+      /rmSync\([\s\S]{0,120}PROBE_PHASE_FILE/.test(hostCode));
+    // ③ 探针侧必须**每次切相位**落盘（不是只写一次）：两处调用点（启动 + 进插件集成段）
+    const probeSideSrc = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+    eq('🔴-D′：探针每次切相位都落盘侧信道（调用点 ≥ 2：启动 + 进插件集成段）', true,
+      (probeSideSrc.match(/writePhaseSideChannel\(/g) ?? []).length >= 3); // 定义 1 + 调用 2
+    eq('🔴-D′：侧信道写入包在 try 里（写不进去只退回保守口径，不得搞崩验收）', true,
+      /function writePhaseSideChannel\([\s\S]{0,200}try \{[\s\S]{0,200}writeFileSync\(PROBE_PHASE_FILE/.test(probeSideSrc));
+    // ④ 装配器侧分流与探针侧相位语义**同构**：三个相位逐一等价（防两条路由各自漂移）
+    eq('🔴-D′：probeAbortRoute 与探针相位语义同构（plugin-integration → 插件侧）', 'plugin',
+      probeAbortRoute(PROBE_PHASE.PLUGIN_INTEGRATION).side);
+    eq('🔴-D′：probeAbortRoute 落点名 = PLUGIN_PROBE_ABORTED_CHECK（已登记，否则归因退化成 UNKNOWN）', true,
+      PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROBE_ABORTED_CHECK)
+      && probeAbortRoute(PROBE_PHASE.PLUGIN_INTEGRATION).check === PLUGIN_PROBE_ABORTED_CHECK);
+    eq('🔴-D′：探针未回报相位 / 读到宿主装配相位 → 一律宿主侧（保守，不丢真漂移）', true,
+      probeAbortRoute(null).side === 'host'
+      && probeAbortRoute(undefined).side === 'host'
+      && probeAbortRoute(PROBE_PHASE.HOST_ASSEMBLY).side === 'host'
+      && probeAbortRoute('some-unknown-phase').side === 'host');
+    // ⑤ 崩溃路径纪律：写入端不得抛（它运行在「探针已死」的路径上，抛出 = 整份报告消失）
+    for (const [label, target] of [
+      ['缺 checks/errors 字段', { hostFatal: [] }],
+      ['字段类型全错', { checks: 'x', errors: 1, hostFatal: 'y' }],
+      ['errors 为抛错 getter', Object.defineProperty({ hostFatal: [] }, 'errors', { get() { throw new Error('boom'); }, set() { throw new Error('boom'); } })],
+    ]) {
+      let threw = 'no-throw';
+      try { recordProbeAbort(target, PROBE_PHASE.PLUGIN_INTEGRATION, 'x'); } catch { threw = 'threw'; }
+      eq(`🔴-D′：崩溃路径上 recordProbeAbort 不抛（${label}）`, 'no-throw', threw);
+    }
+    // ⑥ 补 skip 的写入端也不得抛，且只补 skip（装配器没有资格替探针宣布 pass/fail）
+    eq('🔴-D′：skipPendingProbeChecks 对畸形目标不抛', 'no-throw', (() => {
+      try { skipPendingProbeChecks(null, 'x'); skipPendingProbeChecks({ checks: 'x' }, 'x'); return 'no-throw'; } catch { return 'threw'; }
+    })());
+    eq('🔴-D′：补的项状态只有 skip（不得出现 pass/fail）', true, (() => {
+      const t = { checks: [] };
+      skipPendingProbeChecks(t, 'r');
+      return t.checks.length === PROBE_CHECK_ORDER.length && t.checks.every((c) => c.status === 'skip');
+    })());
+  }
 
   // 9.8f 夹具自检：异步夹具必须真的「在 apply 里排后台任务并抛错」——否则离线/E2E 断言空转
   for (const [fixture, marker, pattern] of [

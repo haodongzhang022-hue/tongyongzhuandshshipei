@@ -73,6 +73,9 @@ export function verifyChannel(options) {
     hostFatal: Array.isArray(probe.hostFatal) ? probe.hostFatal : [],
     // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
     probePhase: probe.phase ?? null,
+    // 探针**侧信道**相位（`probe-phase.txt`）：探针被杀时唯一还活着的归属证据。
+    // 与 `probePhase` 的区别：后者来自探针的结构化输出（探针活着才有），前者落盘、探针死后仍可读。
+    probeSideChannelPhase: probe.sideChannelPhase ?? null,
     probeExit: probe.probeExit ?? null,
     install: probe.install,
     cacheHit: probe.cacheHit,

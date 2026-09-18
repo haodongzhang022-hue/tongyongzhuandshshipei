@@ -29,6 +29,17 @@
  *    → 无条件 `pushHostFatal()` → `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**（整份报告消失）。
  *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.async_uncaught_exception`、
  *    `checks` 非空且已跑完的检查全在（报告不丢）、`probePhase = plugin-integration`。
+ * 9c. **🔴-D′ 同族活口·第二轮（探针被插件杀掉）**：`apply()` 永不 settle / 后台任务 `process.exit()` /
+ *    先摘掉进程级处理器再抛 / 占死事件循环——这四条**探针内任何兜底都来不及跑**
+ *    （`uncaughtException` 处理器、看门狗、`writeSync` 全部失效）。
+ *    历史缺陷：装配器看到「探针未输出结构化结果」→ 无条件 `pushHostFatal()` → `UPSTREAM_DRIFT`/AMBER
+ *    且 `checks = 0`。现在由**带外**侧信道相位（`probe-phase.txt`，落盘、探针死后仍可读）归因：
+ *    `PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.probe_aborted`、
+ *    17 项按规范顺序补 `skip`（报告形态与正常失败一致）、`probePhase = plugin-integration`。
+ * 9c′. **看门狗「能红」断言（行为级）**：`apply()` 挂起 + 后台抛错时，看门狗（**保持 ref**）
+ *    必须在 10s 窗口内收尾，于是失败项是**探针侧** `plugin.async_uncaught_exception`。
+ *    若有人把 `watchdog.unref()` 写回去 → 看门狗失效 → 失败项变成 `plugin.probe_aborted`
+ *    → 本断言红（与离线源码守卫 [9.8g] 互为对偶）。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
@@ -40,7 +51,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { channelFingerprint, loadChannels } from '../src/harness/host.mjs';
 // P2-8：插件侧 check 名单**从唯一事实源 import**（此前硬编码 12 项，表一改测试就不设防）
-import { PLUGIN_SIDE_CHECKS } from '../src/harness/contract.mjs';
+import { PLUGIN_SIDE_CHECKS, PROBE_CHECK_ORDER } from '../src/harness/contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -304,6 +315,52 @@ try {
       checks.filter((c) => c.status === 'pass').length, (again.checks ?? []).filter((c) => c.status === 'pass').length);
   }
 
+  // ---- 11c. 🔴-D′：探针被插件**杀掉**（挂起 / process.exit / 摘处理器）→ 靠带外相位归因 ----
+  // 为什么单列：这四条路径下探针内的兜底（uncaughtException / 看门狗 / writeSync）**全都失效**——
+  // 唯一还活着的证据是落盘的侧信道相位文件。断言必须覆盖「报告不丢（17 项按序补 skip）」。
+  console.log('  [8c] 🔴-D′：探针被插件杀掉 → 必须判插件、hostFatal 为空、报告不丢');
+  for (const [label, fixture, expectedFail] of [
+    ['apply() 永不 settle（exit 13，看门狗兜底）', 'plugin-hang-plugin.mjs', 'plugin.async_uncaught_exception'],
+    ['后台任务 process.exit（探针当场消失）', 'plugin-process-exit-plugin.mjs', 'plugin.probe_aborted'],
+    ['先摘进程级处理器再抛错', 'plugin-detach-handlers-plugin.mjs', 'plugin.probe_aborted'],
+    ['后台任务占死事件循环（看门狗排不上→占死后收尾）', 'plugin-busy-loop-plugin.mjs', 'plugin.async_uncaught_exception'],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    eq(`${label}（verdict 不是 AMBER——责任未被甩给上游）`, true, report.summary?.verdict !== 'AMBER');
+    const checks = report.checks ?? [];
+    eq(`${label}（checks 非空——整份报告不得消失）`, true, checks.length > 0);
+    // 报告完整性：17 项**一项都不能少**（探针被杀时装配器按规范顺序补 skip，不让它们消失）
+    const recorded = new Set(checks.map((c) => c.name));
+    eq(`${label}（17 项报告一项不缺）`, JSON.stringify([]), JSON.stringify(PROBE_CHECK_ORDER.filter((name) => !recorded.has(name))));
+    eq(`${label}（失败项含 ${expectedFail}）`, true, checks.some((c) => c.name === expectedFail && c.status === 'fail'));
+    // 失败项必须全在插件侧表内（不得出现宿主侧 check 失败 → 否则归因会被判据 1 抢走）
+    const pluginSide = new Set(PLUGIN_SIDE_CHECKS);
+    const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（失败项全在插件侧，名单取自 PLUGIN_SIDE_CHECKS）`, true, failed.every((name) => pluginSide.has(name)));
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+    eq(`${label}（hostFatal 不含 stack 帧 'at '）`, false, /\n\s*at /.test(fatalText));
+    // 相位随报告透出（异常归属依据；侧信道相位，探针死后仍可读）
+    eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+    // 侧信道相位透出（排障：与结构化相位不一致 = 探针在切相位后被中断）
+    eq(`${label}（侧信道相位透出）`, 'plugin-integration', report.probeSideChannelPhase);
+  }
+  // 看门狗「能红」断言（行为级对偶）：挂起夹具的失败项必须是**探针侧** check。
+  // 若 `watchdog.unref()` 被写回 → 探针被 Node 以 unsettled top-level await 杀掉 →
+  // 失败项变成 `plugin.probe_aborted`（装配器兜底）→ 本断言红。
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures/plugin-hang-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-D′ 看门狗能红断言：挂起夹具的失败项是探针侧 plugin.async_uncaught_exception（不是装配器兜底 plugin.probe_aborted）', true,
+      failed.includes('plugin.async_uncaught_exception') && !failed.includes('plugin.probe_aborted'));
+    eq('🔴-D′ 看门狗能红断言：探针确实跑到了插件集成相位并自己输出了结构化结果', true,
+      (report.checks ?? []).filter((c) => c.status === 'pass').length > 0);
+  }
+
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----
   console.log('  [9] 🔴-D 反向：宿主侧异常仍判漂移（收窄写入端不丢真漂移）');
   {
@@ -311,6 +368,10 @@ try {
     eq('离线缺缓存（宿主装配相位）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT', offline.attribution);
     eq('离线缺缓存 → hostFatal 非空（宿主侧信号照写）', true, (offline.hostFatal ?? []).length > 0);
     eq('离线缺缓存 → probePhase=host-assembly（未进插件集成段）', 'host-assembly', offline.probePhase);
+    // 🔴-D′ 反向护栏：探针**根本没起来**（离线缺缓存，探针未执行）→ 侧信道读不到 →
+    // 仍按宿主侧处理（判漂移、hostFatal 非空）。收窄的只有「侧信道明确写着插件集成相位」。
+    eq('离线缺缓存 → 侧信道相位为空（探针未执行）', null, offline.probeSideChannelPhase);
+    eq('离线缺缓存 → 侧信道为空时仍判 UPSTREAM_DRIFT（真漂移不得被收窄掉）', 'UPSTREAM_DRIFT', offline.attribution);
   }
 } finally {
   rmSync(work, { recursive: true, force: true });

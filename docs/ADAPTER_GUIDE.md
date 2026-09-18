@@ -201,18 +201,28 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
-**另有 2 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
+**另有 3 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`，
+本数由 `tests/test_exports.mjs` [2b'''] 按该表长度反推并断言——改文档不改代码、或反之，都即红）：
 
 | 条件检查 | 触发场景 | 归因 |
 |---|---|---|
 | `plugin.unexpected_exception` | **同步**异常：探针读插件侧数据（`tools.schemas()` / `definitions.map()`）时**插件代码**抛错，逃到顶层 `catch` | `PLUGIN_REGRESSION` |
 | `plugin.async_uncaught_exception` | **异步**异常：插件在 `apply()` 里排的后台任务（微任务 / 定时器 / 事件回调 / 预取 promise）抛错，**不在**探针 `run()` 的调用栈上 | `PLUGIN_REGRESSION` |
+| `plugin.probe_aborted` | **探针被插件杀掉**（连结构化结果都没输出）：`apply()` 永不 settle / 后台任务 `process.exit()` / 先摘进程级处理器再抛 / 占死事件循环。**探针内任何兜底都来不及跑**，由装配器读**带外**侧信道相位（`probe-phase.txt`，落盘、探针死后仍可读）归因 | `PLUGIN_REGRESSION` |
 
-两者都是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
+前两者是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
 异步那条为何必须单独兜：不在调用栈上 ⇒ 顶层 `catch` 永远接不到 ⇒ 旧探针会在写出结构化结果前被杀，
 装配器只看到「探针未输出结构化结果」→ 判 `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**。
 现在探针挂了 `uncaughtException` / `unhandledRejection` 两个进程级兜底：按同一份相位路由归因，
 **照常输出结构化结果**（已跑完的检查全部保留），`probePhase` 仍为 `plugin-integration`。
+
+第三条为何必须落在**装配器**侧：前两者的兜底都**跑在探针进程内**——插件能把探针整个弄死
+（挂起 / `process.exit` / 摘掉 `process` 上的监听器 / 同步占死事件循环），那时探针内的
+任何处理器与看门狗都没有机会执行，「异常归属」这份信息也随之消失。故探针每次切相位时把相位
+**落盘**（侧信道），装配器在「没有 `__DSH_PROBE__`」时读它：写着 `plugin-integration` →
+落插件侧 check `plugin.probe_aborted`；读不到（含 `host-assembly`）→ 仍按宿主侧
+`pushHostFatal()` 保守处理（真漂移绝不被收窄掉）。探针被杀时 17 项由装配器按规范顺序补
+`skip`（报告里看得见「没验」，而不是凭空消失）。
 边界（不越权承诺）：探针是**有限时长验收**，只在收尾前给已排队的微任务/宏任务一个 50ms 排空窗口；
 更晚的延迟抛错发生在探针退出之后，不属本防线范围。
 

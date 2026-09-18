@@ -110,6 +110,24 @@ export const PROBE_PHASE = {
 export const PLUGIN_PROBE_EXCEPTION_CHECK = 'plugin.unexpected_exception';
 
 /**
+ * 「探针未输出结构化结果」且**侧信道相位 = 插件集成**时的落点 check 名（已登记进
+ * {@link PLUGIN_SIDE_CHECKS}）。
+ *
+ * 为什么必须有它（评审 🔴-D′ 同族活口·第二轮）：探针内的 `uncaughtException` /
+ * `unhandledRejection` 兜底只在**探针还活着**时有效。以下四条路径下探针里的任何处理器
+ * 都救不了自己，而它们**都是插件可造成**的：
+ * - 插件 `apply()` 返回**永不 settle** 的 promise：探针挂住 → 事件循环空 → Node 以
+ *   「unsettled top-level await」退出（退出码 13），连看门狗都来不及触发；
+ * - 插件后台任务调 `process.exit()`（探针当场消失）；
+ * - 插件先摘掉 `uncaughtException` / `unhandledRejection` 处理器再抛错；
+ * - 插件后台任务占死事件循环（探针内的看门狗同样是 JS，永远排不上）。
+ *
+ * 旧装配器对这四条一律 `pushHostFatal()` → `UPSTREAM_DRIFT`/AMBER 且 `checks = 0`
+ * （整份报告消失）。故装配器侧必须有一条**不依赖探针活着**的判据：侧信道相位文件。
+ */
+export const PLUGIN_PROBE_ABORTED_CHECK = 'plugin.probe_aborted';
+
+/**
  * 探针异常归属路由（**唯一事实源**，探针顶层 catch 与离线回归共用）。
  *
  * 返回值**只给归属与落点**：宿主侧 → `hostFatal[]`（唯一落点由 {@link pushHostFatal} 决定，
@@ -122,10 +140,110 @@ export const PLUGIN_PROBE_EXCEPTION_CHECK = 'plugin.unexpected_exception';
  * 宁可让人多看一眼插件侧失败，也不让一个未确认的信号去开「上游漂移」这道门
  * （那道门直接决定放行/改中台，代价更大）。
  */
-export function probeFailureRoute(phase) {
+export function probeFailureRoute(phase, check = PLUGIN_PROBE_EXCEPTION_CHECK) {
   return phase === PROBE_PHASE.HOST_ASSEMBLY
     ? { side: 'host' }
-    : { side: 'plugin', check: PLUGIN_PROBE_EXCEPTION_CHECK };
+    : { side: 'plugin', check };
+}
+
+/**
+ * 探针**侧信道相位文件**名（探针写、装配器读）。
+ *
+ * 为什么需要带外信号（评审 🔴-D′）：探针的进程级兜底（`uncaughtException` /
+ * `unhandledRejection`）与看门狗都**跑在探针进程内**。插件可以把探针整个弄死
+ * （`apply()` 返回永不 settle 的 promise / 后台任务 `process.exit()` / 先摘处理器再抛 /
+ * 占死事件循环），那时探针内的任何处理器都救不了自己，「异常归属」这份信息也随之丢失
+ * → 装配器只能看到「没有 `__DSH_PROBE__`」→ 旧行为一律 `pushHostFatal()`（判上游漂移）。
+ *
+ * 侧信道是**落盘的**（`writeFileSync`，随相位切换即时写）：探针被杀也不影响**已经写下**的
+ * 相位，于是装配器仍能知道「探针死在插件集成相位」——这是插件侧行为，不是上游漂移。
+ * 读不到该文件时装配器按宿主侧处理（保守，真漂移绝不被收窄掉）。
+ *
+ * @type {string}
+ */
+export const PROBE_PHASE_FILE = 'probe-phase.txt';
+
+/**
+ * 装配器侧「探针未输出结构化结果」的归属路由（**唯一事实源**，装配器与离线回归共用）。
+ *
+ * 与 {@link probeFailureRoute} 的关系：**同一套相位语义**（宿主装配 → 宿主侧；其余 →
+ * 插件侧），唯一区别是缺省分支——探针**连相位都没回报**（侧信道文件读不到）时，装配器
+ * 只能按「探针自身 / 环境出问题」处理 → 宿主侧（保守：真漂移绝不能被收窄掉）。
+ *
+ * 收窄的**只有**「侧信道明确写着插件集成相位」这一种情形——那是探针来不及自己上报时留下的
+ * 唯一带外证据（探针被杀 / 被摘 / 被占死时，探针内任何处理器都救不了，见 🔴-D′）。
+ *
+ * @param {string|null|undefined} phase 探针写入侧信道的相位（可能读不到）
+ * @returns {{side: 'host'} | {side: 'plugin', check: string}} 归属：宿主侧写 hostFatal[] / 插件侧写 check
+ */
+export function probeAbortRoute(phase) {
+  return phase === PROBE_PHASE.PLUGIN_INTEGRATION
+    ? { side: 'plugin', check: PLUGIN_PROBE_ABORTED_CHECK }
+    : { side: 'host' };
+}
+
+/**
+ * 装配器侧「探针未输出结构化结果」的**写入端**：按 {@link probeAbortRoute} 落点，且**绝不抛**。
+ *
+ * 纪律与探针侧兜底一致：本函数运行在「探针已死」的路径上，任何抛出都会让整份报告消失
+ * （`checks` 归零，比「多一条误判」更彻底）。故全字段归一 + 吞自身异常。
+ *
+ * @param {{checks?: object[], errors?: string[], hostFatal?: string[]}} target 装配器 `result`
+ * @param {string|null|undefined} phase 侧信道相位
+ * @param {string} detail 人读原因（含 stdout 尾巴）
+ * @returns {{side: 'host'|'plugin', check: string|null, line: string}} 归属与写入的日志行（供排障 / 审计）
+ */
+export function recordProbeAbort(target, phase, detail) {
+  try {
+    const route = probeAbortRoute(phase);
+    const text = String(detail).slice(0, 600);
+    if (!Array.isArray(target.checks)) target.checks = [];
+    if (!Array.isArray(target.errors)) target.errors = [];
+    if (route.side === 'host') {
+      return {
+        side: 'host',
+        check: null,
+        line: pushHostFatal(target, `探针未输出结构化结果（探针自身崩溃 / 被宿主中断 / 未进入插件集成相位）：${text}`),
+      };
+    }
+    // 插件集成相位：探针死在插件代码上（挂起 / 被 process.exit 杀 / 处理器被摘 / 事件循环被占死）。
+    // 落**插件侧 check**，绝不写 hostFatal[]——那是「上游漂移」这道门的唯一钥匙。
+    target.checks.push({ name: route.check, status: 'fail', detail: text });
+    const line = `${route.check}: 探针未输出结构化结果，且侧信道相位=${PROBE_PHASE.PLUGIN_INTEGRATION}（探针被插件侧行为中断，插件侧错误）：${text}`;
+    target.errors.push(line);
+    return { side: 'plugin', check: route.check, line };
+  } catch (error) {
+    try {
+      if (!Array.isArray(target.errors)) target.errors = [];
+      target.errors.push(`recordProbeAbort 自身失败（已吞掉，不影响报告输出）：${String(error?.message ?? error)}`);
+    } catch { /* 连 errors 都写不进去时静默——崩溃路径上不得再抛 */ }
+    return { side: 'host', check: null, line: '' };
+  }
+}
+
+/**
+ * 把「探针未输出结构化结果」的人读报告补齐成「缺失项可见」的形态（**不改判据字段**）。
+ *
+ * 为什么需要：探针被杀时 `checks` 会从 17 掉到 0（整份报告消失）。装配器**无法**知道
+ * 「哪一项真验过」——但它知道**规范顺序**，故把 17 项按序标 `skip`，让报告形态与
+ * 「探针正常跑完但全挂」一致（人比对两次运行不必重排），并一眼看出「报告没丢，是没跑」。
+ *
+ * 只补 `skip`，**绝不**补 `pass` / `fail`：装配器没有资格替探针宣布结果。
+ *
+ * @param {{checks?: object[]}} target 装配器 `result`
+ * @param {string} reason 跳过原因（进报告）
+ * @returns {number} 补了条数
+ */
+export function skipPendingProbeChecks(target, reason) {
+  if (!Array.isArray(target?.checks)) return 0;
+  const recorded = new Set(target.checks.map((check) => check?.name));
+  let added = 0;
+  for (const name of PROBE_CHECK_ORDER) {
+    if (recorded.has(name)) continue;
+    target.checks.push({ name, status: 'skip', detail: reason });
+    added += 1;
+  }
+  return added;
 }
 
 /**
@@ -156,9 +274,10 @@ export const PLUGIN_ASYNC_EXCEPTION_CHECK = 'plugin.async_uncaught_exception';
  * @returns {{side: 'host'|'plugin', check?: string}} 归属：宿主侧 → hostFatal[]；插件侧 → check
  */
 export function probeAsyncFailureRoute(phase) {
-  return probeFailureRoute(phase).side === 'host'
-    ? { side: 'host' }
-    : { side: 'plugin', check: PLUGIN_ASYNC_EXCEPTION_CHECK };
+  // 🟡-6（评审）：不再复制一份「相位 → 归属」判断，改为**带落点名调用同一路由**——
+  // 两条路由的相位语义从此只有一处可写错（`probeFailureRoute`），漂移面收敛到落点名一个参数。
+  // 不变量由 `tests/test_attribution.mjs` [9.8a] 断言：两者对三个相位逐一等价。
+  return probeFailureRoute(phase, PLUGIN_ASYNC_EXCEPTION_CHECK);
 }
 
 /**
@@ -294,16 +413,24 @@ export const PLUGIN_SIDE_CHECKS = [
   // 🔴-D 同族活口：插件后台任务（apply 里排的微任务/定时器/promise）的未捕获异常——
   // 不在 run() 调用栈上，顶层 catch 接不到，由探针的进程级兜底按相位归到这里。
   'plugin.async_uncaught_exception',
+  // 🔴-D′ 同族活口（第二轮）：探针**连结构化结果都没输出**（挂起 / 被 process.exit 杀 /
+  // 处理器被摘 / 事件循环被占死）——探针内任何处理器都救不了，只能由**装配器**读侧信道
+  // 相位归到这里。旧行为是装配器无条件 pushHostFatal() → 判上游漂移且 checks=0。
+  'plugin.probe_aborted',
 ];
 
 /**
  * 探针的**条件触发检查项**：仅在异常路径出现，**不计入 17 项**（文档口径见
- * `docs/ADAPTER_GUIDE.md`「另有 1 项条件检查」/ `docs/INDEX.md`）。
+ * `docs/ADAPTER_GUIDE.md` / `docs/INDEX.md` 的「另有 N 项条件检查」，N = 本表长度）。
+ *
+ * ⚠️ 纪律（评审 🟡-4）：本 JSDoc 曾写死「另有 1 项条件检查」——文档早已改成 2 项而此处未同步，
+ * 且「另有 N 项」这句**无守卫**（改文档不改代码、或反之，都静默通过）。现在：
+ * ① 本注释不再写死 N；② `tests/test_exports.mjs` [2b'''] 按本表长度反推两份文档的 N 并断言一致。
  *
  * 为什么单独成表：`PROBE_CHECK_ORDER` 与「条件项」必须能互相推出，
  * 否则「17 项」的口径会随新增条件项悄悄变成 18 项而无人发现。
  */
-export const CONDITIONAL_PROBE_CHECKS = [PLUGIN_PROBE_EXCEPTION_CHECK, PLUGIN_ASYNC_EXCEPTION_CHECK];
+export const CONDITIONAL_PROBE_CHECKS = [PLUGIN_PROBE_EXCEPTION_CHECK, PLUGIN_ASYNC_EXCEPTION_CHECK, PLUGIN_PROBE_ABORTED_CHECK];
 
 /**
  * 探针 17 项检查的**规范输出顺序**（= `docs/INDEX.md` 的 `#` 序号列口径）。

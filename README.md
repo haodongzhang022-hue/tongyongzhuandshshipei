@@ -48,7 +48,7 @@
 ✅ stable  (0.1.5-rc.2)      17/17 检查通过   flavor=modern
 ✅ dev     (0.1.6-alpha.2)   17/17 检查通过   flavor=modern
 ✅ legacy  (0.1.1-rc.2)      17/17 检查通过   flavor=legacy
-✅ 离线单测 85 项 + 归因离线回归 209 项 + 发布面自检 28 项 + 归因端到端回归 92 项
+✅ 离线单测 95 项 + 归因离线回归 236 项 + 发布面自检 36 项 + 归因端到端回归 144 项
 ✅ 负例插件被正确拦下（保留名冲突显式上报，不静默失效）
 ✅ 插件写错代码（未初始化字段 / 抛错 getter）→ 判插件且 `hostFatal[]` 为空（插件侧错误不进判据字段）
 ✅ 上游漂移侦测可用（基线只在通道 ok 时更新，失败不覆盖）
@@ -81,9 +81,11 @@ export function apply(ctx) {
 node src/cli.mjs matrix                                  # 看通道矩阵
 node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status --markdown
 node src/cli.mjs watch                                   # 上游有没有发新版
-bash tests/test_offline.sh                               # 离线单测（85 项，秒级）
-node tests/test_attribution.mjs                          # 归因离线回归（209 项，秒级）
-node tests/test_exports.mjs                              # 发布面自检（exports 全解析 + 模板拷贝可用）
+bash tests/test_offline.sh                               # 离线单测（95 项，秒级）
+node tests/test_attribution.mjs                          # 归因离线回归（236 项，秒级）
+node tests/test_exports.mjs                              # 发布面自检（36 项，秒级）
+node tests/gate_plugin_side.mjs                          # 🔴-D / 🔴-D′ 闸门（真宿主，8 份夹具 × 6 条断言）
+node tests/test_e2e_regression.mjs                       # 归因端到端回归（真宿主，144 项）
 ```
 
 ### 作为人类观察者

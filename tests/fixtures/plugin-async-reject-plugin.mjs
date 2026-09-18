@@ -18,7 +18,9 @@ const healthy = {
   name: 'demo_echo',
   description: '回显',
   parameters: { type: 'object', properties: { text: { type: 'string' } } },
-  output: { schema: { type: 'object', properties: { text: { type: 'string' } } }, render: () => [] },
+  // 真实 render（默认投影）：`render: () => []` 会让 dispatch.render_projected / echo_payload
+  // 额外失败，噪声掩盖「失败点精确留在后台任务」的自述（评审 🟡-5）。
+  output: { schema: { type: 'object', properties: { text: { type: 'string' } } } },
   execute: async (args) => ({ text: `echo: ${args?.text ?? ''}` }),
 };
 

@@ -7,6 +7,8 @@
 #  3. dev 通道：示例插件必须通过
 #  4. legacy 通道：示例插件必须通过（防「为适配新版把旧版装崩」）
 #  5. 负例插件：必须被中台拦下（保留名 / schema 子集），且**归因必须是插件侧**（不得被漂移吞掉）
+#  5b. 🔴-D / 🔴-D′ 闸门：8 份夹具（探针活着·同步/异步 + **探针被插件杀掉**）→ 必须判插件侧
+#      且 hostFatal 为空、17 项一项不缺（与 .cnb.yml push/PR 段**共用同一脚本**，防两处漂移）
 #  6. 归因端到端回归：上游取消保留名 → GREEN；插件侧失败 → PLUGIN_REGRESSION
 #  7. 上游变更侦测可运行（离线时允许返回 2，不视为失败）
 set -uo pipefail
@@ -84,6 +86,13 @@ console.log([r.summary.verdict, c.attribution, guard ? guard.status : 'missing']
   else
     ok "负例判决非 AMBER（verdict=${ATTRIBUTION%%|*}）"
   fi
+fi
+
+step "3b. 🔴-D / 🔴-D′ 闸门（8 份夹具 × 6 条断言；与 .cnb.yml push/PR 段同一脚本）"
+if "$NODE_BIN" "$ROOT/tests/gate_plugin_side.mjs" --channel stable --json-dir /tmp/gate-json > /tmp/gate.log 2>&1; then
+  ok "插件侧异常/中断闸门全绿（$(count_of /tmp/gate.log) 份夹具：归因插件侧 + hostFatal 为空 + 17 项不缺）"
+else
+  bad "插件侧异常/中断闸门失败"; tail -30 /tmp/gate.log
 fi
 
 step "4. 归因端到端回归（真宿主；上游取消保留名 / 插件侧失败 / 漂移窗口不吞插件硬违规）"

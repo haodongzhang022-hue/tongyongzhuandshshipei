@@ -184,7 +184,7 @@ echo "  [9] 归因判定（结构化判据：宿主侧 hostFatal[] vs 插件侧 
 # 落插件侧 check（plugin.unexpected_exception），绝不进 hostFatal[]。
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure, attributionDetail } from '$ROOT/src/verify/runner.mjs';
-import { PROBE_PHASE, recordProbeException, recordProbeAsyncException, PLUGIN_ASYNC_EXCEPTION_CHECK } from '$ROOT/src/harness/contract.mjs';
+import { PROBE_PHASE, PROBE_CHECK_ORDER, recordProbeAbort, recordProbeException, recordProbeAsyncException, skipPendingProbeChecks, PLUGIN_ASYNC_EXCEPTION_CHECK } from '$ROOT/src/harness/contract.mjs';
 const ch = { label: 'x', line: '0.1.6' };
 const p = (errors, checks = [], extra = {}) => ({ errors, checks, hostFatal: [], profile: { flavor: 'modern' }, contract: {}, ...extra });
 const hf = (detail) => p(['fatal(host): ' + detail], [], { hostFatal: [detail] });
@@ -226,6 +226,30 @@ console.log(PLUGIN_ASYNC_EXCEPTION_CHECK === asyncOut.checks[0].name ? 'register
 const asyncHost = { checks: [], errors: [], hostFatal: [] };
 recordProbeAsyncException(asyncHost, PROBE_PHASE.HOST_ASSEMBLY, 'Cannot find package @deepseek-ai/dsh-tools');
 console.log(attributeFailure({ ...asyncHost, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
+// 🔴-D′（v0.1.9）：探针被插件**杀掉**（连结构化结果都没输出）→ 装配器读**带外**侧信道相位归因。
+// 四条路径（挂起 / process.exit / 摘处理器 / 占死事件循环）下探针内兜底全失效，唯一可行的是带外信号。
+const abortOut = { checks: [], errors: [], hostFatal: [] };
+const abortRouted = recordProbeAbort(abortOut, PROBE_PHASE.PLUGIN_INTEGRATION, '探针未输出结构化结果');
+console.log(abortRouted.side);
+console.log(abortOut.checks[0].name);
+console.log(abortOut.hostFatal.length);
+console.log(attributeFailure({ ...abortOut, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
+// 反向护栏：读不到侧信道 / 侧信道写着宿主装配相位 → 仍写 hostFatal[] 并判漂移（真漂移不得被收窄）
+const abortHost = { checks: [], errors: [], hostFatal: [] };
+recordProbeAbort(abortHost, PROBE_PHASE.HOST_ASSEMBLY, 'x');
+const abortUnknown = { checks: [], errors: [], hostFatal: [] };
+recordProbeAbort(abortUnknown, null, 'x');
+console.log(abortHost.hostFatal.length + '/' + abortUnknown.hostFatal.length);
+console.log(attributeFailure({ ...abortUnknown, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
+// 报告完整性：探针被杀时装配器按规范顺序把未验项补 skip（17 项一项不少，报告不丢）
+const abortSkips = { checks: [] };
+console.log(skipPendingProbeChecks(abortSkips, 'r'));
+console.log(abortSkips.checks.every((c) => c.status === 'skip') ? 'all-skip' : 'not-all-skip');
+console.log(abortSkips.checks.map((c) => c.name).join(',') === PROBE_CHECK_ORDER.join(',') ? 'order-kept' : 'order-broken');
+// 崩溃路径纪律：记录函数**自身不得抛**（它运行在「探针已死」的路径上）
+let abortThrew = 'no-throw';
+try { recordProbeAbort(Object.defineProperty({ hostFatal: [] }, 'errors', { get() { throw new Error('boom'); }, set() { throw new Error('boom'); } }), PROBE_PHASE.PLUGIN_INTEGRATION, 'x'); } catch { abortThrew = 'threw'; }
+console.log(abortThrew);
 ")"
 assert "宿主安装失败（结构化 hostFatal[]）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
 assert "宿主未就绪 → UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 2p)"
@@ -245,6 +269,16 @@ assert "🔴-D 异步：不写 hostFatal[]（不变量，与同步路径同口�
 assert "🔴-D 异步：→ PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 16p)"
 assert "🔴-D 异步：落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）" "registered-check" "$(echo "$OUT" | sed -n 17p)"
 assert "🔴-D 异步反向：宿主装配相位异步异常 → 仍判 UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 18p)"
+assert "🔴-D′：探针被插件杀掉 → 归因插件侧（带外侧信道相位）" "plugin" "$(echo "$OUT" | sed -n 19p)"
+assert "🔴-D′：落点 check = plugin.probe_aborted" "plugin.probe_aborted" "$(echo "$OUT" | sed -n 20p)"
+assert "🔴-D′：不写 hostFatal[]（不变量，与另两条路径同口径）" "0" "$(echo "$OUT" | sed -n 21p)"
+assert "🔴-D′：→ PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 22p)"
+assert "🔴-D′ 反向：host-assembly / 读不到侧信道 → 仍写 hostFatal[]" "1/1" "$(echo "$OUT" | sed -n 23p)"
+assert "🔴-D′ 反向：读不到侧信道 → 仍判 UPSTREAM_DRIFT（真漂移不得被收窄）" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 24p)"
+assert "🔴-D′：探针被杀时装配器补 17 条 skip（报告不丢）" "17" "$(echo "$OUT" | sed -n 25p)"
+assert "🔴-D′：补的项状态全为 skip（装配器不得替探针宣布结果）" "all-skip" "$(echo "$OUT" | sed -n 26p)"
+assert "🔴-D′：补的项顺序 = PROBE_CHECK_ORDER（报告形态与正常失败一致）" "order-kept" "$(echo "$OUT" | sed -n 27p)"
+assert "🔴-D′：崩溃路径上记录函数不抛（探针已死时不得再崩）" "no-throw" "$(echo "$OUT" | sed -n 28p)"
 
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure } from '$ROOT/src/verify/runner.mjs';

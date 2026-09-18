@@ -1,5 +1,94 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.1.9 — 🔴-D′ 同族活口·第二轮：装配器侧**带外相位信号**分流 + 删看门狗 `unref` + 🟡 四项收口
+
+> 承接 v0.1.8。评审 @ `c8965b9` 判**不放行**：同步路径与两份夹具「真的修对了」（评审独立复现
+> A/B：父提交 + `plugin-async-throw` → `UPSTREAM_DRIFT`/`checks=0`；`c8965b9` 同夹具 →
+> `PLUGIN_REGRESSION`/`hostFatal=[]`/`checks=18`），但**清零口径未达成**——同族活口从
+> 「异步异常处理器」搬到了**「探针未输出结构化结果」分支**：`src/harness/host.mjs` 仍**无条件**
+> `pushHostFatal()`，只要探针没吐出 `__DSH_PROBE__`，无论死在哪个相位，插件侧 bug 一律被写成宿主信号。
+
+### 🔴 必修（同族活口·第二轮：探针被杀）
+
+| # | 问题（评审实测，四条插件可造成的路径） | 修复 | 回归防线 |
+|---|---|---|---|
+| 🔴-D′-a | **`apply()` 返回永不 settle 的 promise + 后台任务抛错** → `UPSTREAM_DRIFT` / `hostFatal` 非空 / `checks=0` / `probeExit.status=13`。**根因是一行**：`probe-template.mjs` 的 `watchdog.unref?.()`——`run()` 被挂住时事件循环已空 → Node 以「unsettled top-level await」退出（exit 13），**unref 的看门狗永不触发**（注释里「看门狗兜住 `run()` 被拖住」这条声明，在它被写出来的那个场景里**不可达**）；且全仓 `watchdog|unref|ASYNC_WATCHDOG` 在 `tests/` 与 `.cnb.yml` **0 命中**（声明无防线 = 下一轮必被搬回来） | **删掉 `watchdog.unref?.()`**（定时器保持 ref → run() 被拖住时 10s 后强制收尾并输出结构化结果）；并在原处写明「绝不可 unref」的理由与防线编号 | 源码级 `test_attribution.mjs` [9.8g]（**能红**：把 `watchdog.unref?.()` 写回即红；附守卫自证 + 注释不误报反证 + 「看门狗存在且窗口为正」）；行为级 `test_e2e_regression.mjs` [8c]（挂起夹具的失败项必须是**探针侧** `plugin.async_uncaught_exception`，若 unref 写回则变成装配器兜底 `plugin.probe_aborted` → 红）+ 闸门同款断言 |
+| 🔴-D′-b | **插件后台任务 `process.exit(0)`** → 同族误判（探针当场消失，探针内处理器来不及跑） | 见下「带外相位信号」 | 真宿主 [8c] + 闸门 `tests/gate_plugin_side.mjs`（`plugin-process-exit-plugin.mjs`） |
+| 🔴-D′-c | **插件 `removeAllListeners('uncaughtException'/'unhandledRejection')` 后再抛** → 同族误判（**针对性摘除**：探针兜底只在它自己还挂着时有效） | 同上 | 真宿主 [8c] + 闸门（`plugin-detach-handlers-plugin.mjs`） |
+| 🔴-D′-d | **后台任务占死事件循环** → 只能等外层 timeout，仍 `UPSTREAM_DRIFT` / `checks=0` | 同上 | 真宿主 [8c] + 闸门（`plugin-busy-loop-plugin.mjs`） |
+
+**统一修法（评审原型已验证可行，本轮落地）**：探针侧两条兜底（进程级 handler / 看门狗）**都跑在探针进程内**——
+插件能把探针整个弄死，那时探针内的任何处理器都救不了自己，「异常归属」也随之丢失。故改用**带外信号**：
+
+1. **探针每次切相位把相位落盘**（`writeFileSync('probe-phase.txt', phase)`，失败静默）——探针被杀也不影响**已经写下**的相位；
+2. **装配器读侧信道分流**（`host.mjs` 的「marker 缺失」分支）：侧信道 = `plugin-integration` →
+   落**插件侧 check** `plugin.probe_aborted`（登记进 `PLUGIN_SIDE_CHECKS` + `CONDITIONAL_PROBE_CHECKS`），
+   **绝不**写 `hostFatal[]`；其余（含读不到侧信道 / `host-assembly`）→ 保持 `pushHostFatal()`（**真漂移不得被收窄**）；
+3. **报告不丢**：探针被杀时 `checks` 会从 17 掉到 0——装配器按 `PROBE_CHECK_ORDER` 补 17 条 `skip`
+   （**只补 skip**：装配器没有资格替探针宣布 pass/fail），报告形态与「探针正常跑完但全挂」一致；
+4. 归属路由唯一事实源：`contract.mjs` 的 `probeAbortRoute()` / `recordProbeAbort()` / `skipPendingProbeChecks()`；
+5. **跑探针前先删侧信道文件**（`rmSync`）：`workDir` 路径含 channel + 指纹 + pid，同进程重复跑同一通道会复用目录——
+   遗留的 `probe-phase.txt`（写着 `plugin-integration`）会让**这一次**的「探针没起来」被误判成插件侧
+   （真漂移被收窄）。删掉后语义干净：读不到 = 本次探针没写下 = 按宿主侧保守处理。
+
+**顺手发现并修的同类报告漏洞**：探针第 10 段（生命周期）的 `catch` 只标了 `lifecycle.registered` / `lifecycle.dispose`，
+而 `lifecycle.disposer_count` 的 `check()` 在抛错点**之前** → 报告里少一项（17 → 16，人分不清「没验」与「验过了」）。
+现改为 `skipAll([...])` 补全三项（新增闸门的「17 项一项不缺」断言把它抓了出来）。
+
+### 🟡 建议（同批修）
+
+| # | 问题（评审实测） | 处置 |
+|---|---|---|
+| 🟡-3 | **`[9.4]` 源码守卫有切片盲区**：从 `try {\n  await run();` 起切 → **兜底处理器区域不在视野内**。评审用「保留 `recordProbeAsyncException` 诱饵 + 另加一行 `pushHostFatal`」变异，源码守卫**漏检**（行为级 E2E 抓到 → 主防线仍在，故列 🟡） | **已修**：切片起点上移到兜底区段标记（`// ---- 进程级兜底`），覆盖「进程级 handler + 顶层 catch + finish」整块崩溃路径；补守卫自证（诱饵形态 / 别名 / 模板插值）与**反证**（把同一变异喂给旧切片 → 确认漏检、喂给新切片 → 确认抓到）；段标记本身也有断言（改名即红） |
+| 🟡-4 | **文档口径未同步**：`contract.mjs` 的 JSDoc 仍写「`docs/ADAPTER_GUIDE.md`『另有 1 项条件检查』」——`docs/` 已改「2 项」；且「另有 N 项」这句**无守卫**（`tests/` 搜「另有」0 命中），与 🟡-2 同族 | **已修**：① JSDoc 不再写死 N；② 新增 `test_exports.mjs` **[2b''']**：把 N 从**唯一事实源**（`CONDITIONAL_PROBE_CHECKS.length`）反推，两份文档必须一致，且每条条件检查名都要在文档表里出现；附守卫自证（N 改字即红 / 名单缺一项即红 / 未变异文档不缺项）。本轮 N 由 2 → 3（新增 `plugin.probe_aborted`），守卫已自动生效 |
+| 🟡-5 | **夹具噪音失败与自述不符**：两份异步夹具的 `healthy` 工具用 `render: () => []` → 额外 2 条失败（`dispatch.render_projected` / `dispatch.echo_payload`），注释却写「把失败点**精确**留在后台任务」；`test_e2e` 用 `pass>=10` 掩盖了这一点。旧同步夹具同写法（遗留） | **已修**：4 份夹具（`plugin-async-throw` / `plugin-async-reject` / `plugin-side-throw` / `plugin-registry-throw`）改为**真实 render**（走中台默认投影 `defaultRender`；`plugin-registry-throw` 直接调宿主 `ctx.tools.register()`、无兜底，故显式给 `render`）。修后失败点**精确**：异步两例仅 `plugin.async_uncaught_exception` 一条 fail、pass 17 条（原 15 pass + 2 条噪音 fail）；`test_e2e` 的 `pass>=10` 阈值一并收紧为**逐项声明期望失败项**（见闸门） |
+| 🟡-6 | **`probeAsyncFailureRoute` 是 `probeFailureRoute` 的薄包装**，两处语义靠注释保证一致 | **已修**：`probeFailureRoute(phase, check = PLUGIN_PROBE_EXCEPTION_CHECK)` 带落点名，`probeAsyncFailureRoute` 改为**调用同一路由**并只传落点名——「相位 → 归属」只有一处可写错；不变量由 [9.8a] 对三个相位逐一断言等价 |
+
+### 🟢 优化（同批顺手）
+
+- 闸门从 `.cnb.yml` 的两段 inline `node -e`（push 段与 PR 段**各抄一份**）收敛为**单一脚本**
+  `tests/gate_plugin_side.mjs`：夹具清单与断言口径只有一处，防两段漂移后其中一处静默失效。
+  覆盖 8 份夹具 × 6 条断言（归因 / `hostFatal` 为空 / verdict≠AMBER / **17 项一项不缺** /
+  失败项全在 `PLUGIN_SIDE_CHECKS` 内 / 期望失败项确实出现）。
+- 报告新增 `probeSideChannelPhase`（侧信道相位）：与 `probePhase` 并列透出，排障时可比对
+  「结构化相位 vs 侧信道相位」——不一致即说明探针在切相位后被中断。
+
+### 兼容性
+
+- 探针输出 / 验收报告**新增**：条件检查项 `plugin.probe_aborted`（仅在「探针被插件杀掉」路径出现，不计入 17 项）、
+  报告字段 `probeSideChannelPhase`、装配器结果字段 `sideChannelPhase`。
+- `contract.mjs` 新增导出：`PLUGIN_PROBE_ABORTED_CHECK` / `PROBE_PHASE_FILE` / `probeAbortRoute()` /
+  `recordProbeAbort()` / `skipPendingProbeChecks()`；`probeFailureRoute()` 增加可选第二参数（默认值保持原语义，向后兼容）。
+- **语义收窄（同 🔴-D / 🔴-D′ 口径）**：探针死在**插件集成相位**时不再进 `hostFatal[]`；`host-assembly` 相位与
+  「读不到侧信道」保持原样（真漂移仍判 `UPSTREAM_DRIFT`）。
+
+### 边界（不越权承诺）
+
+- 探针仍是**有限时长验收**：50ms 排空窗口（`ASYNC_DRAIN_MS`）+ 10s 看门狗（`ASYNC_WATCHDOG_MS`，**保持 ref**）。
+- 「后台任务同步占死事件循环」的边界如实声明：占死时长**短于**看门狗窗口 → 看门狗在事件循环空出后如期收尾；
+  **超过**窗口 → 只能等外层 `execFileSync` 超时（`timeoutMs`，默认 600s），之后由**带外**侧信道相位归因
+  （仍判插件侧、`hostFatal` 为空、报告不丢）。
+
+### 测试项数
+
+- `tests/test_offline.sh`：85 → **95 项**（🔴-D′ 装配器侧分流 10 条）
+- `tests/test_attribution.mjs`：209 → **236 项**（[9.8g] 看门狗能红守卫 5 条 + 🟡-3 兜底区切片守卫与自证/反证 6 条 + [8] 反向护栏 3 条「探针未执行 → 侧信道为 null / checks 为空 / 仍判漂移」+ [9.8h] 装配器侧带外相位分流源码守卫 13 条）
+- `tests/test_e2e_regression.mjs`：92 → **144 项**（[8c] 4 份夹具 × 14 条 + 看门狗行为级对偶 2 条 + 反向护栏 2 条）
+- `tests/test_exports.mjs`：28 → **36 项**（[2b'''] 条件项计数守卫 8 条）
+- 新增 `tests/gate_plugin_side.mjs`：8 份夹具 × 6 条断言（push / PR 共用）
+- 新增夹具 4 份：`plugin-hang` / `plugin-process-exit` / `plugin-detach-handlers` / `plugin-busy-loop`
+
+### 变异复测（本版自证：能红的都真的会红）
+
+| 变异 | 修前 | 修后 |
+|---|---|---|
+| 写回 `watchdog.unref?.()` | 全绿 ❌ | **红** ✅（[9.8g] 源码 + [8c]/闸门行为级） |
+| 兜底区内另加一行 `pushHostFatal`（保留诱饵） | 全绿 ❌ | **红** ✅（🟡-3 新切片） |
+| 文档「另有 N 项」改字 / 条件项名单删一项 | 全绿 ❌ | **红** ✅（[2b''']） |
+| 探针死在插件集成相位（挂起 / `exit` / 摘处理器 / 占死） | 判漂移 + `checks=0` ❌ | **红且归因正确** ✅（`PLUGIN_REGRESSION` / `hostFatal=[]` / 17 项不缺） |
+| 侧信道文件被残留（同 workDir 复用） | 真漂移被收窄成插件侧 ❌ | **红**（跑探针前先 `rmSync`；离线 [8] 断言「探针未执行 → 侧信道 null → 仍判漂移」） |
+| 探针未执行（离线缺缓存，读不到侧信道） | 判漂移 ✅ | 仍判漂移 ✅（反向护栏未被收窄） |
+
 ## v0.1.8 — 🔴-D 同族活口收口：插件侧**异步**异常进程级兜底 + 🟡 两处守卫加固
 
 > 承接 v0.1.7（写入端分相位）。评审 @ `24362c7` 判 `disposition = fix_bug`：
