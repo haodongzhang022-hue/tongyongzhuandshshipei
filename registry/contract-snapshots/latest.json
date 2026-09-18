@@ -1,0 +1,23 @@
+{
+  "capturedAt": "2026-09-18T12:59:35.544Z",
+  "contracts": {
+    "stable": {
+      "configProjection": "{ mode?: \"native\" | \"ptc\" | \"both\", maxParallelSubCalls?: number }",
+      "reservedName": "tool name \"run_code\" is reserved for the PTC mode presentation transport and cannot be registered or shadowed",
+      "schemaSubset": "unsupported JSON schema: schema.properties.a.type must be one of object/array/string/number/integer/boolean/null",
+      "outputShape": "tool \"probe_no_render\" must declare output { schema, render, presentationMeta? }"
+    },
+    "dev": {
+      "configProjection": "{ mode?: \"native\" | \"ptc\" | \"both\", maxParallelSubCalls?: number }",
+      "reservedName": "tool name \"run_code\" is reserved for the PTC mode presentation transport and cannot be registered or shadowed",
+      "schemaSubset": "unsupported JSON schema: schema.properties.a.type must be one of object/array/string/number/integer/boolean/null",
+      "outputShape": "tool \"probe_no_render\" must declare output { schema, render, presentationMeta? }"
+    },
+    "legacy": {
+      "configProjection": "{ mode?: \"native\" | \"code\" | \"both\", maxParallelSubCalls?: number }",
+      "reservedName": "tool name \"run_code\" is reserved for the Code Mode presentation transport and cannot be registered or shadowed",
+      "schemaSubset": "unsupported JSON schema: schema.properties.a.type must be one of object/array/string/number/integer/boolean/null",
+      "outputShape": "tool \"probe_no_render\" must declare output { schema, render, presentationMeta? }"
+    }
+  }
+}

@@ -1,0 +1,43 @@
+# DSH 适配中台 · 页面手动触发按钮
+# 事件名需在 .cnb.yml 中配置（web_trigger 自定义事件），否则无法触发。
+branch:
+  - reg: ^main$
+    buttons:
+      - name: 双通道验收
+        description: 对指定插件跑 stable + dev 双通道真宿主验收
+        event: web_trigger
+        groupName: 适配验收
+        isDefault: true
+        inputs:
+          - name: 插件与工具
+            collapsed: false
+            inputs:
+              PLUGIN_PATH:
+                name: 插件路径
+                type: input
+                required: true
+                default: ./tests/fixtures/demo-plugin.mjs
+                placeholder: 仓库内相对路径，如 ./src/index.mjs
+              TOOLS:
+                name: 期望工具清单
+                type: input
+                required: true
+                default: demo_echo,demo_status
+                placeholder: 英文逗号分隔
+              CHANNEL:
+                name: 通道
+                type: select
+                default: both
+                options:
+                  - name: 双通道（stable + dev）
+                    value: both
+                  - name: 仅稳定版
+                    value: stable
+                  - name: 仅开发版
+                    value: dev
+                  - name: 三通道（stable + dev + legacy，等价 CLI 的 --channel all）
+                    value: all
+      - name: 上游漂移侦测
+        description: 检查 DSH 上游 dist-tag 是否已越过本中台钉版
+        event: web_trigger_watch
+        groupName: 上游侦测

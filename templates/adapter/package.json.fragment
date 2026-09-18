@@ -1,0 +1,8 @@
+{
+  "$comment": "把以下字段合并进你的插件 package.json（不要整体覆盖）",
+  "type": "module",
+  "main": "./index.mjs",
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/cordis": "^4.0.1" },
+  "peerDependenciesMeta": { "@deepseek-ai/cordis": { "optional": true } }
+}
