@@ -90,11 +90,13 @@ export default function ToolRuntime(ctx) { ctx.provide('tools', new FakeToolRunt
  * @param {number} [options.timeoutMs] 子进程超时（默认 30s）
  * @param {string} [options.killSignal] 超时后的终止信号（**仅回归反证用**：传 `'SIGTERM'` 复现旧缺陷；
  *   不传 = 生产口径，取自 `probeSpawnOptions` 的 `CHILD_KILL_SIGNAL`）
+ * @param {boolean} [options.noResultChannel] **不给探针 fd3**（`stdio[3]='ignore'`）——
+ *   复现「结果通道不可用 ⇒ 降级到 stdout」（批 1.5 / 🔴-R2 的回归入口）
  * @returns {{result: object, attribution: string, reasons: string[], exit: {status:number|null, signal:string|null}}}
- *   `result` 是装配器结构（`checks` / `hostFatal` / `runCompleted` / `phase` / `ok`）
+ *   `result` 是装配器结构（`checks` / `hostFatal` / `runCompleted` / `phase` / `ok` / `resultChannel`）
  */
 export function runOfflineProbe(options) {
-  const { pluginPath, expectedTools = [], watchdogMs, timeoutMs = 30_000, killSignal } = options;
+  const { pluginPath, expectedTools = [], watchdogMs, timeoutMs = 30_000, killSignal, noResultChannel = false } = options;
   const startedAt = Date.now();
   const work = mkdtempSync(path.join(tmpdir(), 'dsh-offline-probe-'));
   try {
@@ -127,7 +129,8 @@ export function runOfflineProbe(options) {
       cwd: work,
       // 唯一与生产不同的一处：stderr 也接回（生产是 `inherit`，让 CI 日志看得见探针的原始报错）。
       // 回归台若 inherit，负例夹具的 stack 会直接打进测试输出、淹没断言结果。
-      stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+      // `noResultChannel` 时第 4 位为 'ignore'（**不给 fd3**）⇒ 复现「通道降级」形态。
+      stdio: ['pipe', 'pipe', 'pipe', noResultChannel ? 'ignore' : 'pipe'],
       // nonce 走 **stdin**（与生产路径同构：`probeSpawnOptions` 已给 `input`），
       // 这里只叠加看门狗窗口的环境变量（探针**只许缩短**，见其注释）。
       env: { ...process.env, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },

@@ -2,7 +2,7 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.2.2`（module `adapt-hub`；v0.1.9d/v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；**v0.2.1：信任边界写成显式前提（R26）+ R24 反向反证 + 结构性重做一页方案（批 2 待拍板）**）
+> 版本：`dsh-adapt-hub v0.2.3`（module `adapt-hub`；v0.1.9d/v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；v0.2.1：信任边界写成显式前提（R26）+ R24 反向反证 + 结构性重做一页方案；v0.2.2：nonce 改走 stdin；**v0.2.3（批 1.5）：可达性口径更正 + 通道可见化（降级不放行）+ §3 反例固化 + exit 钩子台账**）
 
 ---
 
@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 128 项 + 归因离线回归 441 项 + 发布面自检 40 项 ✅   归因端到端回归 146 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
+离线单测 147 项 + 归因离线回归 452 项 + 发布面自检 40 项 ✅   归因端到端回归 156 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
 ```
 
 ---
@@ -192,9 +192,9 @@ tongyongzhuandshshipei/
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 128 项离线单测（无网可跑；含 [13] nonce 侧信道 / [14] 漂移相关性表唯一事实源 / [15] watch 影响面 / [16] 🔴 四条出口离线探针回归 / [17] 🔴-1 占死事件循环有界返回 / [18] v0.1.9d 三形态）
-│   ├── test_attribution.mjs           # 441 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + 🔴 四条出口/完成位 [9.9] + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9] + [9.10]-[9.12] R28/R26/R24）
-│   ├── test_e2e_regression.mjs        # 146 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D + 🔴 必修-2/3 四条出口复现 + [8d]-[8f] 侧信道/R28/R26/R24，含 verdict 与完成位断言）
+│   ├── test_offline.sh                # 147 项离线单测（无网可跑；含 [13] verdict 优先级 / [14] 漂移相关性表唯一事实源 / [15] watch 影响面 / [16] 🔴 四条出口离线探针回归 / [17] 🔴-1 占死事件循环有界返回 / [18] nonce 侧信道 + v0.1.9d 三形态 / [19] 批 1.5 通道可见化+降级不放行+§3 反例+exit 台账）
+│   ├── test_attribution.mjs           # 452 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + 🔴 四条出口/完成位 [9.9] + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9] + [9.10]-[9.12] R28/R26/R24）
+│   ├── test_e2e_regression.mjs        # 156 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D + 🔴 必修-2/3 四条出口复现 + [8d]-[8g] 侧信道/R28/R26/R24/§3 反例，含 verdict 与完成位断言）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
 │   └── fixtures/{demo,broken,plugin-side-throw,plugin-registry-throw,plugin-async-throw,plugin-async-reject}-plugin.mjs
@@ -281,8 +281,8 @@ export function apply(ctx) {
 > **条件检查项（不计入 17 项）**：`plugin.unexpected_exception`（① 同步）/ `plugin.async_uncaught_exception`
 > （② 异步）/ `plugin.early_exit`（③ 进程 `exit`）/ `plugin.run_incomplete`（④ `run()` 被拖住）/
 > `plugin.abnormal_termination`（不可捕获终止，由装配器按相位信标落）/
-> `plugin.process_defense_tampered`（⑤ 进程内防线被插件干预：静音 / 撤销 / **顶替**，探针收尾四重自检）/
-> `plugin.protocol_injection`（⑥ 结果通道被注入伪造结果，装配器结构不变量 + 通道隔离）/
+> `plugin.process_defense_tampered`（⑤ 进程内防线被插件干预：静音 / 撤销 / **顶替** / **出口③ `exit` 钩子被摘**，探针收尾四重自检）/
+> `plugin.protocol_injection`（⑥ 结果通道被注入伪造结果 / **被插件关闭**，装配器结构不变量 + 通道隔离）/
 > `plugin.probe_result_forged`（🆕 侧信道：输出面出现无 nonce 的伪造报告行）——唯一事实源 =
 > `src/harness/contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS`；
 > 「17 项 ∪ 条件项 == 三张 check 表并集」与「`PROBE_CHECK_ORDER` == 探针实际输出顺序」由
@@ -379,7 +379,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 128 项 + 归因离线回归 441 项 + 发布面自检 40 项 + 归因端到端回归 146 项 + 负例拦下（含漂移窗口）+ 插件侧闸门 21/21（15 负例 + R24 六条 + 防过度修正） | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 147 项 + 归因离线回归 452 项 + 发布面自检 40 项 + 归因端到端回归 156 项 + 负例拦下（含漂移窗口）+ 插件侧闸门 23 项（16 负例 + R24 六条 + 防过度修正） | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |
@@ -388,6 +388,7 @@ export function apply(ctx) {
 | M11 四条出口闭合 | **完成位** + 进程 exit 出口 + `run()` 被拖住 + 不可捕获终止（相位信标）——四条出口逐条闭合（v0.1.9） | ✅ done |
 
 | M13 信任边界显式前提 + 结构性重做方案 | R26 写成**显式前提**（HIGH）+ fd3/nonce 两条防线 + 一页重做方案（`docs/REDO-PROPOSAL.md`，批 2 **待拍板**） | ✅ done（批 2 待拍板） |
+| M14 批 1.5（复评 🔴-R1/R2 收口） | 可达性口径更正（**可证伪**断言替代恒真式）+ 结果通道**可见化**（降级不得判 PASS）+ §3 反例**固化**进闸门 + `'exit'` 钩子纳入防线台账 + 计数守卫（CHANGELOG 入表 / 逐处比对） | ✅ done（v0.2.3） |
 
 **暂停确认点**
 

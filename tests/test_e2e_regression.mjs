@@ -381,9 +381,11 @@ try {
   // 而离线回归台用的是假宿主 + 同一个装配器实现——真宿主能覆盖「真 ToolRuntime 装配下的时机差异」
   // （例如插件依赖在 import 期就动了 process 监听器）。两条都是**放行级假绿**，必须双跑。
   console.log('  [8e] v0.1.9d：R28 防线被顶替（真宿主，放行级假绿收口）');
-  // 注：R26 的**结构级**防线（`plugin.protocol_injection`）在真宿主下不可达（nonce 在插件代码前
-  // 已从 env 删除）⇒ 由离线 [9.11] 用合成输入断言；真宿主可达的 R26 形态（裸 marker 伪造）
-  // 已由上面 [8d] 的 `plugin-forged-result-plugin` 覆盖。
+  // 注：R26 的**结构级**防线（`plugin.protocol_injection`）的**可达性口径已更正**（复评 🔴-R1）：
+  // 它要求「**匹配 nonce 前缀**的结果行 ≥2 条 / 出现在 stdout」⇒ 可达当且仅当插件拿得到 nonce。
+  // nonce 经 stdin 下发 ⇒ **经 env / argv 不可达**（由离线 [9.11e] 通道形态守卫钉住）；
+  // 但**同进程同 uid** 下插件仍可用其它手段（猴子补丁 / 读内存）拿到 nonce ⇒ **不得**写「真宿主不可达」。
+  // 本段因此补一条**真宿主可证伪**断言（§3 反例固化）：见下面 [8g]。
   for (const [label, fixture, expectedCheck, expectedCompleted] of [
     ['R28 防线被顶替（摘掉探针兜底 + 装自己的）', 'plugin-defense-tamper-plugin.mjs', 'plugin.process_defense_tampered', true],
   ]) {
@@ -444,6 +446,39 @@ try {
       (healthy.checks ?? []).filter((c) => c.status === 'pass').length);
     eq('R24 反向护栏（真宿主）：健康插件 hostFatal 为空 + 跑完', '0|true',
       `${(healthy.hostFatal ?? []).length}|${healthy.runCompleted}`);
+  }
+
+  // ---- 11g. 🆕 §3 反例固化（真宿主；复评裁定 ④）+ 批 1.5 通道可见化 ----
+  // 为什么必须真宿主也跑：反例的三条证据链（反读 nonce / 写 fd3 / 摘 exit 钩子 + 抢跑退出）
+  // 全都依赖**真宿主路径**的 spawn 参数与 fd 布局——离线台是假宿主，可能掩盖协议拼装错误。
+  console.log('  [8g] 🆕 §3 反例固化（真宿主，期望**不得** GREEN）+ 通道可见化');
+  {
+    const poc = verify(path.join(ROOT, 'tests/fixtures', 'plugin-host-tamper-poc-plugin.mjs'), 'demo_echo');
+    const pocFailed = (poc.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('§3 反例（真宿主）：**不得** GREEN / PASS（原始 PoC 曾判 GREEN 放行）', true,
+      poc.summary?.verdict !== 'GREEN' && poc.attribution !== 'PASS');
+    eq('§3 反例（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${poc.attribution}|${poc.summary?.verdict}`);
+    eq('§3 反例（真宿主）：hostFatal 为空（插件侧错误不进判据字段）', 0, (poc.hostFatal ?? []).length);
+    eq('§3 反例（真宿主）：伪造被识别（plugin.probe_result_forged）', true,
+      pocFailed.includes('plugin.probe_result_forged'));
+    eq('§3 反例（真宿主）：抢跑退出被归因插件侧（plugin.abnormal_termination）', true,
+      pocFailed.includes('plugin.abnormal_termination'));
+    eq('§3 反例（真宿主）：完成位 false（未跑完不得判通过）', false, poc.runCompleted);
+
+    // 批 1.5 第 8 项（真宿主）：**只摘出口③ 的 exit 钩子**（其余健康）→ 必须判出（原先不可判定）
+    const hook = verify(path.join(ROOT, 'tests/fixtures', 'plugin-exit-hook-tamper-plugin.mjs'), 'demo_echo');
+    const hookFailed = (hook.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('批 1.5 出口钩子（真宿主）：只摘 exit 钩子 → 判 plugin.process_defense_tampered', true,
+      hookFailed.includes('plugin.process_defense_tampered'));
+    eq('批 1.5 出口钩子（真宿主）：归因插件侧 / RED / hostFatal 为空 / 完成位 true（探针跑完了）', 'PLUGIN_REGRESSION|RED|0|true',
+      `${hook.attribution}|${hook.summary?.verdict}|${(hook.hostFatal ?? []).length}|${hook.runCompleted}`);
+
+    // 批 1.5 通道可见化（真宿主）：正常路径 resultChannel=fd3 且不降级
+    const healthyChannel = verify(path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('批 1.5 通道可见化（真宿主）：正常路径 resultChannel=fd3', 'fd3', healthyChannel.resultChannel);
+    eq('批 1.5 通道可见化（真宿主）：正常路径未降级 + 归因 PASS', 'false|PASS',
+      `${healthyChannel.resultChannelDegraded}|${healthyChannel.attribution}`);
   }
 
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----

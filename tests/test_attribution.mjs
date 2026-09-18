@@ -41,6 +41,8 @@ import {
   PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_SIDE_CHECKS,
   PROBE_NONCE_STDIN_CHANNEL,
+  PLUGIN_PROBE_FORGED_RESULT_CHECK,
+  probeResultPrefix,
   PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
@@ -685,8 +687,14 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
     /hasUncaughtExceptionCaptureCallback/.test(probeSrc));
   // R28 收口：判据从「计数」升级为「**身份检查**」——数个数挡不住「插件用自己的回调顶替我们的」
   // （实测：插件顶替后 `listenerCount === 1`、`has() === true`，计数判据恒判「防线有效」= 假阳性）。
+  // 身份检查的事件清单**必须**含 `exit`（批 1.5 第 8 项：出口③ 的钩子被单方摘除原先不可判定）。
+  // 断言形式：`process.listeners(event).includes(handler)` 存在，且清单里三个事件都在
+  // （`uncaughtException` / `unhandledRejection` / `exit`）——少一个即红（回退到两事件 = 出口③ 盲区）。
   eq('H1/R28 源码守卫：收尾自检做**身份检查**（我们的 handler 仍在 process.listeners() 内）', true,
-    /for \(const event of \['uncaughtException', 'unhandledRejection'\]\)[\s\S]{0,400}process\.listeners\(event\)\.includes\(handler\)/.test(probeSrc));
+    /process\.listeners\(event\)\.includes\(handler\)/.test(probeSrc));
+  eq('H1/R28/批1.5 源码守卫：身份检查的事件清单含 exit（出口③ 钩子摘除可判定）', true,
+    /for \(const event of \[[^\]]*'uncaughtException'[^\]]*'unhandledRejection'[^\]]*'exit'[^\]]*\]\)/.test(probeSrc)
+    || /for \(const event of \[[^\]]*'exit'[^\]]*\]\)/.test(probeSrc));
   eq('H1 源码守卫：自检在 emit() 内、且在 `out.ok` 判定**之前**（否则 GREEN 会被写出去）', true,
     (() => {
       const body = probeSrc.slice(probeSrc.indexOf('function emit()'), probeSrc.indexOf('/** definitions 不可用时'));
@@ -944,8 +952,12 @@ console.log('  [9.9] 🔴 四条出口 + 完成位（进程 exit / run() 被拖�
   eq('🔴 出口③ 源码守卫：探针挂 process.on("exit") 钩子（可捕获出口闭合）', true, /process\.on\('exit'/.test(exitProbeSrc));
   eq('🔴 出口③ 源码守卫：exit 钩子里用 writeSync 出报告（防 exit 截断 stdout）', true,
     /process\.on\('exit'[\s\S]{0,1200}emit\(\)/.test(exitProbeSrc));
+  // 出口③ 的钩子现为**具名** handler（`defenseHandlers.exit`）——具名是**身份检查**的锚点
+  // （批 1.5 第 8 项：`checkProcessDefense()` 靠它判断钩子是否仍在 `process.listeners('exit')` 里）。
+  eq('🔴 出口③ 源码守卫：exit 钩子具名登记（身份检查的锚点，防被单方摘除不可判定）', true,
+    /defenseHandlers\.exit = \(code\) =>/.test(exitProbeSrc) && /process\.on\('exit', defenseHandlers\.exit\)/.test(exitProbeSrc));
   eq('🔴 出口③ 源码守卫：exit 钩子改 process.exitCode（插件 exit(0) 不得读成通过）', true,
-    /process\.on\('exit'[\s\S]{0,1600}process\.exitCode = 1/.test(exitProbeSrc));
+    /defenseHandlers\.exit = \(code\) =>[\s\S]{0,2000}process\.exitCode = 1/.test(exitProbeSrc));
   // 按**代码视图**判（codeOnly 去掉注释与字符串文本）：本文件的注释里大量出现
   // `watchdog.unref?.()` / `onProcessLevelException()` 这类「历史缺陷长什么样」的说明，
   // 直接扫源码会把**文档**当成**实现**（误报）。守卫本身不能有盲区，也不能有误报。
@@ -1144,23 +1156,71 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
   eq('R26：落点 check 已登记进 CONDITIONAL_PROBE_CHECKS（条件项计数随之 +1）', true,
     CONDITIONAL_PROBE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
 
-  // 9.11f **可达性边界**（口径，必须显式声明）：结构级防线（`plugin.protocol_injection`）要求
-  // 「匹配 nonce 前缀的结果行 ≥2 条 / 出现在 stdout」——而探针在**任何插件代码之前**就把 nonce
-  // 从 `process.env` 删除 ⇒ **真宿主下插件无法构造**该输入。故：
-  // ① 该 check 由**离线合成输入**断言（9.11a/9.11b，已覆盖）；
-  // ② 真宿主可达的 R26 形态是 `plugin-forged-result-plugin`（裸 marker / nonce 不匹配
-  //    ⇒ `plugin.probe_result_forged`），它**进闸门**；
-  // ③ 本项**不得**因「不可达」而从 `PLUGIN_SIDE_CHECKS` / `CONDITIONAL_PROBE_CHECKS` 摘除——
-  //    它是**第二道防线**（nonce 机制一旦被改坏/绕过，结构不变量仍能兜住）。
-  eq('R26 可达性：结构级防线在真宿主不可达（nonce 在插件代码前已从 env 删除）⇒ 由离线合成输入断言',
-    true, PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
-  eq('R26 可达性：真宿主可达形态是 plugin-forged-result-plugin（进闸门）', true,
-    /plugin-forged-result-plugin\|plugin\.probe_result_forged/.test(readText(path.join(ROOT, 'tests/gate_plugin_side.sh'), 'utf8')));
+  // 9.11f **可达性：可证伪断言**（复评裁定 ⑤ 收口——上一版这里是**恒真式**，测不到它要守的命题）。
+  //
+  // ## 上一版错在哪（复评 🔴-R1）
+  // 上一版写的是「结构级防线（`plugin.protocol_injection`）在**真宿主不可达**」，并把断言写成
+  // `PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK)` —— **恒真式**（名单里当然有它），
+  // 与「可达性」**无关** ⇒ 该「守卫」测不到它要守的命题（正是 R27 点过的「断言不可满足 / 假精度」）。
+  // 更严重的是：那句「不可达」是**事实错误**——本仓实测（env 通道下）插件经 `/proc/self/environ`
+  // 反读 nonce 后，把**匹配前缀**的结果行写到 stdout，真宿主**确实命中** `plugin.protocol_injection`。
+  //
+  // ## 现在的口径（事实陈述，不越权承诺）
+  // 结构级防线要求「**匹配 nonce 前缀**的结果行 ≥2 条 / 出现在 stdout」⇒ 它**可达当且仅当**
+  // 插件能拿到 nonce。当前实现 nonce 经 **stdin** 下发（不经 env / argv）⇒ 经这两条**读取面**
+  // 不可达（由下面的通道形态守卫 + 夹具自检钉住）；但**同进程同 uid** 下插件仍可用**其它**手段
+  // 拿到 nonce（猴子补丁 / 读内存）⇒ **不得**写「真宿主不可达」，那是把未验证的命题写成对外口径。
+  // 故本段的断言改为**可证伪**：构造输入 → 判据必须命中；去掉 nonce → 判据必须**不**命中。
   {
-    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'utf8');
-    eq('R26 夹具：真的写裸 marker（无 nonce ⇒ 命中侧信道防线）', true, /write\(`__DSH_PROBE__/.test(src));
-    eq('R26 夹具：真缺陷（多注册工具 ⇒ registry.exact 必 fail，绿卡不得掩盖它）', true, /demo_extra/.test(src));
-    eq('R26 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+    const mkPayload = (ok = true) => JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok, runCompleted: true, phase: 'plugin-integration' });
+    const nonce = createProbeNonce(randomBytes).value;
+    // ① 可证伪（正向）：**已知 nonce** 时，把匹配前缀的结果行写到 **stdout**（通道已隔离）→ 必须命中。
+    //    这条**不是恒真式**：把判据删掉 / 把通道隔离关掉，它立刻红。
+    {
+      const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
+      interpretProbeStdout(r, `${probeResultPrefix(nonce)}${mkPayload()}\n`, { resultFd: `${probeResultPrefix(nonce)}${mkPayload()}\n`, nonce });
+      eq('R26 可达性（可证伪·正向）：匹配 nonce 的结果行出现在 stdout（通道已隔离）→ 判 plugin.protocol_injection', PLUGIN_PROTOCOL_INJECTION_CHECK, r.checks[0]?.name);
+      eq('R26 可达性（可证伪·正向）：命中即不放行（ok=false / 完成位 false）', 'false|false', `${r.ok}|${r.runCompleted}`);
+    }
+    // ② 可证伪（反向）：同样的输入但**前缀不匹配**（插件拿不到 nonce 的形态）→ **不得**命中结构级防线。
+    //    两条一起构成「判据有判别力」的证明（只写正向的话，一个「恒判篡改」的实现也能过）。
+    {
+      const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
+      interpretProbeStdout(r, `__DSH_PROBE__${mkPayload()}\n`, { resultFd: `${probeResultPrefix(nonce)}${mkPayload()}\n`, nonce });
+      eq('R26 可达性（可证伪·反向）：前缀不匹配（拿不到 nonce）→ **不**命中结构级防线', false,
+        r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+      eq('R26 可达性（可证伪·反向）：改判 plugin.probe_result_forged（侧信道，独立证据链）', true,
+        r.checks.some((c) => c.name === PLUGIN_PROBE_FORGED_RESULT_CHECK));
+    }
+    // ③ 通道形态事实（**这才是**「经 env / argv 不可达」的机器可检依据）：spawn 参数里
+    //    nonce 不在 env、不在 argv，经 stdin 字节流下发。
+    const opts = probeSpawnOptions({ hubRoot: ROOT, pluginPath: '/tmp/p.mjs', expectedTools: ['a'], timeoutMs: 1000, nonce: createProbeNonce(randomBytes) });
+    eq('R26 可达性（通道事实）：nonce 不经 env（/proc/self/environ 读取面不成立）', true,
+      !opts.env || !Object.keys(opts.env).some((k) => k.startsWith('DSH_NONCE')));
+    eq('R26 可达性（通道事实）：nonce 不经 argv（ps / cmdline 读取面不成立）', true,
+      !(opts.args ?? []).some((a) => /nonce/i.test(String(a))));
+    eq('R26 可达性（通道事实）：nonce 经 stdin 字节流下发', true, typeof opts.input === 'string' && opts.input.trim().length > 0);
+    // ④ 真宿主可达形态（进闸门）：裸 marker 伪造 ⇒ `plugin.probe_result_forged`。
+    eq('R26 可达性：真宿主可达形态是 plugin-forged-result-plugin（进闸门）', true,
+      /plugin-forged-result-plugin\|plugin\.probe_result_forged/.test(readText(path.join(ROOT, 'tests/gate_plugin_side.sh'), 'utf8')));
+    // ⑤ §3 反例（**真宿主 PoC**）固化并进闸门——这是「不可达」口径作废的可执行证据。
+    eq('R26 可达性：§3 反例 PoC 夹具进闸门（真宿主，期望不得 GREEN）', true,
+      /plugin-host-tamper-poc-plugin\|/.test(readText(path.join(ROOT, 'tests/gate_plugin_side.sh'), 'utf8')));
+    {
+      const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'utf8');
+      eq('R26 夹具：真的写裸 marker（无 nonce ⇒ 命中侧信道防线）', true, /write\(`__DSH_PROBE__/.test(src));
+      eq('R26 夹具：真缺陷（多注册工具 ⇒ registry.exact 必 fail，绿卡不得掩盖它）', true, /demo_extra/.test(src));
+      eq('R26 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+    }
+    // ⑥ 三处「真宿主不可达」口径必须已被更正（回退即红）：RISKS / e2e 注释 / 闸门注释
+    const r26Row = readText(path.join(ROOT, 'docs/RISKS.md'), 'utf8').split('\n').find((line) => /^\| R26 \|/.test(line)) ?? '';
+    // 注意：守卫要判的是**是否把不可达当结论**——上一版的原话是「真宿主下插件无法构造该输入」/
+    // 「结构级防线在真宿主不可达」。只判这两个**断言式**写法（不判「不得写 X」这类**禁止语**，
+    // 否则守卫会把更正说明本身判红——那正是「文档即防线」要保留的东西）。
+    eq('R26 口径：RISKS R26 不再把「真宿主不可达 / 无法构造」当结论（未验证命题不得当对外口径）', false,
+      /真宿主下(\*\*)?不可达/.test(r26Row) || /真宿主下插件无法构造/.test(r26Row));
+    eq('R26 口径：RISKS R26 写明经 env/argv 不可达 + 同进程其它手段仍可达（事实陈述）', true,
+      /经 env \/ argv 不可达/.test(r26Row) && /同进程/.test(r26Row));
   }
 }
 

@@ -501,7 +501,7 @@ assert "🔴-1 反向反证（生产口径）：失败项 plugin.abnormal_termin
 assert "🔴-1 反向反证（旧口径 SIGTERM）：耗时 ≥ 2×timeout（超时被探针处理器吞掉 ⇒ 形同虚设）" "true" "$(jk17 legacy '.ms >= c.timeout * 2')"
 assert "🔴-1 反向反证：SIGTERM 下确实**不是**被超时杀掉的（差异来自 killSignal，非环境噪声）" "false" "$(jk17 legacy '.signal === "SIGKILL"')"
 
-echo "  [13] 🆕 nonce 带外通道（侧信道：只认带 nonce 的报告 + 伪造即判）"
+echo "  [18] 🆕 nonce 带外通道（侧信道：只认带 nonce 的报告 + 伪造即判）+ v0.1.9d R28/R26/R24 三形态"
 NONCE_OUT="$("$NODE_BIN" --input-type=module -e '
 import { interpretProbeStdout } from "'"$ROOT"'/src/harness/host.mjs";
 import { createProbeNonce, probeResultPrefix, PLUGIN_PROBE_FORGED_RESULT_CHECK } from "'"$ROOT"'/src/harness/contract.mjs";
@@ -554,6 +554,78 @@ assert "R24 同步死循环：按相位信标归因插件侧 + hostFatal 为空"
 assert "R24 同步死循环：完成位 false（未跑完不得判通过）" "false" "$(j syncLoop '.completed')"
 assert "R24 同步死循环：归因 PLUGIN_REGRESSION（有信标 ⇒ 不判上游漂移）" "PLUGIN_REGRESSION" "$(j syncLoop '.attribution')"
 
+
+echo "  [19] 🆕 批 1.5：结果通道可见化 + 降级不得判 PASS + §3 反例固化 + exit 钩子台账"
+# 四项分别对应复评裁定的批 1.5 清单：
+#   ② 通道可见化（`resultChannel` 落进报告）/ 降级不得放行；
+#   ④ §3 反例（真宿主 PoC）固化并进闸门（离线侧先断言夹具自述与关键行为）；
+#   ⑧ `'exit'` 钩子纳入 `wrapProcessDefenseApis()` 台账（原先**不可判定**）。
+#
+# 为什么降级必须能判红（评审 🔴-R2）：`writeResult()` 的返回值原被调用点**丢弃**、
+# `out` 里没有任何通道字段 ⇒ 报告里看不到这次走的是哪条通道；而装配器在「结果通道为空」时
+# **回落到 stdout** ⇒ 降级等于**静默把防线关掉**（实测：无 fd3 的离线台上 nonce 伪造 +
+# `SIGKILL` ⇒ `ok=true / runCompleted=true / hostFatal=0`，**放行**）。
+CHANNEL_OUT="$("$NODE_BIN" --input-type=module -e '
+import path from "node:path";
+import { runOfflineProbe } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+const healthy = path.join("'"$ROOT"'", "tests/fixtures/demo-plugin.mjs");
+const tools = ["demo_echo", "demo_status"];
+const normal = runOfflineProbe({ pluginPath: healthy, expectedTools: tools });
+const degraded = runOfflineProbe({ pluginPath: healthy, expectedTools: tools, noResultChannel: true });
+console.log(JSON.stringify({
+  normalChannel: normal.result.resultChannel,
+  normalOk: normal.result.ok === true,
+  normalAttr: normal.attribution,
+  degradedChannel: degraded.result.resultChannel,
+  degradedOk: degraded.result.ok === true,
+  degradedAttr: degraded.attribution,
+  degradedHostFatal: degraded.result.hostFatal.length,
+  degradedCompleted: degraded.result.runCompleted === true,
+  degradedChecks: degraded.result.checks.length,
+}));
+')"
+jc() { echo "$CHANNEL_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);console.log(eval('r$1'))})"; }
+assert "正常路径：resultChannel=fd3（通道形态落进报告，排障可见）" "fd3" "$(jc '.normalChannel')"
+# 注：离线台的 `attribution` 来自 `attributionDetail()`（**只在失败路径**判归因），健康插件无失败项
+# ⇒ 返回 UNKNOWN 属预期；「判 PASS」是 `verifyChannel()` 在 `probe.ok` 为真时的分支（真宿主侧断言）。
+# 这里断言的是**新增通道字段不误伤正常路径**：ok 仍为真、无宿主侧信号。
+assert "正常路径：ok=true（新增通道字段不误伤正常路径）" "true" "$(jc '.normalOk')"
+assert "降级路径：resultChannel=stdout-degraded（**显式可见**，不静默）" "stdout-degraded" "$(jc '.degradedChannel')"
+assert "降级路径：**不得判 PASS**（ok=false）" "false" "$(jc '.degradedOk')"
+assert "降级路径：归因 UPSTREAM_DRIFT + hostFatal 非空（环境限制 → 宿主/环境侧信号，AMBER 不放行）" "UPSTREAM_DRIFT|1" "$(jc '.degradedAttr+"|"+r.degradedHostFatal')"
+assert "降级路径：完成位仍 true（探针跑完了——它只是**知道**通道降级）" "true" "$(jc '.degradedCompleted')"
+assert "降级路径：17 项检查仍在（降级不丢报告，只降判决）" "17" "$(jc '.degradedChecks')"
+
+# §3 反例固化：真宿主 PoC 夹具（离线先断言其**自述与关键行为**，真宿主断言见闸门）
+POC_SRC="$ROOT/tests/fixtures/plugin-host-tamper-poc-plugin.mjs"
+assert "§3 反例夹具存在（复评要求的真宿主 PoC 固化）" "yes" "$([[ -f "$POC_SRC" ]] && echo yes || echo no)"
+assert "§3 反例夹具：真的反读 /proc/self/environ（原始 PoC 第一步）" "yes" "$(grep -q '/proc/self/environ' "$POC_SRC" && echo yes || echo no)"
+assert "§3 反例夹具：真的反读 /proc/self/cmdline（argv 面）" "yes" "$(grep -q '/proc/self/cmdline' "$POC_SRC" && echo yes || echo no)"
+assert "§3 反例夹具：真的向 fd3 写伪造结果" "yes" "$(grep -q 'writeSync(3,' "$POC_SRC" && echo yes || echo no)"
+assert "§3 反例夹具：真的摘掉 exit 钩子" "yes" "$(grep -q "removeAllListeners('exit')" "$POC_SRC" && echo yes || echo no)"
+assert "§3 反例夹具：真的 process.exit(0) 抢跑" "yes" "$(grep -q 'process.exit(0)' "$POC_SRC" && echo yes || echo no)"
+
+# 出口钩子台账（批 1.5 第 8 项）：**行为级**——只摘 `exit` 钩子的夹具必须被判出（原先不可判定）
+HOOK_OUT="$("$NODE_BIN" --input-type=module -e '
+import path from "node:path";
+import { runOfflineProbe } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+const r = runOfflineProbe({ pluginPath: path.join("'"$ROOT"'", "tests/fixtures/plugin-exit-hook-tamper-plugin.mjs"), expectedTools: ["demo_echo"] });
+const fails = r.result.checks.filter((c) => c.status === "fail").map((c) => c.name);
+console.log([r.attribution, fails.includes("plugin.process_defense_tampered"), r.result.hostFatal.length, r.result.runCompleted === true, r.result.ok === true].join("|"));
+')"
+assert "出口钩子被摘（只摘 exit，其余健康）：判 plugin.process_defense_tampered（行为级，原先不可判定）" "PLUGIN_REGRESSION|true|0|true|false" "$HOOK_OUT"
+
+# 出口钩子台账（批 1.5 第 8 项）：`'exit'` 必须在 wrap 的记账范围内 + 身份检查清单里
+PROBE_SRC="$ROOT/src/harness/probe-template.mjs"
+assert "批 1.5：wrapProcessDefenseApis 的记账事件含 exit（原先出口钩子摘除**不可判定**）" "yes"   "$(grep -q "const targets = \['uncaughtException', 'unhandledRejection', 'exit'\]" "$PROBE_SRC" && echo yes || echo no)"
+assert "批 1.5：收尾身份检查的事件清单含 exit" "yes"   "$(grep -q "for (const event of \['uncaughtException', 'unhandledRejection', 'exit'\])" "$PROBE_SRC" && echo yes || echo no)"
+assert "批 1.5：exit 钩子具名登记（身份检查的锚点）" "yes"   "$(grep -q "process.on('exit', defenseHandlers.exit)" "$PROBE_SRC" && echo yes || echo no)"
+
+# 段落编号唯一性守卫（评审 🟡-R3②：`test_offline.sh` 曾有**两个 `[13]`**，编号不能再当索引锚）
+DUP_SECTIONS="$(grep -oE '^echo "  \[[0-9]+\]' "$ROOT/tests/test_offline.sh" | sed -E 's/.*\[([0-9]+)\].*/\1/' | sort | uniq -d | tr '\n' ',')"
+assert "段落编号唯一（重复编号 = 索引不可用，回退即红）" "" "$DUP_SECTIONS"
+SECTION_18="$(grep -cE '^echo "  \[18\]' "$ROOT/tests/test_offline.sh")"
+assert "文档声称的 [18] 段**真实存在**（曾指向不存在的产物 = 文档撒谎）" "1" "$SECTION_18"
 
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"

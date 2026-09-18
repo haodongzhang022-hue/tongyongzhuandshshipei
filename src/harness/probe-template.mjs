@@ -96,6 +96,8 @@ import { pathToFileURL } from 'node:url';
 import {
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
   PLUGIN_PROTOCOL_INJECTION_CHECK,
+  RESULT_CHANNEL_FD3,
+  RESULT_CHANNEL_STDOUT_DEGRADED,
   PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
@@ -113,14 +115,20 @@ import {
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
 
-// ---- 🆕 nonce 带外通道（侧信道收口） ----
-// 宿主每次运行生成随机 nonce 与**随机环境变量名**，经 argv 把「名字」传进来、
-// 经 env 把「值」传进来。探针只认这个值：输出的结构化结果前缀带 nonce，
-// 宿主也只认带 nonce 的行。这样「谁是探针」由宿主掌握的随机量判定，
+// ---- nonce 带外通道（侧信道收口；**经 stdin**，不经 env / argv） ----
+// 宿主每次运行生成随机 nonce，作为**子进程 stdin 的字节流**传进来（见 host.mjs 的
+// `probeSpawnOptions()` / `PROBE_NONCE_STDIN_CHANNEL`）。探针只认这个值：输出的结构化结果
+// 前缀带 nonce，宿主也只认带 nonce 的行。这样「谁是探针」由宿主掌握的随机量判定，
 // 而不是靠公开字面量 `__DSH_PROBE__`——插件伪造裸 marker 会被宿主识别为伪造。
 //
-// 纪律：读到后**立刻**从 `process.env` 删除（缩小插件侧的可见窗口）；
-// 缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
+// ⚠️ 为什么**不是** env / argv（实测依据，不是偏好）：本仓曾并行落地 env 通道（随机环境变量名
+// 经 argv 传、值经 env 传，探针读到后 `delete process.env[NAME]`）。**实测可被同进程插件反读**：
+// `delete` 只改 Node 的环境视图，不改内核里的进程环境块 ⇒ 插件从 **`/proc/self/environ`**
+// 读回 nonce，进而伪造出**被采信**的结果行（实测 GREEN / PASS / 17 项）。argv 同理出现在
+// `ps` / `/proc/self/cmdline`。故**删除** env 传值口径与相关 API。
+//
+// 纪律：读到后**立刻** `destroy()` fd 0（否则插件可从 `/dev/fd/0` 再读一遍——实测 destroy 后
+// 读回空串）。缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
 // 但宿主侧会按「无 nonce ⇒ 不可信」处理（见 host.mjs 的 interpretProbeStdout）。
 const nonceValue = (() => {
   try {
@@ -204,10 +212,46 @@ function beacon(name) {
  */
 const RESULT_FD = 3;
 /**
+ * **通道可用性的早期快照**（在任何插件代码运行之前探测一次）。
+ *
+ * 为什么需要两个时点（批 1.5，评审 🔴-R2 的归因要求）：末次探测若发现 fd3 不可用，
+ * 有两种**完全不同**的原因，必须能区分：
+ * - 早探测也失败 ⇒ **环境**本身没有 fd3（容器 / Windows / 直接跑探针）⇒ 降级是环境限制，
+ *   结论不可信（不放行），归因宿主/环境侧；
+ * - 早探测成功、末次失败 ⇒ 通道是**在插件代码运行期间**被关闭 / 替换的（插件 `closeSync(3)`）
+ *   ⇒ 这是**插件侧篡改结果通道**，落插件侧 check `plugin.protocol_injection`。
+ * 只探一次就无法区分这两者，降级就会变成「谁都能把防线关掉而不被发现」。
+ */
+const resultChannelAtStart = probeResultChannel();
+/**
+ * 结果通道**可用性预检**（批 1.5：降级必须**显式可见**，不得静默）。
+ *
+ * 为什么需要（评审 🔴-R2）：原先 `writeResult()` 的返回值被调用点**丢弃**，报告里**看不到**
+ * 这次走的是 fd3 还是 stdout。而 `interpretProbeStdout()` 在「结果通道为空」时会**回落到
+ * stdout**——于是「降级」等于**静默把防线关掉**：降级后 stdout 上的结果行不再构成篡改证据，
+ * 实测（无 fd3 的离线台）伪造 + `SIGKILL` ⇒ `ok=true / runCompleted=true / hostFatal=0`（**放行**）。
+ *
+ * 修法：写报告**之前**先探测 fd3 是否可写（`writeSync(3, '')` 在 fd 未开时抛 `EINVAL`，实测），
+ * 把结果落进 `out.resultChannel`（`'fd3'` / `'stdout-degraded'`）⇒ 报告与二级信息里**可见**；
+ * 降级时额外记一条 errors 行 ⇒ `ok` 必为 false（装配器另置 `resultChannelDegraded`）。
+ *
+ * 纪律：本函数运行在收尾路径上，**不得抛**。
+ *
+ * @returns {'fd3'|'stdout-degraded'} 通道形态
+ */
+function probeResultChannel() {
+  try {
+    writeSync(RESULT_FD, '');
+    return RESULT_CHANNEL_FD3;
+  } catch {
+    return RESULT_CHANNEL_STDOUT_DEGRADED;
+  }
+}
+/**
  * 把结构化结果写到结果通道（**崩溃路径**：不得抛）。
  *
  * @param {string} payload 完整结果行（含 `__DSH_PROBE__` 前缀与换行）
- * @returns {'fd3'|'stdout'} 实际使用的通道（供排障）
+ * @returns {'fd3'|'stdout'} 实际使用的通道（供排障；降级形态由 {@link probeResultChannel} 先判定）
  */
 function writeResult(payload) {
   try {
@@ -231,7 +275,7 @@ function writeResult(payload) {
  * `hasUncaughtExceptionCaptureCallback()` 仍为 true ⇒「计数判据」恒判「防线有效」（假阳性）。
  * 只有**认出自己的 handler 还在不在**才能判「防线是否被替换」。
  */
-const defenseHandlers = { uncaughtException: null, unhandledRejection: null };
+const defenseHandlers = { uncaughtException: null, unhandledRejection: null, exit: null };
 /** 插件对防线 API 的调用台账（wrap 后逐次记账；由 `apply()` 内的调用填充）。 */
 const defenseApiCalls = [];
 /**
@@ -258,7 +302,10 @@ let defenseCanaryActive = false;
  * @returns {void}
  */
 function wrapProcessDefenseApis() {
-  const targets = ['uncaughtException', 'unhandledRejection'];
+  // 记账范围含 `'exit'`（R23 同族，批 1.5 第 8 项）：出口③ 的 `process.on('exit')` 钩子原先
+  // **不在台账**里 ⇒「插件把出口钩子单方摘除」这件事**不可判定**（实测：干净插件 +
+  // `removeAllListeners('exit')` → 不判 `plugin.process_defense_tampered`，只因其它 fail 兜住）。
+  const targets = ['uncaughtException', 'unhandledRejection', 'exit'];
   const wrap = (name, describe) => {
     const original = process[name];
     if (typeof original !== 'function') return;
@@ -372,11 +419,17 @@ function checkProcessDefense() {
   const tampered = [];
   try {
     if (defenseApiCalls.length > 0) tampered.push(...defenseApiCalls);
-    for (const event of ['uncaughtException', 'unhandledRejection']) {
+    for (const event of ['uncaughtException', 'unhandledRejection', 'exit']) {
       const handler = defenseHandlers[event];
       let present = false;
       try { present = typeof handler === 'function' && process.listeners(event).includes(handler); } catch { present = true; }
-      if (!present) tampered.push(`探针的 ${event} 兜底 handler 已不在 process.listeners('${event}') 中（被插件摘除或顶替）`);
+      if (!present) {
+        // `exit` 是**出口③**（进程提前退出）的记账钩子：被摘除 ⇒ 插件在验收完成前 `process.exit()`
+        // 这件事将不可见（R23 同族，批 1.5 第 8 项）。
+        tampered.push(event === 'exit'
+          ? '探针的 exit 钩子（出口③：进程提前退出的记账）已不在 process.listeners(\'exit\') 中（被插件摘除或顶替）'
+          : `探针的 ${event} 兜底 handler 已不在 process.listeners('${event}') 中（被插件摘除或顶替）`);
+      }
     }
     let capturePresent = false;
     try { capturePresent = typeof process.hasUncaughtExceptionCaptureCallback === 'function' && process.hasUncaughtExceptionCaptureCallback() === true; } catch { capturePresent = false; }
@@ -426,6 +479,28 @@ function emit() {
   } catch { /* 收尾路径上不得再抛 */ }
   // 完成位落进结构化结果（排障与断言都看得见「这次到底跑完了没有」）。
   out.runCompleted = runCompleted;
+  // 批 1.5（🔴-R2）：结果通道**可见化**——报告里看得见这次走的是 fd3 还是降级到 stdout。
+  out.resultChannel = probeResultChannel();
+  out.resultChannelAtStart = resultChannelAtStart;
+  if (out.resultChannel === RESULT_CHANNEL_STDOUT_DEGRADED) {
+    // **降级不得判 PASS**：fd3 不可用时 stdout 上的结果行**不再构成**篡改证据
+    // （装配器在通道为空时回落到 stdout）⇒ 本轮结论不可信。
+    const closedByPlugin = resultChannelAtStart === RESULT_CHANNEL_FD3;
+    if (closedByPlugin && !out.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK)) {
+      // 早探测成功、末次失败 ⇒ 通道是**在插件代码运行期间**被关闭/替换的（插件侧篡改）。
+      out.checks.push({
+        name: PLUGIN_PROTOCOL_INJECTION_CHECK,
+        status: 'fail',
+        detail: '结果通道 fd3 在插件代码运行期间变为不可写（早探测可写、收尾不可写）——插件关闭/替换了探针的结果通道，本轮结果不可信',
+      });
+      out.errors.push(`${PLUGIN_PROTOCOL_INJECTION_CHECK}: 结果通道被插件关闭/替换（早探测可写 → 收尾不可写）`);
+    } else if (!closedByPlugin) {
+      // 环境本身没有 fd3 ⇒ 降级是**环境限制**（不是插件的错）⇒ 按宿主/环境侧信号落 `hostFatal[]`：
+      // 归因 `UPSTREAM_DRIFT` / AMBER（**不放行**，人须确认），且 `hostFatal[]` 里看得见原因。
+      // 这样「降级」既**显式可见**（resultChannel 字段 + hostFatal 原因），又**不静默通过**。
+      pushHostFatal(out, `结果通道 fd3 在本环境不可用（早探测即失败）⇒ 结构化结果降级走 stdout（${RESULT_CHANNEL_STDOUT_DEGRADED}）：stdout 上的结果行不再具备篡改证据能力，本轮结论不可信（不放行，人须确认）`);
+    }
+  }
   // 🔴 必修-1：`ok` 必须**同时**要求「跑完」与「无失败」——否则出口 ③ 的中途报告会假绿
   // （`apply()` 里 process.exit(0) → 剩余检查是 skip 不是 fail → 只看 errors 就 GREEN）。
   out.ok = runCompleted && out.errors.length === 0;
@@ -840,7 +915,7 @@ process.on('unhandledRejection', defenseHandlers.unhandledRejection);
 // 都接不到；旧探针于是在写出结构化结果前直接消失 → 装配器判「探针未输出结构化结果」
 // → 无条件 pushHostFatal() → 插件 bug 判 UPSTREAM_DRIFT/AMBER，且 checks 归零。
 // 钩子内必须用 writeSync（见 emit 的说明），且**不得**抛（崩溃路径）。
-process.on('exit', (code) => {
+defenseHandlers.exit = (code) => {
   if (finishing) return; // 探针自己正在收尾（finish() 已输出过结果）：不重复记、不改退出码
   try {
     // 走到这里 = 进程**不是**由探针的 finish() 退出的（finish 会先置 finishing）⇒ 一律是
@@ -855,7 +930,10 @@ process.on('exit', (code) => {
   // 退出码：报告判失败（含「没跑完」）时，插件 exit(0) 也不得让装配器把这次运行读成通过。
   // exit 钩子里只能改 process.exitCode，不能再次 process.exit（会死循环）。
   if (!out.ok) { try { process.exitCode = 1; } catch { /* 极端情形：静默，报告已输出 */ } }
-});
+};
+// 具名登记（不是匿名箭头）：`checkProcessDefense()` 的**身份检查**靠它判断「出口③ 的钩子是否
+// 仍挂在 `process.listeners('exit')` 里」（批 1.5 第 8 项：摘除出口钩子原先不可判定）。
+process.on('exit', defenseHandlers.exit);
 // 自杀式信号：默认行为直接终止进程，**不触发** exit 钩子的记账语义（来不及写报告），
 // 故显式接住 → 记插件侧 check → 输出报告 → 以失败码退出。
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT']) {

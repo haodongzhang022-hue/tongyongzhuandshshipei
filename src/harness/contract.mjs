@@ -88,7 +88,8 @@ export const PROBE_PHASE_BEACON_PREFIX = '__DSH_PROBE_PHASE__';
  *
  * 为什么「随机」而不是固定名：固定名（如 `__DSH_PROBE__`）等于没设防——插件照抄即可。
  * nonce 经**带外通道（stdin）**下发（见 {@link PROBE_NONCE_STDIN_CHANNEL}），
- * **不进 argv / env** ⇒ 不落 `/proc/self/environ`，也不出现在 `ps` 里。
+ * **不经 argv / env**（实测：env 通道可被 `/proc/self/environ` 反读、argv 通道出现在 `ps` 里，
+ * 两者都让插件伪造出**被采信**的结果行）⇒ 这两条读取面都不成立。
  */
 export const PROBE_RESULT_MARKER = '__DSH_PROBE__';
 
@@ -115,6 +116,24 @@ export const PROBE_RESULT_MARKER = '__DSH_PROBE__';
  * （独立 fd 通道 / 独立进程签名 / `vm` 隔离 `apply()`）——见 `docs/REDO-PROPOSAL.md`。
  */
 export const PROBE_NONCE_STDIN_CHANNEL = 'stdin';
+
+/**
+ * 结果通道的**形态取值**（唯一事实源；探针与装配器共用，防两侧字符串漂移）。
+ *
+ * 为什么需要（批 1.5，评审 🔴-R2「降级是静默的」）：
+ * - {@link RESULT_CHANNEL_FD3}：结构化结果走独立 fd3（正常形态，stdout 出现结果行 = 篡改证据）；
+ * - {@link RESULT_CHANNEL_STDOUT_DEGRADED}：fd3 不可用 ⇒ **降级**到 stdout。降级后
+ *   「stdout 上出现结果行」**不再**构成篡改证据（装配器在通道为空时回落到 stdout），
+ *   故**降级运行不得判 PASS**——报告与二级信息里必须能看见 `resultChannel`。
+ *
+ * 历史缺陷：`writeResult()` 的返回值被调用点**丢弃**、`out` 里没有任何通道字段 ⇒
+ * 报告里看不到这次走的是哪条通道，降级等于**静默把防线关掉**（实测：无 fd3 的离线台上
+ * nonce 伪造 + `SIGKILL` ⇒ `ok=true / runCompleted=true / hostFatal=0`，**放行**）。
+ */
+export const RESULT_CHANNEL_FD3 = 'fd3';
+
+/** 降级形态：fd3 不可用，结果走 stdout（见 {@link RESULT_CHANNEL_FD3}）。 */
+export const RESULT_CHANNEL_STDOUT_DEGRADED = 'stdout-degraded';
 
 /**
  * 生成一次运行的随机 nonce。

@@ -19,6 +19,8 @@ import {
   PLUGIN_PROBE_FORGED_RESULT_CHECK,
   PLUGIN_PROTOCOL_INJECTION_CHECK,
   PROBE_NONCE_STDIN_CHANNEL,
+  RESULT_CHANNEL_FD3,
+  RESULT_CHANNEL_STDOUT_DEGRADED,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
   PROBE_RESULT_MARKER,
@@ -205,6 +207,13 @@ export function runHostProbe(options) {
     // 装配器自身的失败（离线缺缓存 / npm 失败 / 装配异常）**都是宿主装配相位**——
     // 探针跑通后由探针回报的相位覆盖（那时才可能进入插件集成相位）。
     phase: PROBE_PHASE.HOST_ASSEMBLY,
+    // 结果通道形态（批 1.5 / 🔴-R2：**降级必须显式可见**，不得静默）。
+    // `resultChannel`：'fd3' | 'stdout-degraded'；`resultChannelDegraded`：降级 ⇒ **不得判 PASS**；
+    // `resultChannelAtStart`：插件代码运行**之前**探测到的通道形态（用于区分
+    // 「环境没有 fd3」与「插件把 fd3 关了」——两者归因完全不同）。
+    resultChannel: null,
+    resultChannelDegraded: false,
+    resultChannelAtStart: null,
     install: 'skipped',
     cacheHit: false,
     durationMs: 0,
@@ -421,8 +430,12 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
     : null;
   if (forgedEvidence) {
     // 探针与插件**共用输出面**，插件可自造绿卡或甩锅上游（见 docs/RISKS.md R26）。
-    // 只落 errors（人读日志）与下面的 check：**绝不**据此把 result.ok 判真。
+    // 只落 errors（人读日志）与 check：**绝不**据此把 result.ok 判真。
     result.errors.push(`${PLUGIN_PROBE_FORGED_RESULT_CHECK}: 检测到伪造的结构化结果行（共 ${forgedMarkers.length} 行，本轮报告不可信）`);
+    // 🆕 批 1.5：**没有可采信报告**时（例如插件伪造后立刻 `process.exit(0)`，真报告根本没写出来）
+    // 伪造证据也必须落进 `checks`——否则报告里只看得到「不可捕获终止」一条，
+    // 「有人冒用了探针的输出协议」这条**独立证据链**就丢了（评审 §3 反例正是这个形态）。
+    if (!marker) result.checks.push(forgedEvidence);
   }
   if (!marker) {
     // 探针没写出结构化结果 = 它被**不可捕获**地终止了（SIGKILL / OOM / 原生 abort）
@@ -476,6 +489,36 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   // nonce 伪造证据**在报告解析之后**落 check（payload.checks 已就位）：
   // 本轮报告不可信 ⇒ `result.ok` 必为 false（errors 非空），且报告里看得见伪造项。
   if (forgedEvidence) result.checks.push(forgedEvidence);
-  result.ok = result.runCompleted && payload.ok === true && result.errors.length === 0;
+  // ---- 批 1.5（🔴-R2）：结果通道**可见化** + 降级**不得放行** ----
+  // 探针在报告里回报 `resultChannel`（'fd3' | 'stdout-degraded'）。老探针 / 无该字段时按
+  // 「结果通道是否真的用上了」推断（`isolated` = fd3 有内容）。
+  const reportedChannel = typeof payload.resultChannel === 'string' ? payload.resultChannel : null;
+  // 通道形态以**探针的报告为准**（`payload.resultChannel`）——它是唯一知道「fd3 是否可写」的一方。
+  // 老探针 / 合成 payload 无该字段时**不**追溯判降级（保持向后兼容：2 参调用的历史行为不变）。
+  result.resultChannel = reportedChannel ?? (isolated ? RESULT_CHANNEL_FD3 : null);
+  result.resultChannelAtStart = typeof payload.resultChannelAtStart === 'string' ? payload.resultChannelAtStart : null;
+  result.resultChannelDegraded = reportedChannel === RESULT_CHANNEL_STDOUT_DEGRADED;
+  if (result.resultChannelDegraded) {
+    // 降级 = 结构化结果走 stdout ⇒ 「stdout 上出现结果行」**不再**构成篡改证据（装配器已回落到
+    // stdout）。故本轮结论**不可信**：必须能看见、且**不得**判 PASS。两种成因归因不同：
+    // - 早探测**可写**、收尾不可写 ⇒ 通道是**在插件代码运行期间**被关闭/替换的 ⇒ 插件侧篡改；
+    // - 早探测即失败 ⇒ **环境**本身没有 fd3（容器 / Windows / 直接跑探针）⇒ 宿主/环境侧信号，
+    //   落 `hostFatal[]` ⇒ `UPSTREAM_DRIFT`（AMBER，人须确认）——**不是**通过。
+    const closedByPlugin = result.resultChannelAtStart === RESULT_CHANNEL_FD3;
+    if (closedByPlugin) {
+      if (!result.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK)) {
+        result.checks.push({
+          name: PLUGIN_PROTOCOL_INJECTION_CHECK,
+          status: 'fail',
+          detail: '结果通道 fd3 在插件代码运行期间变为不可写（早探测可写、收尾不可写）——插件关闭/替换了探针的结果通道，本轮结果不可信',
+        });
+      }
+      result.errors.push(`${PLUGIN_PROTOCOL_INJECTION_CHECK}: 结果通道被插件关闭/替换（早探测可写 → 收尾不可写）`);
+    } else if (!result.errors.some((line) => String(line).includes(RESULT_CHANNEL_STDOUT_DEGRADED))) {
+      pushHostFatal(result, `结果通道 fd3 在本环境不可用（早探测即失败）⇒ 结构化结果降级走 stdout（${RESULT_CHANNEL_STDOUT_DEGRADED}）：stdout 上的结果行不再具备篡改证据能力，本轮结论不可信（不放行，人须确认）`);
+    }
+  }
+  // 完成位 + **降级**：任一不满足即不得判 PASS（假绿比 AMBER 更危险）。
+  result.ok = result.runCompleted && payload.ok === true && result.errors.length === 0 && !result.resultChannelDegraded;
   return result;
 }

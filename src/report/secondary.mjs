@@ -22,6 +22,21 @@ export function buildSecondary(report) {
   const risks = [];
 
   for (const channel of channels) {
+    // 结果通道降级（批 1.5 / 🔴-R2）：**必须显式可见**——降级后 stdout 上的结果行不再构成
+    // 篡改证据，故本轮结论不可信。独立成一条风险（即便 channel.ok 为假也已由下面的通用分支覆盖，
+    // 这里保证「降级」这件事**不会**被淹没在别的失败原因里）。
+    if (channel.resultChannelDegraded === true) {
+      risks.push({
+        severity: 'HIGH',
+        channel: channel.channel,
+        attribution: channel.attribution,
+        description: `${channel.label ?? channel.channel} 结构化结果的**通道降级**（\`${channel.resultChannel}\`）：fd3 不可用 ⇒ 结果走 stdout，「stdout 上出现结果行」不再构成篡改证据 ⇒ 本轮结论**不可信**（不得判 PASS）`,
+        reasons: [`resultChannel=${channel.resultChannel}`, `resultChannelAtStart=${channel.resultChannelAtStart ?? 'null'}`],
+        mitigation: '修环境（容器 / Windows 需支持 fd3）或改用支持独立 fd 的执行方式；降级运行**不得**作为放行依据',
+        hostFatal: channel.hostFatal ?? [],
+        errors: channel.errors ?? [],
+      });
+    }
     if (channel.ok) continue;
     const isDrift = channel.attribution === 'UPSTREAM_DRIFT';
     const isUnknown = channel.attribution === 'UNKNOWN';
@@ -64,6 +79,9 @@ export function buildSecondary(report) {
       checksTotal: (channel.checks ?? []).length,
       attributionReasons: channel.attributionReasons ?? [],
       durationMs: channel.durationMs,
+      // 结果通道形态（批 1.5 / 🔴-R2）：'fd3' | 'stdout-degraded'；降级 ⇒ 结论不可信。
+      resultChannel: channel.resultChannel ?? null,
+      resultChannelDegraded: channel.resultChannelDegraded === true,
       failedChecks: (channel.checks ?? []).filter((c) => c.status === 'fail').map((c) => ({ name: c.name, detail: c.detail })),
       // 宿主/环境侧致命信号（**结构化**；归因判据只读它，errors 仅作日志——见 docs/RISKS.md R7/R13）
       hostFatal: channel.hostFatal ?? [],
@@ -106,8 +124,9 @@ export function toMarkdown(secondary) {
   lines.push('|---|---|---|---|---|---|---|');
   for (const channel of secondary.channels) {
     const skipped = channel.checksSkipped ? `（跳过 ${channel.checksSkipped}）` : '';
+    const degraded = channel.resultChannelDegraded ? `（⚠️ 通道降级：${channel.resultChannel}）` : '';
     lines.push(
-      `| ${channel.lamp} ${channel.label ?? channel.channel} | ${channel.line} | ${channel.status} | ${channel.attribution} | ${channel.flavor ?? '-'} | ${channel.checksPassed}/${channel.checksTotal}${skipped} | ${channel.durationMs}ms |`,
+      `| ${channel.lamp} ${channel.label ?? channel.channel} | ${channel.line} | ${channel.status} | ${channel.attribution} | ${channel.flavor ?? '-'} | ${channel.checksPassed}/${channel.checksTotal}${skipped} | ${channel.durationMs}ms${degraded} |`,
     );
   }
   lines.push('');

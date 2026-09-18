@@ -52,7 +52,10 @@ export function verifyChannel(options) {
 
   // 契约漂移：把本次指纹与该通道基线对比（失败运行的 `{}` 不参与对比，防假信号）
   const contractDrift = channelContractDrift(options.previousContracts ?? null, options.channel, probe.contract);
-  const detail = probe.ok
+  // 🔴-R2：降级运行**不得判 PASS**——探针侧已置 `probe.ok=false`（并记 errors），这里再做一次
+  // 显式收口（装配器 / 老探针路径下 `probe.ok` 可能仍为真，防线不能只挂在一处）。
+  const degraded = probe.resultChannelDegraded === true;
+  const detail = probe.ok && !degraded
     ? { attribution: 'PASS', channel: options.channel, reasons: ['全部检查通过'] }
     : attributionDetail(probe, channel, options.channel, { contractDrift });
   const attribution = detail.attribution;
@@ -61,7 +64,7 @@ export function verifyChannel(options) {
     label: channel.label,
     line: channel.line,
     intent: channel.intent,
-    ok: probe.ok,
+    ok: probe.ok && !degraded,
     attribution,
     attributionReasons: detail.reasons,
     profile: probe.profile,
@@ -74,6 +77,11 @@ export function verifyChannel(options) {
     // 完成位：探针是否**跑完**（🔴 必修-1）。未跑完的运行**绝不**能判 PASS——
     // 中途被打断时「没跑到的检查」是 skip 不是 fail，只看失败项会假绿。
     runCompleted: probe.runCompleted === true,
+    // 结果通道形态（批 1.5 / 🔴-R2）：'fd3' | 'stdout-degraded'。**降级必须显式可见**——
+    // 报告与二级信息里看得见「这次结果走的是哪条通道」，且降级运行**不得判 PASS**（见下 `ok`）。
+    resultChannel: probe.resultChannel ?? null,
+    resultChannelDegraded: probe.resultChannelDegraded === true,
+    resultChannelAtStart: probe.resultChannelAtStart ?? null,
     // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
     probePhase: probe.phase ?? null,
     probeExit: probe.probeExit ?? null,

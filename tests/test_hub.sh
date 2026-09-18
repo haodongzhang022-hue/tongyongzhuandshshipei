@@ -140,22 +140,50 @@ step "7. 文档计数防漂移（文档声明的项数必须等于实际跑出�
 # 修法：**声明缺失即 FAIL**（声明本身是必需项）。计数口径因此分两类，都必须为 0：
 #   - DOC_COUNT_MISMATCH：声明存在但数值 ≠ 实际；
 #   - DOC_COUNT_MISSING：声明行缺失（有人删了它）。
+#
+# 🟡-R3①（复评实测逃逸）：上一版用 `grep … | head -1` **只校验每文件首处**匹配 —— 于是
+# `docs/ARCHITECTURE.md` 的 M5 行（**第二处**）写错（113 项 / 21-21 / 15 负例）**永远逃逸**；
+# 且 `CHANGELOG.md` **完全不在守卫表内**（v0.2.1 段写 149 项，实际 146）。
+# 修法（复评要求）：① `CHANGELOG` 入表；② 改为「该文件内**所有**匹配处都必须等于实际值」
+# （逐处比对，不再 `head -1`）——否则「改一处、漏一处」永远能逃。
+#
+# 历史段的例外（为什么 CHANGELOG 只守**最新段**）：CHANGELOG 是**历史记录**，旧版本段里的
+# 数字记录的是**当时的**实际值（如「128 → 129 项」），不可能等于今天的最新值。
+# 故对 CHANGELOG 只守**最新版本段**（自文件头到第二个 `## v` 之前），历史段不参与逐处比对。
 DOC_COUNT_MISMATCH=0
 DOC_COUNT_MISSING=0
+# 取「文件内**全部**匹配处」的数值（不再 head -1）——每一处都必须等于实际值。
+doc_counts_of() {
+  local pattern="$1" file="$2"
+  grep -oE "$pattern" "$ROOT/$file" 2>/dev/null | sed -E 's/.* ([0-9]+) 项$/\1/'
+}
+# 取 CHANGELOG 的**最新版本段**（自文件头到第二个 `## v` 之前）——历史段记录当时的值，不参与比对。
+changelog_head() { awk '/^## v/{c++} c>=2{exit} {print}' "$ROOT/CHANGELOG.md"; }
+# 逐处比对：**所有**匹配处都等于实际值才算通过（少一处声明即 MISSING，任一处不符即 MISMATCH）。
 check_doc_count() {
   local label="$1" actual="$2" pattern="$3" file="$4"
-  local declared
-  declared="$(grep -oE "$pattern" "$ROOT/$file" | head -1 | sed -E 's/.* ([0-9]+) 项$/\1/')"
-  if [[ -z "$declared" ]]; then
+  local values
+  if [[ "$file" == "CHANGELOG.md" ]]; then
+    values="$(changelog_head | grep -oE "$pattern" 2>/dev/null | sed -E 's/.* ([0-9]+) 项$/\1/')"
+  else
+    values="$(doc_counts_of "$pattern" "$file")"
+  fi
+  if [[ -z "$values" ]]; then
     bad "$file 的「$label」项数声明**缺失**（声明本身是必需项：删掉它 = 防漂移失效）"
     DOC_COUNT_MISSING=$((DOC_COUNT_MISSING + 1))
     return
   fi
-  if [[ "$declared" == "$actual" ]]; then
-    ok "$file 的「$label」项数 = 实际（$actual）"
+  local total=0 mismatch=0 v
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    total=$((total + 1))
+    [[ "$v" != "$actual" ]] && mismatch=$((mismatch + 1))
+  done <<< "$values"
+  if [[ "$mismatch" -eq 0 ]]; then
+    ok "$file 的「$label」项数 = 实际（$actual，逐处比对 $total 处）"
   else
-    bad "$file 的「$label」声明 $declared 项，实际 $actual 项（文档漂移）"
-    DOC_COUNT_MISMATCH=$((DOC_COUNT_MISMATCH + 1))
+    bad "$file 的「$label」声明有 $mismatch/$total 处 ≠ 实际 $actual 项（文档漂移；逐处比对，改一处漏一处也红）"
+    DOC_COUNT_MISMATCH=$((DOC_COUNT_MISMATCH + mismatch))
   fi
 }
 
@@ -175,15 +203,64 @@ if [[ "$_selfcheck" == "missing=1 fail=1" ]]; then
 else
   bad "守卫自证：声明缺失未判红（🟡-2 回归）：$_selfcheck"
 fi
+# 自证 ②（🟡-R3① 的原始逃逸形态）：**第二处**写错必须判红——旧实现 `head -1` 只看首处，
+# 于是「改一处、漏一处」永远能逃。这里造一个「首处对、第二处错」的临时文件，断言守卫判红。
+_selfcheck2="$( (
+  DOC_COUNT_MISMATCH=0; DOC_COUNT_MISSING=0
+  bad() { :; }
+  ok() { :; }
+  tmp="$(mktemp -d)"
+  mkdir -p "$tmp"
+  printf '离线单测 7 项\n……\n离线单测 999 项\n' > "$tmp/doc.md"
+  ROOT_SAVE="$ROOT"; ROOT="$tmp"
+  # 复用被测函数体：直接调用（函数内以 $ROOT/$file 取文件）
+  check_doc_count "自证-第二处写错" "7" '离线单测 [0-9]+ 项' 'doc.md'
+  ROOT="$ROOT_SAVE"
+  rm -rf "$tmp"
+  echo "mismatch=$DOC_COUNT_MISMATCH missing=$DOC_COUNT_MISSING"
+) 2>/dev/null )"
+if [[ "$_selfcheck2" == "mismatch=1 missing=0" ]]; then
+  ok "守卫自证：**第二处**写错即判红（🟡-R3① 的「改一处、漏一处」逃逸已被堵）"
+else
+  bad "守卫自证：第二处写错未判红（🟡-R3① 回归）：$_selfcheck2"
+fi
 check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 [0-9]+ 项' 'README.md'
 check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 [0-9]+ 项' 'README.md'
 check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 [0-9]+ 项' 'README.md'
 check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 [0-9]+ 项' 'docs/ARCHITECTURE.md'
+# 🟡-R3① 的**原始逃逸**：M5 行写的是「离线 147 项」（**没有「单测」二字**）——旧守卫的模式
+# `离线单测 [0-9]+ 项` **匹配不到它** ⇒ M5 行写 113 / 999 都逃逸。故补一条**独立模式**
+# （`[^测]` 负向环视，避免把「离线单测 N 项」重复计一次）。
+# 模式用「离线 + **空格** + 数字」（M5 行的写法）——`离线单测 147 项` 里 `离线` 后跟的是「单」不是空格，
+# 故两个模式**互不重叠**，各自逐处比对（`grep -E` 无环视，故用字面空格区分）。
+check_doc_count "离线单测（M5 行写法：离线 N 项）" "$(count_of /tmp/offline.log)" '离线 [0-9]+ 项' 'docs/ARCHITECTURE.md'
 check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 [0-9]+ 项' 'docs/ARCHITECTURE.md'
 check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 [0-9]+ 项' 'docs/ARCHITECTURE.md'
 check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 . .tests/test_offline.sh. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
 check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 . .tests/test_attribution.mjs. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
 check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 . .tests/test_e2e_regression.mjs. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
+# 🟡-R3①：`CHANGELOG.md` **入表**（此前完全不在守卫表内 ⇒ v0.2.1 段写 149 项、实际 146 也无人发现）。
+# 只守**最新版本段**（历史段记录当时的实际值，见 `changelog_head` 的说明）。
+check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 [0-9]+ 项' 'CHANGELOG.md'
+check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 [0-9]+ 项' 'CHANGELOG.md'
+check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 [0-9]+ 项' 'CHANGELOG.md'
+
+# 闸门计数（🟡-R3① 同族）：`docs/ARCHITECTURE.md` 的 M5 行同时声明「插件侧闸门 N/N（M 负例…）」——
+# 这两处也必须逐处对齐（此前 21/21、15 负例 与实际 20/17 不符且无人发现）。
+check_doc_count "闸门项数" "$(count_of /tmp/gate.log)" '插件侧闸门 [0-9]+ 项' 'docs/ARCHITECTURE.md'
+# 负例份数：声明形如「插件侧闸门 23 项（17 负例 + R24 六条 + 防过度修正）」——`check_doc_count` 的
+# sed 只认「… 项」后缀，故这里单独取（口径与「逐处比对」一致：M5 行里该声明**每一处**都要对上）。
+NEG_FIXTURES="$(grep -cE '^  "(plugin|demo)-[a-z-]+\|' "$ROOT/tests/gate_plugin_side.sh")"
+NEG_DECLARED="$(grep -oE '插件侧闸门 [0-9]+ 项（[0-9]+ 负例' "$ROOT/docs/ARCHITECTURE.md" | sed -E 's/.*（([0-9]+) 负例$/\1/' | sort -u | tr '\n' ',')"
+if [[ -z "$NEG_DECLARED" ]]; then
+  bad "docs/ARCHITECTURE.md 的「闸门负例份数」声明**缺失**"
+  DOC_COUNT_MISSING=$((DOC_COUNT_MISSING + 1))
+elif [[ "$NEG_DECLARED" == "${NEG_FIXTURES}," ]]; then
+  ok "docs/ARCHITECTURE.md 的「闸门负例份数」= 实际（$NEG_FIXTURES，逐处比对）"
+else
+  bad "docs/ARCHITECTURE.md 的「闸门负例份数」声明 ${NEG_DECLARED%,} 份，实际 $NEG_FIXTURES 份（文档漂移）"
+  DOC_COUNT_MISMATCH=$((DOC_COUNT_MISMATCH + 1))
+fi
 
 # 计数口径收口：声明漂移与声明缺失都必须为 0（🟡-2）
 if [[ "$DOC_COUNT_MISMATCH" -eq 0 && "$DOC_COUNT_MISSING" -eq 0 ]]; then

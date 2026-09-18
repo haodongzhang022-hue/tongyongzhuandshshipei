@@ -1,5 +1,54 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.2.3 · 批 1.5 —— 复评 🔴-R1 / 🔴-R2 收口（可达性口径作废 + 降级不放行 + 反例固化 + exit 台账）
+
+> 承接 v0.2.2（nonce 改走 stdin）。本轮按**架构·总师复评裁定**落地**批 1.5**（8 项，小、可回滚、不动架构）。
+> 批 1 状态由 `done` 改 **`in_progress`**（三处「真宿主不可达」口径作废）；批 2（进程隔离）**待 CP2 人批准**。
+
+### 🔴-R1 可达性论断被反证 —— 三处「不可达」口径**作废**，判据改**可证伪**
+
+| 项 | 内容 |
+|---|---|
+| 反证（复评 §3，三步可复现） | 插件 `readFileSync('/proc/self/environ')` 恢复 nonce → 向 **fd3** 写**带该 nonce 前缀**的 17/17 全绿报告 → `removeAllListeners('exit')` → `process.exit(0)`；当时实测 `ok=true / PASS / GREEN / 17-17 / exit 0` |
+| 根因 | `delete process.env[name]` 只清 **JS 侧副本**；**`/proc/self/environ` 仍是 spawn 时的环境快照** ⇒ 「nonce 与被测插件同进程」**不需要读 env 就能拿到** |
+| 口径更正（**事实陈述**） | 结构级防线（`plugin.protocol_injection`）要求「**匹配 nonce 前缀**的结果行 ≥2 条 / 出现在 stdout」⇒ **可达当且仅当插件拿得到 nonce**。nonce 经 stdin ⇒ **经 env / argv 不可达**；但**同进程同 uid** 下插件仍可用**其它**手段（猴子补丁 / 读内存）拿到 ⇒ **在真宿主下确实可达**。四处口径（`RISKS.md` R26 / `[9.11f]` / e2e [8e] 注释 / 闸门注释）**均已更正**，回退即红 |
+| `[9.11f]` 恒真式 → **可证伪** | 上一版断言是 `PLUGIN_SIDE_CHECKS.includes(...)`（**恒真**，与可达性无关）。现改为两条互为反证的断言：**构造匹配 nonce 的输入 → 判据必须命中**；**去掉 nonce（前缀不匹配）→ 判据必须不命中**（一个「恒判篡改」的实现过不了反向那条） |
+| §3 反例**固化** | 新夹具 `tests/fixtures/plugin-host-tamper-poc-plugin.mjs`（反读 nonce + 写 fd3 + 摘 `exit` 钩子 + `exit(0)` 抢跑）**进闸门**，期望**不得** GREEN；实测 `PLUGIN_REGRESSION` / RED / `hostFatal=[]` / 失败项 `plugin.probe_result_forged` + `plugin.abnormal_termination` |
+
+### 🔴-R2 降级静默 —— 通道**可见化** + **降级不得判 PASS**
+
+| 项 | 内容 |
+|---|---|
+| 缺陷 | `writeResult()` 的返回值被调用点**丢弃**、`out` 里没有通道字段 ⇒ 报告里看不到走的是哪条通道；装配器在「结果通道为空」时**回落 stdout** ⇒ **降级 = 静默把防线关掉**（实测：无 fd3 的离线台 nonce 伪造 + `SIGKILL` ⇒ `ok=true / runCompleted=true / hostFatal=0`，**放行**） |
+| 修法 | 探针写报告**前**探测 fd3 可写性（`writeSync(3,'')` 在 fd 未开时抛 `EINVAL`，实测）→ 回报 `resultChannel`（`fd3` / `stdout-degraded`）与 `resultChannelAtStart`（**插件代码之前**的快照）；落进 `verify` 报告与二级信息（Markdown 行内标「⚠️ 通道降级」） |
+| 降级**不放行** | 降级时**两种成因分开归因**：① 早探测可写、收尾不可写 ⇒ **插件关/替换了通道** → `plugin.protocol_injection`（RED）；② 早探测即失败 ⇒ **环境**没有 fd3 → `hostFatal[]` ⇒ `UPSTREAM_DRIFT`（AMBER，**不放行**，人须确认）。装配器另置 `resultChannelDegraded` ⇒ `ok=false`（双重收口） |
+
+### 🟡-R3 / 🟡-R4 文档与防线盲区
+
+| 项 | 内容 |
+|---|---|
+| 计数守卫（🟡-R3①） | `CHANGELOG` **入守卫表**；`check_doc_count` 由 `grep … \| head -1`（**只校验首处**）改为「文件内**所有**匹配处**逐处**比对」⇒「改一处、漏一处」不再能逃（附自证：造「首处对、第二处错」的文件必须判红）。`CHANGELOG` 只守**最新版本段**（历史段记录当时的实际值） |
+| 计数漂移修正 | `test_e2e_regression` 149 → **156**、离线 113 → **146**、闸门 20 → **23 项**（17 负例）；M5 行同口径 |
+| 编号漂移（🟡-R3②③） | `test_offline.sh` **重复的 `[13]`** → `[18]`（nonce 侧信道段）；新增**段落编号唯一性**守卫 + `[18]` **真实存在**守卫（此前 `INDEX` / `ARCHITECTURE` 指向不存在的 `[18]` 段 = 文档撒谎） |
+| `'exit'` 钩子台账（🟡-R4，R23 同族） | `wrapProcessDefenseApis()` 的记账事件与 `checkProcessDefense()` 的身份检查清单均加 `'exit'`，出口③ 钩子**具名登记**（`defenseHandlers.exit`）作身份锚点。收口前实测：干净插件 + `removeAllListeners('exit')` → **不判** `plugin.process_defense_tampered`（**不可判定**）；现新夹具 `plugin-exit-hook-tamper-plugin`（**只摘钩子**，其余健康）**进闸门** ⇒ 判出该项 |
+
+### 兼容性（行为变更，预期）
+
+- `contract.mjs` 新增导出 `RESULT_CHANNEL_FD3` / `RESULT_CHANNEL_STDOUT_DEGRADED`（通道形态唯一事实源）。
+- 探针结构化结果新增字段 `resultChannel` / `resultChannelAtStart`；`verify` 报告与二级信息新增
+  `resultChannel` / `resultChannelDegraded` / `resultChannelAtStart`。
+- `interpretProbeStdout()`：**合成 payload / 老探针无 `resultChannel` 时按原行为**（不追溯判降级）——
+  2 参调用的历史行为不变（旧断言不破）。
+- 出口③ 钩子由匿名箭头改为**具名** `defenseHandlers.exit`（行为等价，但**可被身份检查**）。
+
+### 测试项数（本版）
+
+- 离线单测 147 项（`tests/test_offline.sh`：128 → 147；新增 [19] 批 1.5 四项 × 18 条）
+- 归因离线回归 452 项（`tests/test_attribution.mjs`：441 → 452；[9.11f] 可证伪改写 + 口径守卫）
+- 归因端到端回归 156 项（`tests/test_e2e_regression.mjs`：146 → 156；新增 [8g] §3 反例 + 通道可见化 10 条）
+- 插件侧闸门 23 项（`tests/gate_plugin_side.sh`：21 → 23；负例 15 → **16 份**：+ §3 反例 + exit 钩子）
+- 发布面自检 40 项（`tests/test_exports.mjs`，不变）
+
 ## v0.2.2 · nonce 带外通道改走 **stdin**（env/argv 通道可被同进程插件反读，实测放行级假绿）
 
 > 承接 v0.2.1（fd3 结果通道 + R28 判据 + R24 反向反证 + 结构性重做一页方案）。
@@ -82,7 +131,7 @@ SIGTERM **6251ms** / `signal=null`。
 
 - `tests/test_offline.sh`：113 → **129 项**（[17] 反向反证 5 条）
 - `tests/test_attribution.mjs`：401 → **430 项**（[14] 信任边界显式前提 + 重做方案 + 源码守卫 29 条）
-- `tests/test_exports.mjs` **40 项** / `tests/test_e2e_regression.mjs` **149 项** / 闸门 **20 项**（均不变）
+- `tests/test_exports.mjs` **40 项** / `tests/test_e2e_regression.mjs` **146 项**（该版实测值；原文误记 149，属并行线 `57969b8` 的值，merge 后已变 146——已按 🟡-R3① 修正）/ 闸门 **20 项**（均不变）
 
 ### 兼容性
 

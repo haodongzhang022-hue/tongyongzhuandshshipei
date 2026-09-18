@@ -173,6 +173,16 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 报告里的 `attributionReasons` 是**判据链**：告诉你这次为什么这么判（哪条信号命中），不必猜。
 
+**结果通道（批 1.5 / 🔴-R2）**：每条通道报告里另有 `resultChannel` 字段：
+
+| 取值 | 含义 | 判决影响 |
+|---|---|---|
+| `fd3` | 结构化结果走**独立 fd3**（正常形态）⇒ stdout 上出现结果行**即**篡改证据 | 正常 |
+| `stdout-degraded` | fd3 不可用 ⇒ **降级**走 stdout | **不得判 PASS**：环境没有 fd3 → `hostFatal[]` / `UPSTREAM_DRIFT`（AMBER，人须确认）；插件在运行期间关掉 fd3 → `plugin.protocol_injection` / RED |
+
+> 为什么降级**不放行**：降级后「stdout 上出现结果行」**不再**构成篡改证据（装配器在通道为空时会回落 stdout）⇒
+> 继续判通过等于**静默把防线关掉**。降级这件事在报告与 Markdown 视图里**显式可见**（不静默）。
+
 > **优先级提醒**：插件侧**硬证据**（声明 DSH 保留名 → `guard.reserved_rejected` fail）
 > **优先于**上游漂移相关性——即使上游此刻正在漂移，你的保留名冲突也会如实归因为
 > `PLUGIN_REGRESSION`，不会被甩成「上游变了，不是你的问题」。
@@ -210,8 +220,8 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 | `plugin.early_exit` | ③ 进程 exit | 插件在验收完成前调 `process.exit()` / 自杀式信号（`SIGTERM` 等）——`process.exit()` **不抛异常**，前两条出口都接不到 | `PLUGIN_REGRESSION` |
 | `plugin.run_incomplete` | ④ `run()` 被拖住 | 插件挂住事件循环，或 `apply()` 返回一个**永不 resolve** 的 Promise（无异常、无退出） | `PLUGIN_REGRESSION` |
 | `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort`）——探针来不及写报告，装配器按**相位信标**归因 | `PLUGIN_REGRESSION` |
-| `plugin.process_defense_tampered` | ⑤ 防线被静音 / 被顶替 | 插件抢占 `setUncaughtExceptionCaptureCallback`（真实形态：Sentry / APM / 错误上报库）、摘掉 `uncaughtException` 监听器，或**用自己的回调顶替**探针的 ⇒ 探针兜底被**静音**、后台抛错不可见、完成位仍真 → **假绿放行**。探针收尾**四重**自检（API 调用台账 + **身份检查** + 独占 API 检测 + 行为级 canary；**不得**用 `has()\|\|listenerCount>0`——插件顶替后该式**假阳性**）判本项 | `PLUGIN_REGRESSION` |
-| `plugin.protocol_injection` | ⑥ 结果通道被注入 | 插件向探针的**结果通道**写入伪造结果（抢首位 / 多结果行 / 在结果走独立通道时仍写 stdout）⇒ 真报告被顶替 → 装配器 `interpretProbeStdout()` 判本项（结构不变量 + 通道隔离，**防放行级假绿**） | `PLUGIN_REGRESSION` |
+| `plugin.process_defense_tampered` | ⑤ 防线被静音 / 被顶替 / 出口钩子被摘 | 插件抢占 `setUncaughtExceptionCaptureCallback`（真实形态：Sentry / APM / 错误上报库）、摘掉 `uncaughtException` 监听器，或**用自己的回调顶替**探针的 ⇒ 探针兜底被**静音**、后台抛错不可见、完成位仍真 → **假绿放行**；**另含摘掉出口③ 的 `exit` 钩子**（批 1.5：钩子具名登记 + 身份检查覆盖 `'exit'`，此前**不可判定**）。探针收尾**四重**自检（API 调用台账 + **身份检查** + 独占 API 检测 + 行为级 canary；**不得**用 `has()\|\|listenerCount>0`——插件顶替后该式**假阳性**）判本项 | `PLUGIN_REGRESSION` |
+| `plugin.protocol_injection` | ⑥ 结果通道被注入 / 被关闭 | 插件向探针的**结果通道**写入伪造结果（抢首位 / 多结果行 / 在结果走独立通道时仍写 stdout），或**在插件代码运行期间把 fd3 关掉/替换**（早探测可写 → 收尾不可写）⇒ 真报告被顶替 → 装配器 `interpretProbeStdout()` 判本项（结构不变量 + 通道隔离，**防放行级假绿**） | `PLUGIN_REGRESSION` |
 | `plugin.probe_result_forged` | 🆕 侧信道 | 探针输出面里出现**无 nonce / nonce 不匹配**的结构化结果行（插件自造绿卡 / 甩锅上游）；由**装配器**判定（与 ⑥ 是**两条独立证据链**） | `PLUGIN_REGRESSION` |
 
 

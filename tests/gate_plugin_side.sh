@@ -23,6 +23,8 @@
 # | `plugin-defense-tamper-plugin` | H1/R28：摘掉探针兜底 + 装**自己的**（计数假阳性形态） | `plugin.process_defense_tampered` | true |
 # | `plugin-forged-result-plugin` | R26：伪造裸 marker 绿卡（nonce 侧信道） | `plugin.probe_result_forged` | true |
 # | `plugin-nonce-reverse-read-plugin` | R26：**反读 nonce**（environ/cmdline）再伪造带 nonce 结果行 | `plugin.probe_result_forged` | true |
+# | `plugin-host-tamper-poc-plugin` | **§3 反例固化**（反读 nonce + 写 fd3 + 摘 exit 钩子 + `exit(0)` 抢跑） | `plugin.probe_result_forged` + `plugin.abnormal_termination` | **false** |
+# | `plugin-exit-hook-tamper-plugin` | **批 1.5 第 8 项**：只摘出口③ 的 `exit` 钩子（其余健康） | `plugin.process_defense_tampered` | true |
 # | `plugin-sync-loop-plugin` | R24：`apply()` 内同步死循环（宿主二次终止） | `plugin.abnormal_termination` | **false** |
 # | `demo-plugin`（健康） | —— | 无（必须 GREEN 17/17） | true |
 #
@@ -114,9 +116,26 @@ NEGATIVE_CASES=(
   # 本实现经 **stdin** 下发 ⇒ 两条读取面都拿不到 ⇒ 判伪造、不放行。
   # 这是「为什么必须用 stdin」的**可执行证据**（不是注释里的偏好）。
   "plugin-nonce-reverse-read-plugin|plugin.probe_result_forged|true|true|plugin.probe_result_forged"
-  # R26 的**结构级**防线（`plugin.protocol_injection`）在真宿主下**不可达**：探针在**任何插件代码之前**
-  # 就把 nonce 从 `process.env` 删除 ⇒ 插件拿不到正确前缀 ⇒「匹配前缀的结果行 ≥2 条 / 出现在 stdout」
-  # 无法构造。故该 check **不进闸门**，由离线 [9.11] 用**合成输入**断言（可达性边界见 docs/RISKS.md R26）。
+  # 🆕 **§3 反例固化**（复评裁定 ④：把反例固化为真宿主夹具并进闸门）。
+  # 原始 PoC 三步：反读 `/proc/self/environ` 拿 nonce → 向 **fd3** 写带 nonce 的 17/17 绿卡 →
+  # `removeAllListeners('exit')` → `process.exit(0)`。当时（env 通道）实测 `GREEN / PASS / exit 0`。
+  # 现在三条独立证据链各自命中：伪造前缀不匹配（nonce 经 stdin，反读拿不到）⇒ `plugin.probe_result_forged`；
+  # 摘 exit 钩子 + 抢跑退出 ⇒ 相位信标落 `plugin.abnormal_termination`（探针来不及收尾自检）。
+  # ⚠️ 期望**不得** GREEN —— 这条断言正是「不可达」口径作废的可执行证据。
+  "plugin-host-tamper-poc-plugin|plugin.probe_result_forged|false|false|plugin.probe_result_forged,plugin.abnormal_termination"
+  # 🆕 **批 1.5 第 8 项**：`'exit'` 钩子纳入防线台账。
+  # 原先 `wrapProcessDefenseApis()` 只记账 `uncaughtException` / `unhandledRejection`，
+  # **`'exit'` 不在台账**、身份检查也只遍历那两个事件 ⇒「出口③ 钩子被单方摘除」**不可判定**
+  # （实测收口前：干净插件 + `removeAllListeners('exit')` → **不判** `plugin.process_defense_tampered`）。
+  # 本夹具把变量**单独隔离**（只摘钩子，不退出/不伪造/不抛错）⇒ 必须判出该项。
+  "plugin-exit-hook-tamper-plugin|plugin.process_defense_tampered|true|true|plugin.process_defense_tampered"
+  # R26 的**结构级**防线（`plugin.protocol_injection`）的**可达性口径**（复评 🔴-R1 更正）：
+  # 它要求「**匹配 nonce 前缀**的结果行 ≥2 条 / 出现在 stdout」⇒ **可达当且仅当插件拿得到 nonce**。
+  # 当前实现 nonce 经 **stdin** 下发（**不经 env / argv**）⇒ 经这两条**读取面**不可达（已由
+  # 离线 [9.11e] 的通道形态守卫钉住）；但**同进程同 uid** 下插件仍可用**其它**手段拿到 nonce
+  # （猴子补丁 / 读内存）⇒ **不得**写「真宿主不可达」（那是把未验证的命题写成对外口径，见 R26）。
+  # 故本项在真宿主侧由上面两份夹具（侧信道 / §3 反例）覆盖，结构级形态由离线 [9.11f]
+  # 用**可证伪**的正反两条断言覆盖（构造输入→必须命中；去掉 nonce→必须不命中）。
   # ⚠️ `plugin-sync-loop-plugin`（R24）**不在**本清单：它的缺陷只在**有界 timeout** 下成立
   # （默认 timeoutMs=600s 时 3s 循环会正常跑完——那本身不是缺陷）。该形态由下方**专用 R24 段**
   # 用 `runHostProbe({ timeoutMs: 1000 })` 断言（含收口时间与 `probeExit.signal`）。
