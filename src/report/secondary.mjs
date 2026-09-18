@@ -24,16 +24,23 @@ export function buildSecondary(report) {
   for (const channel of channels) {
     if (channel.ok) continue;
     const isDrift = channel.attribution === 'UPSTREAM_DRIFT';
+    const isUnknown = channel.attribution === 'UNKNOWN';
     risks.push({
-      severity: isDrift ? 'MEDIUM' : 'HIGH',
+      severity: isDrift ? 'MEDIUM' : isUnknown ? 'MEDIUM' : 'HIGH',
       channel: channel.channel,
       attribution: channel.attribution,
       description: isDrift
         ? `${channel.label ?? channel.channel} 验收失败，归因「上游契约漂移」——上游变了，非插件 bug`
-        : `${channel.label ?? channel.channel} 验收失败，归因「插件回归」——需修插件`,
+        : isUnknown
+          ? `${channel.label ?? channel.channel} 验收失败，但**无法归因**（探针未给出可识别的失败 check，可能被外力打断）`
+          : `${channel.label ?? channel.channel} 验收失败，归因「插件回归」——需修插件`,
+      // 归因理由链（可审计：判据依据哪些信号，而不是让人猜）
+      reasons: channel.attributionReasons ?? [],
       mitigation: isDrift
         ? '按 registry/contract-snapshots 的漂移项更新兼容层与钉版，再重跑验收'
-        : '定位失败 check（见 checks[].name）并修复插件；禁止改验收标准来「过」',
+        : isUnknown
+          ? '看原始 errors 与探针退出实况（probeExit），人工判定后再跑；禁止改验收标准来「过」'
+          : '定位失败 check（见 checks[].name）并修复插件；禁止改验收标准来「过」',
       errors: channel.errors ?? [],
     });
   }
@@ -52,7 +59,9 @@ export function buildSecondary(report) {
       attribution: channel.attribution,
       flavor: channel.profile?.flavor ?? null,
       checksPassed: (channel.checks ?? []).filter((c) => c.status === 'pass').length,
+      checksSkipped: (channel.checks ?? []).filter((c) => c.status === 'skip').length,
       checksTotal: (channel.checks ?? []).length,
+      attributionReasons: channel.attributionReasons ?? [],
       durationMs: channel.durationMs,
       failedChecks: (channel.checks ?? []).filter((c) => c.status === 'fail').map((c) => ({ name: c.name, detail: c.detail })),
       errors: channel.errors ?? [],
@@ -63,6 +72,7 @@ export function buildSecondary(report) {
       failed: summary.failed ?? 0,
       upstreamDrift: summary.upstreamDrift ?? [],
       pluginRegression: summary.pluginRegression ?? [],
+      unknown: summary.unknown ?? [],
     },
     risks,
     decisions: [
@@ -92,8 +102,9 @@ export function toMarkdown(secondary) {
   lines.push('| 通道 | 版本线 | 状态 | 归因 | 版本线探测 | 检查项 | 耗时 |');
   lines.push('|---|---|---|---|---|---|---|');
   for (const channel of secondary.channels) {
+    const skipped = channel.checksSkipped ? `（跳过 ${channel.checksSkipped}）` : '';
     lines.push(
-      `| ${channel.lamp} ${channel.label ?? channel.channel} | ${channel.line} | ${channel.status} | ${channel.attribution} | ${channel.flavor ?? '-'} | ${channel.checksPassed}/${channel.checksTotal} | ${channel.durationMs}ms |`,
+      `| ${channel.lamp} ${channel.label ?? channel.channel} | ${channel.line} | ${channel.status} | ${channel.attribution} | ${channel.flavor ?? '-'} | ${channel.checksPassed}/${channel.checksTotal}${skipped} | ${channel.durationMs}ms |`,
     );
   }
   lines.push('');
@@ -114,6 +125,7 @@ export function toMarkdown(secondary) {
   if (secondary.risks.length === 0) lines.push('- 无未处置风险');
   for (const risk of secondary.risks) {
     lines.push(`- [${risk.severity}] ${risk.description}`);
+    for (const reason of risk.reasons ?? []) lines.push(`  - 判据：${reason}`);
     lines.push(`  - 规避：${risk.mitigation}`);
   }
   lines.push('');

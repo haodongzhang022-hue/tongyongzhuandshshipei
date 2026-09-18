@@ -175,38 +175,59 @@ assert "--key value 仍可用" "stable" "$(echo "$OUT" | sed -n 2p)"
 assert "布尔开关可用" "true" "$(echo "$OUT" | sed -n 3p)"
 assert "未知 token 显式报错" "yes" "$(echo "$OUT" | sed -n 4p)"
 
-echo "  [9] 归因判定（上游漂移 vs 插件回归）"
+echo "  [9] 归因判定（结构化判据：宿主侧 fatal(host) vs 插件侧 check）"
+# 说明：判据自 v0.1.2 起**结构化**——宿主侧只认 fatal(host) 前缀与宿主侧 check 名，
+# 插件侧只认插件侧 check 名（历史缺陷：裸 /npm|fatal:/ 会把含 npm 的路径与插件侧
+# fatal 措辞误判成上游漂移）。更完整的回归见 tests/test_attribution.mjs。
 OUT="$("$NODE_BIN" --input-type=module -e "
-import { attributeFailure } from '$ROOT/src/verify/runner.mjs';
+import { attributeFailure, attributionDetail } from '$ROOT/src/verify/runner.mjs';
 const ch = { label: 'x', line: '0.1.6' };
-console.log(attributeFailure({ errors:['npm ETARGET notarget'], profile:null, checks:[] }, ch, 'dev'));
-console.log(attributeFailure({ errors:['host.tools_ready: ctx.tools 未就绪'], profile:{flavor:'unknown'}, checks:[] }, ch, 'dev'));
-console.log(attributeFailure({ errors:['registry.exact: 期望 a / 实得 b'], profile:{flavor:'modern'}, checks:[] }, ch, 'dev'));
-console.log(attributeFailure({ errors:['dispatch.execute_ok: Error'], profile:{flavor:'modern'}, checks:[] }, ch, 'dev'));
+const p = (errors, checks = []) => ({ errors, checks, profile: { flavor: 'modern' }, contract: {} });
+const fc = (name) => ({ name, status: 'fail', detail: 'x' });
+// 宿主/环境侧
+console.log(attributeFailure(p(['fatal(host): 宿主依赖安装失败（npm）：npm ERR! code ETARGET']), ch, 'dev'));
+console.log(attributeFailure(p(['host.tools_ready: ctx.tools 未就绪'], [fc('host.tools_ready')]), ch, 'dev'));
+// 插件侧
+console.log(attributeFailure(p(['registry.exact: 期望 a / 实得 b'], [fc('registry.exact')]), ch, 'dev'));
+console.log(attributeFailure(p(['dispatch.execute_ok: Error'], [fc('dispatch.execute_ok')]), ch, 'dev'));
+// 🔴-B 回归：路径含 npm + 插件侧失败 → 仍判插件
+console.log(attributeFailure(p(['plugin.apply_ok: 插件 apply 抛错 | at file:///home/runner/.npm/_npx/x/probe.mjs:1:1'], [fc('plugin.apply_ok')]), ch, 'dev'));
+// 🔴-B 回归：插件侧旧措辞裸 fatal: 不得翻案
+console.log(attributeFailure(p(['plugin.loaded: 插件 import 失败：SyntaxError | fatal: 旧措辞'], [fc('plugin.loaded')]), ch, 'dev'));
+// 无失败 check（探针被外力打断）→ 不猜
+console.log(attributeFailure(p(['探针非零退出（status=null）']), ch, 'dev'));
+// 理由链可审计
+console.log(attributionDetail(p(['registry.exact: x'], [fc('registry.exact')]), ch, 'dev').reasons.length > 0 ? 'has-reasons' : 'no-reasons');
 ")"
-assert "钉版缺失 → UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
+assert "宿主安装失败（fatal(host)）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
 assert "宿主未就绪 → UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 2p)"
 assert "工具清单不符 → PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 3p)"
 assert "dispatch 失败 → PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 4p)"
+assert "🔴-B：路径含 npm 不误判为上游漂移" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 5p)"
+assert "🔴-B：插件侧裸 fatal: 措辞不误判为上游漂移" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 6p)"
+assert "无失败 check → UNKNOWN（不猜归因）" "UNKNOWN" "$(echo "$OUT" | sed -n 7p)"
+assert "归因带可审计理由链" "has-reasons" "$(echo "$OUT" | sed -n 8p)"
 
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure } from '$ROOT/src/verify/runner.mjs';
 const ch = { label: 'x', line: '0.1.6' };
-// 真漂移：契约指纹与基线不一致
-console.log(attributeFailure({ errors:['guard.reserved_name: tool name \"run_code\" is reserved'], profile:{flavor:'modern'}, checks:[{name:'guard.reserved_name',status:'fail'}] }, ch, 'dev', { contractDrift:{ changed:true, items:[{field:'reservedName'}] } }));
+const fc = (name) => ({ name, status: 'fail', detail: 'x' });
+const p = (errors, checks = []) => ({ errors, checks, profile: { flavor: 'modern' }, contract: {} });
+// 真漂移：契约指纹与基线不一致且与失败点相关
+console.log(attributeFailure(p(['guard.reserved_name: tool name \"run_code\" is reserved'], [fc('guard.reserved_name')]), ch, 'dev', { contractDrift:{ changed:true, items:[{field:'reservedName'}] } }));
+// 漂移字段与失败点无关 → 插件回归（不甩锅上游）
+console.log(attributeFailure(p(['registry.exact: 期望 a / 实得 b'], [fc('registry.exact')]), ch, 'dev', { contractDrift:{ changed:true, items:[{field:'outputShape'}] } }));
 // 契约 check 失败且无可用基线（首次采集）→ 保守判漂移
-console.log(attributeFailure({ errors:['compat.schema_flatten: unsupported JSON schema: schema.properties.a.type must be one of ...'], profile:{flavor:'modern'}, checks:[] }, ch, 'dev', { contractDrift:{ changed:false, newBaseline:true } }));
+console.log(attributeFailure(p(['compat.schema_flatten: unsupported ...'], [fc('compat.schema_flatten')]), ch, 'dev', { contractDrift:{ changed:false, newBaseline:true } }));
 // 契约 check 失败但基线一致（上游没变）→ 插件回归
-console.log(attributeFailure({ errors:['guard.reserved_name: 插件声明了保留名'], profile:{flavor:'modern'}, checks:[{name:'guard.reserved_name',status:'fail'}], }, ch, 'dev', { contractDrift:{ changed:false, newBaseline:false, items:[] } }));
-// 无漂移的业务失败 → 插件回归
-console.log(attributeFailure({ errors:['registry.exact: 期望 a / 实得 b'], profile:{flavor:'modern'}, checks:[] }, ch, 'dev', { contractDrift:{ changed:false } }));
+console.log(attributeFailure(p(['guard.reserved_name: 插件声明了保留名'], [fc('guard.reserved_name')]), ch, 'dev', { contractDrift:{ changed:false, newBaseline:false, items:[] } }));
 // 旧版死判据不得再出现
 console.log(/register\\.count|register\\.no_issues/.test(attributeFailure.toString()) ? 'dead-criteria-present' : 'no-dead-criteria');
 ")"
-assert "契约指纹漂移 → UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
-assert "契约 check 失败（无基线）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 2p)"
-assert "契约 check 失败但基线一致 → PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 3p)"
-assert "业务失败（无漂移）→ PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 4p)"
+assert "契约指纹漂移（与失败点相关）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
+assert "契约漂移与失败点无关 → PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 2p)"
+assert "契约 check 失败（无基线）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 3p)"
+assert "契约 check 失败但基线一致 → PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 4p)"
 assert "归因不再含死判据" "no-dead-criteria" "$(echo "$OUT" | sed -n 5p)"
 
 echo "  [10] 汇报渲染（二级信息）"
@@ -232,6 +253,25 @@ console.log(JSON.stringify(host.reg));
 ")"
 assert "接受保留名的宿主 → unknown（不误判版本线）" "unknown" "$(echo "$OUT" | sed -n 1p)"
 assert "兜底探测后宿主无残留工具" "[]" "$(echo "$OUT" | sed -n 2p)"
+
+echo "  [12] CLI 契约（退出码 / 带值参数缺值 / cache 子命令）"
+# 退出码即信号：0=GREEN 1=失败 2=用法错误 3=运行时异常（usage 里显式声明）
+cli_exit() {
+  "$NODE_BIN" "$ROOT/src/cli.mjs" "$@" > /dev/null 2>&1
+  echo $?
+}
+assert "带值参数缺值 → 2（不静默改语义）" "2" "$(cli_exit verify --channel --tools a)"
+assert "--json 缺值 → 2（不静默不写文件）" "2" "$(cli_exit verify --json)"
+assert "缺插件文件 → 2（用法错误，非运行时异常）" "2" "$(cli_exit verify --channel stable --plugin /nonexistent-plugin.mjs --tools a)"
+assert "未知通道 → 2" "2" "$(cli_exit verify --channel nope)"
+assert "未知参数 → 2" "2" "$(cli_exit verify --bogus 1)"
+OUT="$("$NODE_BIN" "$ROOT/src/cli.mjs" --help 2>&1 || true)"
+assert "usage 声明了 cache 子命令" "yes" "$(echo "$OUT" | grep -q 'dsh-adapt cache' && echo yes || echo no)"
+assert "usage 声明了退出码 3" "yes" "$(echo "$OUT" | grep -q '3=运行时异常' && echo yes || echo no)"
+# cache 子命令：pruneHostCache 的真实调用点（P2-3）
+OUT="$(TMPDIR="$(mktemp -d)" "$NODE_BIN" "$ROOT/src/cli.mjs" cache 2>&1)"
+assert "cache 子命令可运行且输出 keep 指纹" "yes" "$(echo "$OUT" | grep -q '\"keep\"' && echo yes || echo no)"
+assert "cache 保留三通道指纹" "3" "$(echo "$OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);console.log(r.keep.length)})")"
 
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"

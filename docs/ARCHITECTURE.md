@@ -24,10 +24,10 @@
 **已实测跑通**（非纸面设计）：
 
 ```
-stable(0.1.5-rc.2)  ✅ 14/14 检查通过   flavor=modern
-dev   (0.1.6-alpha.2) ✅ 14/14 检查通过   flavor=modern
-legacy(0.1.1-rc.2)  ✅ 14/14 检查通过   flavor=legacy
-离线单测 46 项 + 发布面自检 16 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
+stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
+dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
+legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
+离线单测 59 项 + 归因离线回归 43 项 + 发布面自检 16 项 ✅   归因端到端回归 28 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
 ```
 
 ---
@@ -146,7 +146,7 @@ flowchart TB
 
 | # | 假设 | 验证方式 | 结论 |
 |---|---|---|---|
-| A1 | 新旧版可同产物兼容（插件不 import 宿主包） | 隔离目录各装真宿主，装同一份插件产物 | ✅ **可行**（三通道各 14/14） |
+| A1 | 新旧版可同产物兼容（插件不 import 宿主包） | 隔离目录各装真宿主，装同一份插件产物 | ✅ **可行**（三通道各 17/17） |
 | A2 | 版本线可探测且无需 import | 读 `tools.constructor.Config.toString()` | ✅ 可行：`ptc`→modern、`code`→legacy |
 | A3 | 保留名 `run_code` 在新旧版都被拒 | 实测 `register({name:'run_code'})` | ✅ 两版均拒（措辞不同：PTC mode / Code Mode） |
 | A4 | `output.schema` 受强制子集校验 | 实测注册 `{type:'json'}` | ✅ 两版均拒，措辞一致 |
@@ -191,7 +191,9 @@ tongyongzhuandshshipei/
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 46 项离线单测（无网可跑）
+│   ├── test_offline.sh                # 59 项离线单测（无网可跑）
+│   ├── test_attribution.mjs           # 43 项归因离线回归（契约采集无残留 + 判据结构化 + 判据表完备性）
+│   ├── test_e2e_regression.mjs        # 28 项归因端到端回归（真宿主；🔴-A / 🔴-B 复现）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
 │   └── fixtures/{demo,broken}-plugin.mjs
@@ -276,7 +278,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 14/14 + 离线 46 项 + 发布面自检 16 项 + 负例拦下 | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 59 项 + 归因离线回归 43 项 + 发布面自检 16 项 + 归因端到端回归 28 项 + 负例拦下 | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |

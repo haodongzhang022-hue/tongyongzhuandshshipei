@@ -155,23 +155,28 @@ node /path/to/hub/src/cli.mjs watch
 
 ```
 | 通道 | 版本线 | 状态 | 归因 | 版本线探测 | 检查项 |
-| ✅ 稳定版通道 | 0.1.5 | pass | PASS | modern | 14/14 |
-| ❌ 开发版通道 | 0.1.6 | fail | UPSTREAM_DRIFT | modern | 12/14 |
+| ✅ 稳定版通道 | 0.1.5 | pass | PASS | modern | 17/17 |
+| ❌ 开发版通道 | 0.1.6 | fail | UPSTREAM_DRIFT | modern | 15/17 |
 ```
 
 | 归因 | 含义 | 你该做什么 |
 |---|---|---|
 | `PASS` | 通过 | 无事 |
-| `UPSTREAM_DRIFT` | **上游契约变了**，不是你的 bug | 提 Issue 到中台仓库；中台改兼容层，你不动 |
+| `UPSTREAM_DRIFT` | **上游契约变了 / 宿主环境不可用**（装不上、离线缺缓存），不是你的 bug | 提 Issue 到中台仓库；中台改兼容层，你不动 |
 | `PLUGIN_REGRESSION` | 你的插件出问题 | 看 `failedChecks[].name` 定位并修 |
-| `ENV_ERROR` | 环境/网络问题 | 检查网络或 `--offline` 缓存 |
+| `UNKNOWN` | 验收失败但无法归因（探针被外力打断等） | 看原始 `errors` 与 `attributionReasons`，人工判定后再跑 |
 
-**14 项检查清单**（三通道一致）：
+> 报告里的 `attributionReasons` 是**判据链**：告诉你这次为什么这么判（哪条信号命中），不必猜。
+
+**17 项检查清单**（三通道一致）：
 
 ```
 host.tools_ready        宿主 ToolRuntime 就绪
 detect.flavor_known     版本线可判定
-plugin.loaded           插件导出 apply(ctx)
+contract.probe_disposed 契约探测采集后已全部卸载（无残留）
+plugin.loaded           插件导出 apply(ctx)（import 失败/未导出 → 插件侧失败）
+plugin.apply_ok         插件 apply(ctx) 执行成功
+plugin.definitions_ok   插件导出可用的 definitions 数组
 registry.exact          注册工具清单精确匹配
 dispatch.execute_ok     真实 dispatch 成功
 dispatch.render_projected  output.render 投影正确

@@ -4,7 +4,7 @@
 > 上游 DSH 一变，只改这里；各插件仓库只写业务，**不再各改一遍**。
 
 [![channels](https://img.shields.io/badge/channels-stable%20%7C%20dev%20%7C%20legacy-blue)](registry/channels.json)
-[![verified](https://img.shields.io/badge/verified-3%20channels%20%C3%97%2014%20checks-brightgreen)](tests/test_hub.sh)
+[![verified](https://img.shields.io/badge/verified-3%20channels%20%C3%97%2017%20checks-brightgreen)](tests/test_hub.sh)
 
 ---
 
@@ -45,10 +45,10 @@
 ## 实测结果（真宿主，非纸面）
 
 ```
-✅ stable  (0.1.5-rc.2)      14/14 检查通过   flavor=modern
-✅ dev     (0.1.6-alpha.2)   14/14 检查通过   flavor=modern
-✅ legacy  (0.1.1-rc.2)      14/14 检查通过   flavor=legacy
-✅ 离线单测 46 项 + 发布面自检 16 项
+✅ stable  (0.1.5-rc.2)      17/17 检查通过   flavor=modern
+✅ dev     (0.1.6-alpha.2)   17/17 检查通过   flavor=modern
+✅ legacy  (0.1.1-rc.2)      17/17 检查通过   flavor=legacy
+✅ 离线单测 59 项 + 归因离线回归 43 项 + 发布面自检 16 项 + 归因端到端回归 28 项
 ✅ 负例插件被正确拦下（保留名冲突显式上报，不静默失效）
 ✅ 上游漂移侦测可用（基线只在通道 ok 时更新，失败不覆盖）
 ```
@@ -80,7 +80,8 @@ export function apply(ctx) {
 node src/cli.mjs matrix                                  # 看通道矩阵
 node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status --markdown
 node src/cli.mjs watch                                   # 上游有没有发新版
-bash tests/test_offline.sh                               # 离线单测（46 项，秒级）
+bash tests/test_offline.sh                               # 离线单测（59 项，秒级）
+node tests/test_attribution.mjs                          # 归因离线回归（43 项，秒级）
 node tests/test_exports.mjs                              # 发布面自检（exports 全解析 + 模板拷贝可用）
 ```
 
@@ -130,7 +131,7 @@ src/
 ├── adapter.mjs              # 插件侧唯一 import 面
 ├── detect/flavor.mjs        # 版本线探测（ptc/code/unknown）
 ├── compat/                  # schema 压平 + 工具契约适配
-├── harness/                 # 隔离真宿主装配 + 14 项探针
+├── harness/                 # 隔离真宿主装配 + 17 项探针 + 契约指纹采集
 ├── verify/runner.mjs        # 双通道验收 + 归因
 ├── watch/upstream.mjs       # 上游漂移侦测 + 契约指纹 diff
 └── report/secondary.mjs     # 二级信息汇报（JSON + Markdown）

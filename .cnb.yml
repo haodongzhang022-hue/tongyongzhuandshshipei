@@ -17,6 +17,10 @@ main:
           script: |
             # 发布面自检：exports 全解析 + 文档 import 路径 + 模板拷贝可用（防同类回归）
             node tests/test_exports.mjs
+        - name: attribution-offline
+          script: |
+            # 归因离线回归：契约采集无残留（🔴-A）+ 判据结构化（🔴-B）+ CLI 契约
+            node tests/test_attribution.mjs
     - name: dual-channel-verify
       docker:
         image: node:22
@@ -44,6 +48,12 @@ main:
               echo "❌ 负例插件被误判为通过：护栏失效"; exit 1
             fi
             echo "✅ 负例插件被正确拦下"
+        - name: attribution-e2e
+          script: |
+            # 归因端到端回归（真宿主）：上游取消保留名 → GREEN 且记漂移；
+            # 插件 apply 抛错 / 语法错误 / 缺 apply / 多余工具 → PLUGIN_REGRESSION；
+            # hub 路径含 npm 不得翻案（🔴-A / 🔴-B 原始复现场景）
+            node tests/test_e2e_regression.mjs
     - name: upstream-watch
       docker:
         image: node:22
@@ -64,6 +74,9 @@ main:
         - name: exports-selfcheck
           script: |
             node tests/test_exports.mjs
+        - name: attribution-offline
+          script: |
+            node tests/test_attribution.mjs
     - name: dual-channel-verify
       docker:
         image: node:22
@@ -87,6 +100,9 @@ main:
               --plugin ./tests/fixtures/demo-plugin.mjs \
               --tools demo_echo,demo_status \
               --json ./.ci/verify-legacy.json --markdown
+        - name: attribution-e2e
+          script: |
+            node tests/test_e2e_regression.mjs
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
     - name: upstream-drift-scan

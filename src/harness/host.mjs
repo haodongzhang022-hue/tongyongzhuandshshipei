@@ -60,6 +60,9 @@ export function channelFingerprint(channel) {
  * 策略：默认**只保留当前钉版指纹**对应的缓存目录（其余为历史版本残留，白占磁盘）；
  * `keepAll` 为 true 时仅清理临时工作目录（不动缓存）。
  *
+ * 真实调用点：CLI `dsh-adapt cache`（默认保留当前三通道钉版指纹）与
+ * `dsh-adapt verify --prune-cache`（验收后顺手清理历史残留）。
+ *
  * @param {{cacheDir?:string, keepFingerprints?:string[], keepAll?:boolean}} [options] 选项
  * @returns {{removed:string[], kept:string[]}} 清理结果
  */
@@ -89,7 +92,7 @@ export function pruneHostCache(options = {}) {
  * @param {string} [options.cacheDir] 宿主依赖缓存根（默认 $TMPDIR/dsh-adapt-host-cache）
  * @param {boolean} [options.offline] 仅用缓存，缺失即失败
  * @param {number} [options.timeoutMs] 安装 / 探针超时
- * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], contract:object, install:string, cacheHit:boolean, durationMs:number}}
+ * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], contract:object, probes:object[], probeExit:object|null, install:string, cacheHit:boolean, durationMs:number}}
  *
  * 缓存策略：命中时以**软链**挂载缓存 `node_modules`（不再全量复制）；
  * 历史残留用 {@link pruneHostCache} 清理（保留当前钉版指纹）。
@@ -117,6 +120,8 @@ export function runHostProbe(options) {
     checks: [],
     errors: [],
     contract: {},
+    probes: [],
+    probeExit: null,
     install: 'skipped',
     cacheHit: false,
     durationMs: 0,
@@ -133,14 +138,21 @@ export function runHostProbe(options) {
       result.install = `cache:${cachePath}`;
     } else if (offline) {
       result.install = 'offline-miss';
-      result.errors.push(`离线模式下缺少宿主依赖缓存：${cachePath}`);
+      result.errors.push(`fatal(host): 离线模式下缺少宿主依赖缓存（先联网跑一次或去掉 --offline）`);
       return result;
     } else {
-      execFileSync('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error', ...pinsToSpecs(channel)], {
-        cwd: workDir,
-        stdio: ['ignore', 'ignore', 'inherit'],
-        timeout: timeoutMs,
-      });
+      try {
+        execFileSync('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error', ...pinsToSpecs(channel)], {
+          cwd: workDir,
+          stdio: ['ignore', 'ignore', 'inherit'],
+          timeout: timeoutMs,
+        });
+      } catch (error) {
+        // 安装失败 = 宿主/环境侧（网络不可达 或 上游钉版消失）→ 显式措辞，供归因按**结构**判定
+        result.install = 'npm-failed';
+        result.errors.push(`fatal(host): 宿主依赖安装失败（npm）：${String(error?.message ?? error).slice(0, 300)}`);
+        return result;
+      }
       cpSync(path.join(workDir, 'node_modules'), path.join(cachePath, 'node_modules'), { recursive: true });
       result.install = 'npm-install';
     }
@@ -157,7 +169,9 @@ export function runHostProbe(options) {
       }
     }
 
+    // 探针与其依赖一起拷入临时目录（probe-template.mjs 会 import './contract.mjs'）
     cpSync(path.join(hubRoot, 'src', 'harness', 'probe-template.mjs'), path.join(workDir, 'probe.mjs'));
+    cpSync(path.join(hubRoot, 'src', 'harness', 'contract.mjs'), path.join(workDir, 'contract.mjs'));
 
     let stdout = '';
     try {
@@ -168,23 +182,35 @@ export function runHostProbe(options) {
       });
     } catch (error) {
       stdout = `${error.stdout ?? ''}`;
-      result.errors.push(`探针非零退出：${String(error.message).slice(0, 300)}`);
+      // 注意：措辞里**不得**回显命令行与路径（历史缺陷：路径含 npm 时被归因判据误命中，
+      // 把插件 bug 报成上游漂移）。归因只看探针的结构化错误，这里只记退出实况。
+      result.probeExit = { status: error.status ?? null, signal: error.signal ?? null };
+      result.errors.push(`探针非零退出（status=${error.status ?? 'null'}${error.signal ? `, signal=${error.signal}` : ''}）`);
     }
 
     const marker = stdout.split('\n').find((line) => line.startsWith('__DSH_PROBE__'));
     if (!marker) {
-      result.errors.push(`探针未输出结构化结果：${stdout.slice(-600)}`);
+      result.errors.push(`fatal(host): 探针未输出结构化结果（探针自身崩溃 / 被宿主中断）：${stdout.slice(-600)}`);
       return result;
     }
-    const payload = JSON.parse(marker.slice('__DSH_PROBE__'.length));
+    let payload;
+    try {
+      payload = JSON.parse(marker.slice('__DSH_PROBE__'.length));
+    } catch (error) {
+      // 探针输出不可解析 = 探针自身（本仓文件）出问题 → 宿主侧，不甩锅插件
+      result.errors.push(`fatal(host): 探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
+      return result;
+    }
     result.profile = payload.profile;
     result.checks = payload.checks ?? [];
     result.contract = payload.contract ?? {};
+    result.probes = payload.probes ?? [];
     result.errors.push(...(payload.errors ?? []));
     result.ok = payload.ok === true && result.errors.length === 0;
     return result;
   } catch (error) {
-    result.errors.push(`装配失败：${String(error?.message ?? error).slice(0, 500)}`);
+    // 装配阶段兜底：一律宿主/环境侧（探针脚本未产出结构化结果前的失败不可能是插件造成）
+    result.errors.push(`fatal(host): 宿主装配失败：${String(error?.message ?? error).slice(0, 500)}`);
     return result;
   } finally {
     result.durationMs = Date.now() - started;

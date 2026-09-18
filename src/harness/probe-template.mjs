@@ -9,86 +9,156 @@
  *   验证「装上就能用」；
  * - **生命周期路径**：用中台 `registerTools` 重注册并逐个卸载，验证 disposer 语义。
  *
+ * ## 错误分级（归因的前提，见评审 🔴-A / 🔴-B）
+ * 探针的错误分两侧，措辞**必须可区分**，否则归因会被带跑：
+ * - **宿主/环境侧**（装不上、宿主包 import 失败、ToolRuntime 未就绪、探针自身契约采集炸）
+ *   → 写成 `fatal(host): ...`，归因判 `UPSTREAM_DRIFT`；
+ * - **插件侧**（import 失败、未导出 `apply`、`apply` 抛错、`definitions` 抛错、
+ *   工具清单不符、dispatch 失败、卸载残留、声明保留名）
+ *   → 一律落成 **check 失败**（`plugin.*` / `registry.*` / `dispatch.*` / `lifecycle.*` /
+ *   `guard.reserved_rejected`），归因判 `PLUGIN_REGRESSION`。
+ * 历史缺陷：插件侧错误曾被统一写成 `fatal: ...`，而 `runner` 用裸 `fatal:` 判上游漂移
+ * → 插件写坏了却被告知「上游变了，不是你的问题」。
+ *
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
 import { pathToFileURL } from 'node:url';
+import { collectContract, PLUGIN_SIDE_CHECKS } from './contract.mjs';
 
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
 
-const out = { checks: [], errors: [], profile: null, contract: {}, ok: false };
+const out = { checks: [], errors: [], profile: null, contract: {}, probes: [], ok: false };
 const check = (name, ok, detail) => {
   out.checks.push({ name, status: ok ? 'pass' : 'fail', detail: detail === undefined ? '' : String(detail).slice(0, 600) });
   if (!ok) out.errors.push(`${name}: ${detail ?? ''}`);
 };
+/** 记录「因前置失败而无法验证」的检查项（不产生错误，避免制造噪音归因）。 */
+const skip = (name, detail) => {
+  out.checks.push({ name, status: 'skip', detail: detail === undefined ? '' : String(detail).slice(0, 600) });
+};
+/**
+ * 前置失败时把「尚未验证」的检查项标 skip（报告里看得见「哪些没验」，而不是凭空消失）。
+ *
+ * 已记录的检查项（pass/fail）不重复标注——否则同一 check 会同时出现 fail 与 skip 两条。
+ *
+ * @param {string[]} names 待标注的检查项名
+ * @param {string} reason 跳过原因（进报告，供人判断「没验」还是「验失败」）
+ */
+const skipAll = (names, reason) => {
+  const recorded = new Set(out.checks.map((c) => c.name));
+  for (const name of names) if (!recorded.has(name)) skip(name, reason);
+};
+const brief = (error, limit = 600) => String(error?.stack ?? error).split('\n').slice(0, 3).join(' | ').slice(0, limit);
 
-try {
-  const { Context } = await import('@deepseek-ai/cordis');
-  const { default: ToolRuntime } = await import('@deepseek-ai/dsh-tools');
-  const { default: SystemPrompt } = await import('@deepseek-ai/dsh-system-prompt');
+async function run() {
+  let ctx;
+  let tools;
+  let hub;
+  // 宿主符号提升到函数作用域：生命周期路径（第 10 段）也要用同一个 Context/ToolRuntime
+  let Context;
+  let ToolRuntime;
+  let SystemPrompt;
 
-  const hub = await import(pathToFileURL(`${hubRoot}/src/index.mjs`).href);
+  // ---- 1. 宿主装配：此段任何失败都是**宿主/环境侧** → fatal(host) ----
+  try {
+    ({ Context } = await import('@deepseek-ai/cordis'));
+    ({ default: ToolRuntime } = await import('@deepseek-ai/dsh-tools'));
+    ({ default: SystemPrompt } = await import('@deepseek-ai/dsh-system-prompt'));
+    hub = await import(pathToFileURL(`${hubRoot}/src/index.mjs`).href);
 
-  const ctx = new Context();
-  ctx.plugin(SystemPrompt, {});
-  ctx.plugin(ToolRuntime, {});
-  await new Promise((resolve) => setTimeout(resolve, 200));
+    ctx = new Context();
+    ctx.plugin(SystemPrompt, {});
+    ctx.plugin(ToolRuntime, {});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    tools = ctx.get('tools');
+  } catch (error) {
+    out.errors.push(`fatal(host): ${brief(error, 1200)}`);
+    return;
+  }
 
-  const tools = ctx.get('tools');
   check(
     'host.tools_ready',
     Boolean(tools),
     tools ? `ctx.tools 已就绪（${tools.constructor?.name ?? 'ToolRuntime'}）` : 'ctx.tools 未就绪（宿主未装配 ToolRuntime）',
   );
-  if (!tools) throw new Error('ctx.tools 未就绪');
+  if (!tools) return;
 
-  // ---- 1. 版本线探测 ----
+  // ---- 2. 版本线探测 ----
   const profile = hub.detectHostFlavor(tools);
   out.profile = profile.toJSON();
   check('detect.flavor_known', profile.flavor !== 'unknown', profile.evidence);
   out.contract.configProjection = profile.signals.configProjection;
 
-  // ---- 2. 契约指纹采集（上游漂移侦测基线） ----
+  // ---- 3. 契约指纹采集（上游漂移侦测基线；采集后必须立即卸载） ----
   try {
-    tools.register({
-      name: 'run_code', description: 'probe', parameters: { type: 'object', properties: {} },
-      output: { schema: { type: 'object', properties: {} }, render: () => [] }, execute: async () => ({}),
-    });
-    out.contract.reservedName = 'ACCEPTED(unexpected)';
-  } catch (error) { out.contract.reservedName = String(error?.message ?? error); }
+    const collected = collectContract(tools);
+    Object.assign(out.contract, collected.contract);
+    out.probes = collected.probes;
+    check(
+      'contract.probe_disposed',
+      collected.residue.length === 0,
+      collected.residue.length === 0
+        ? `契约探测已全部卸载（${collected.probes.length} 项，不留副作用）`
+        : `契约探测残留 ${collected.residue.join(',')}（宿主未返回可用 disposer → 上游 register 语义变了；残留会污染插件工具清单）`,
+    );
+  } catch (error) {
+    out.errors.push(`fatal(host): 契约指纹采集失败：${brief(error, 1000)}`);
+    return;
+  }
+
+  // ---- 4. 中台自身护栏（与插件无关，宿主侧契约 check） ----
+  const guardWorks = (() => { try { hub.assertNotReserved('run_code'); return false; } catch { return true; } })();
+  check('guard.reserved_name', guardWorks, guardWorks ? '中台保留名护栏可用（run_code 被插件侧拒绝）' : '插件侧未拒绝 DSH 保留名 run_code');
+
+  const flattened = hub.normalizeSchema({ type: 'object', properties: { a: { type: 'json' } } });
+  const flattenOk = hub.collectSchemaViolations(flattened).length === 0;
+  check('compat.schema_flatten', flattenOk, flattenOk ? `schema 压平后无违规：${JSON.stringify(flattened)}` : `schema 压平后仍有违规：${JSON.stringify(flattened)}`);
+
+  // ---- 5. 集成路径：插件 import / apply（**插件侧**失败 → check，绝不 fatal） ----
+  let plugin = null;
+  try {
+    plugin = await import(pathToFileURL(pluginPath).href);
+  } catch (error) {
+    check('plugin.loaded', false, `插件 import 失败（语法/依赖错误）：${brief(error)}`);
+    skipAll(PLUGIN_SIDE_CHECKS, '插件 import 失败，无法执行验收');
+    return;
+  }
+  const hasApply = typeof plugin.apply === 'function';
+  check('plugin.loaded', hasApply, hasApply ? '插件导出 apply(ctx)' : `插件未导出 apply(ctx)（导出面：${Object.keys(plugin).join(',') || '空'}）`);
+  if (!hasApply) {
+    skipAll(PLUGIN_SIDE_CHECKS, '插件未导出 apply(ctx)，无法执行验收');
+    return;
+  }
 
   try {
-    tools.register({
-      name: 'probe_bad_schema', description: 'probe', parameters: { type: 'object', properties: {} },
-      output: { schema: { type: 'object', properties: { a: { type: 'json' } } }, render: () => [] }, execute: async () => ({}),
-    });
-    out.contract.schemaSubset = 'ACCEPTED(unexpected)';
-  } catch (error) { out.contract.schemaSubset = String(error?.message ?? error); }
+    await plugin.apply({ tools, effect: (fn, label) => ctx.effect(fn, label) });
+    check('plugin.apply_ok', true, '插件 apply(ctx) 执行成功（工具已注册）');
+  } catch (error) {
+    check('plugin.apply_ok', false, `插件 apply(ctx) 抛错（插件侧初始化失败）：${brief(error)}`);
+    skipAll(PLUGIN_SIDE_CHECKS, '插件 apply(ctx) 未成功，后续检查无法验证');
+    return;
+  }
 
-  try {
-    tools.register({
-      name: 'probe_no_render', description: 'probe', parameters: { type: 'object', properties: {} },
-      output: { schema: { type: 'object', properties: {} } }, execute: async () => ({}),
-    });
-    out.contract.outputShape = 'render-optional';
-  } catch (error) { out.contract.outputShape = String(error?.message ?? error); }
-
-  // ---- 3. 集成路径：调用插件自己的 apply（真实入口 + 中台适配器） ----
-  const plugin = await import(pathToFileURL(pluginPath).href);
-  const pluginCtx = { tools, effect: (fn, label) => ctx.effect(fn, label) };
-  check('plugin.loaded', typeof plugin.apply === 'function', typeof plugin.apply === 'function' ? '插件导出 apply(ctx)' : '插件未导出 apply(ctx)');
-  if (typeof plugin.apply !== 'function') throw new Error('插件未导出 apply(ctx)');
-  await plugin.apply(pluginCtx);
-
+  // ---- 6. 工具清单精确匹配 ----
   const actual = tools.schemas().map((s) => s.name).filter((n) => !n.startsWith('probe_')).sort();
   const want = [...expectedTools].sort();
   const registryExact = JSON.stringify(actual) === JSON.stringify(want);
   check('registry.exact', registryExact, registryExact ? `工具清单精确匹配（${actual.join(',')}）` : `期望 ${want.join(',')} / 实得 ${actual.join(',')}`);
 
-  // ---- 4. 真实 dispatch：execute → output.schema 校验 → render 投影 ----
+  // ---- 7. 真实 dispatch：execute → output.schema 校验 → render 投影 ----
   const echoName = want.find((n) => n.endsWith('echo'));
   const dispatchName = echoName ?? want[0];
-  const dispatched = await tools.execute({ callId: 'probe-echo', name: dispatchName, arguments: { text: 'hello' }, signal: new AbortController().signal });
+  let dispatched;
+  try {
+    dispatched = await tools.execute({ callId: 'probe-echo', name: dispatchName, arguments: { text: 'hello' }, signal: new AbortController().signal });
+  } catch (error) {
+    check('dispatch.execute_ok', false, `dispatch 抛错（插件工具实现问题）：${brief(error)}`);
+    skip('dispatch.render_projected', 'dispatch 未成功，跳过');
+    skip('dispatch.echo_payload', 'dispatch 未成功，跳过');
+    skip('dispatch.abort_semantics', 'dispatch 未成功，跳过');
+    return;
+  }
   const dispatchDetail = JSON.stringify(dispatched.content)?.slice(0, 200);
   check(
     'dispatch.execute_ok',
@@ -104,10 +174,16 @@ try {
     check('dispatch.echo_payload', true, `插件未声明 *echo 工具（${dispatchName}），跳过回显载荷断言`);
   }
 
-  // ---- 5. 取消语义（宿主三线一致要求） ----
+  // ---- 8. 取消语义（宿主三线一致要求） ----
   const aborter = new AbortController();
   aborter.abort();
-  const cancelled = await tools.execute({ callId: 'probe-abort', name: dispatchName, arguments: { text: 'x' }, signal: aborter.signal });
+  let cancelled;
+  try {
+    cancelled = await tools.execute({ callId: 'probe-abort', name: dispatchName, arguments: { text: 'x' }, signal: aborter.signal });
+  } catch (error) {
+    check('dispatch.abort_semantics', false, `已中止调用未被宿主拒绝而是抛错：${brief(error)}`);
+    return;
+  }
   check(
     'dispatch.abort_semantics',
     cancelled.isError === true,
@@ -116,55 +192,67 @@ try {
       : `取消语义失效：已中止的调用仍返回成功：${JSON.stringify(cancelled.content)?.slice(0, 160)}`,
   );
 
-  // ---- 6. 保留名护栏（插件侧显式失败，而非炸在宿主里） ----
-  const guardWorks = (() => { try { hub.assertNotReserved('run_code'); return false; } catch { return true; } })();
-  check('guard.reserved_name', guardWorks, guardWorks ? '中台保留名护栏可用（run_code 被插件侧拒绝）' : '插件侧未拒绝 DSH 保留名 run_code');
+  // ---- 9. 插件 definitions（**插件侧**失败 → check，绝不 fatal） ----
+  let definitions;
+  try {
+    definitions = typeof plugin.definitions === 'function' ? plugin.definitions({ profile: profile.toJSON() }) : plugin.definitions;
+  } catch (error) {
+    check('plugin.definitions_ok', false, `插件 definitions() 抛错（插件侧错误）：${brief(error)}`);
+    skipAll(['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected'], 'definitions 不可用');
+    return;
+  }
+  const definitionsUsable = Array.isArray(definitions) && definitions.length > 0;
+  check(
+    'plugin.definitions_ok',
+    definitionsUsable,
+    definitionsUsable ? `插件导出 ${definitions.length} 个工具定义` : `插件未导出可用的 definitions 数组（typeof=${typeof definitions}）`,
+  );
+  if (!definitionsUsable) {
+    skipAll(['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected'], '插件无可注册定义');
+    return;
+  }
 
-  // ---- 7. schema 压平（作者侧宽松写法必须被压平而非原样透传） ----
-  const flattened = hub.normalizeSchema({ type: 'object', properties: { a: { type: 'json' } } });
-  const flattenOk = hub.collectSchemaViolations(flattened).length === 0;
-  check('compat.schema_flatten', flattenOk, flattenOk ? `schema 压平后无违规：${JSON.stringify(flattened)}` : `schema 压平后仍有违规：${JSON.stringify(flattened)}`);
-
-  // ---- 8. 生命周期：disposer 语义（独立 Context，宿主拒绝同层重名注册） ----
-  const definitions = typeof plugin.definitions === "function" ? plugin.definitions({ profile: profile.toJSON() }) : plugin.definitions;
-  if (Array.isArray(definitions) && definitions.length > 0) {
+  // ---- 10. 生命周期：disposer 语义（独立 Context，宿主拒绝同层重名注册） ----
+  try {
     const ctx2 = new Context();
     ctx2.plugin(SystemPrompt, {});
     ctx2.plugin(ToolRuntime, {});
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const tools2 = ctx2.get("tools");
+    const tools2 = ctx2.get('tools');
     const lifecycle = hub.registerTools({ tools: tools2, effect: (fn, label) => ctx2.effect(fn, label) }, definitions, { profile });
     // 被拒绝的保留名不产生 disposer；按「可注册定义数」计数（避免把冲突误算成漏注册）
     const expectedDisposers = definitions.length - lifecycle.reservedRejected.length;
-    check("lifecycle.disposer_count", lifecycle.disposers.length === expectedDisposers, lifecycle.disposers.length === expectedDisposers ? lifecycle.disposers.length + "/" + expectedDisposers + '（全部可注册定义均产出 disposer）' : lifecycle.disposers.length + "/" + expectedDisposers + '（数量不符）');
+    check('lifecycle.disposer_count', lifecycle.disposers.length === expectedDisposers, lifecycle.disposers.length === expectedDisposers ? lifecycle.disposers.length + '/' + expectedDisposers + '（全部可注册定义均产出 disposer）' : lifecycle.disposers.length + '/' + expectedDisposers + '（数量不符）');
     const before = tools2.schemas().map((s) => s.name).sort();
     const lifecycleRegistered = JSON.stringify(before) === JSON.stringify([...expectedTools].sort());
-    check("lifecycle.registered", lifecycleRegistered, lifecycleRegistered ? `独立上下文注册成功（${before.join(',')}）` : `独立上下文注册不符：${before.join(',')}`);
+    check('lifecycle.registered', lifecycleRegistered, lifecycleRegistered ? `独立上下文注册成功（${before.join(',')}）` : `独立上下文注册不符：${before.join(',')}`);
     lifecycle.disposers.forEach((dispose) => dispose());
     const after = tools2.schemas().map((s) => s.name);
-    check("lifecycle.dispose", after.length === 0, after.length === 0 ? '卸载后无残留' : '卸载后仍残留：' + after.join(','));
-  } else {
-    check("lifecycle.disposer_count", false, "插件未导出 definitions 数组，无法验证生命周期");
+    check('lifecycle.dispose', after.length === 0, after.length === 0 ? '卸载后无残留' : '卸载后仍残留：' + after.join(','));
+  } catch (error) {
+    check('lifecycle.registered', false, `生命周期路径执行抛错（插件定义不可注册）：${brief(error)}`);
+    skip('lifecycle.dispose', '生命周期路径未完成，跳过');
   }
 
-  // ---- 9. 保留名冲突：既不得静默丢弃，也不得被放行（插件须改名） ----
-  const defsForGuard = typeof plugin.definitions === 'function'
-    ? plugin.definitions({ profile: profile.toJSON() })
-    : plugin.definitions;
-  const reservedInDefs = Array.isArray(defsForGuard)
-    ? defsForGuard.map((d) => d?.name).filter((n) => hub.RESERVED_TOOL_NAMES.includes(n))
-    : [];
+  // ---- 11. 保留名冲突：既不得静默丢弃，也不得被放行（插件须改名） ----
+  const reservedInDefs = definitions.map((d) => d?.name).filter((n) => hub.RESERVED_TOOL_NAMES.includes(n));
   if (reservedInDefs.length === 0) {
     check('guard.reserved_rejected', true, `插件未使用 DSH 保留名（${hub.RESERVED_TOOL_NAMES.join(',')}）`);
   } else {
-    const ctx3 = new Context();
-    ctx3.plugin(SystemPrompt, {});
-    ctx3.plugin(ToolRuntime, {});
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const tools3 = ctx3.get('tools');
-    const guardResult = hub.registerTools({ tools: tools3 }, defsForGuard, { profile });
-    const reported = guardResult.reservedRejected.length === reservedInDefs.length
-      && guardResult.issues.some((issue) => issue.includes('reserved_name_conflict'));
+    let reported = false;
+    try {
+      const ctx3 = new Context();
+      ctx3.plugin(SystemPrompt, {});
+      ctx3.plugin(ToolRuntime, {});
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const tools3 = ctx3.get('tools');
+      const guardResult = hub.registerTools({ tools: tools3 }, definitions, { profile });
+      reported = guardResult.reservedRejected.length === reservedInDefs.length
+        && guardResult.issues.some((issue) => issue.includes('reserved_name_conflict'));
+    } catch (error) {
+      reported = false;
+      out.errors.push(`guard.reserved_rejected: 保留名冲突处置抛错：${brief(error)}`);
+    }
     // 插件声明保留名 = 违反宿主硬约束 → 验收必须判失败（且失败原因是插件侧，不是静默丢弃）
     check(
       'guard.reserved_rejected',
@@ -172,12 +260,15 @@ try {
       `插件声明了 DSH 保留名 ${reservedInDefs.join(',')}，中台已拒绝并上报（reported=${reported}），但插件须改名后重跑`,
     );
   }
-
-  out.ok = out.errors.length === 0;
-} catch (error) {
-  out.errors.push(`fatal: ${String(error?.stack ?? error).slice(0, 1200)}`);
-  out.ok = false;
 }
 
+try {
+  await run();
+} catch (error) {
+  // 兜底：探针自身未预期的异常。**不猜归因**：按宿主侧记录（插件侧错误在 run() 内已落成 check）。
+  out.errors.push(`fatal(host): 探针未预期异常：${brief(error, 1200)}`);
+}
+
+out.ok = out.errors.length === 0;
 process.stdout.write(`__DSH_PROBE__${JSON.stringify(out)}\n`);
 process.exit(out.ok ? 0 : 1);

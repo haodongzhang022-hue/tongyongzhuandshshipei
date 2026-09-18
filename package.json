@@ -1,6 +1,6 @@
 {
   "name": "@dongdongxiaozu/dsh-adapt-hub",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 适配中台：把「插件适配 DSH 生态」的重复劳动固化为可复用能力——版本线探测 / 契约兼容层 / 双通道（稳定版+开发版）验收 / 上游变更侦测。",
   "type": "module",
   "bin": {
@@ -31,7 +31,9 @@
     "verify:all": "node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
     "test": "bash tests/test_hub.sh",
     "test:offline": "bash tests/test_offline.sh",
-    "test:exports": "node tests/test_exports.mjs"
+    "test:exports": "node tests/test_exports.mjs",
+    "test:attribution": "node tests/test_attribution.mjs",
+    "test:e2e": "node tests/test_e2e_regression.mjs"
   },
   "keywords": [
     "dsh",
