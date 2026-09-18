@@ -35,7 +35,7 @@
 ### 测试项数（本版）
 
 - 离线单测 189 项（`tests/test_offline.sh`：178 → 189）
-- 归因离线回归 578 项（`tests/test_attribution.mjs`：541 → 578；**[9.16]** 新增 29 条 + 报告层）
+- 归因离线回归 583 项（`tests/test_attribution.mjs`：541 → 583；**[9.16]** 新增 29 条 + 报告层 + 🟡-A 措辞守卫 5 条）
 - 归因端到端回归 179 项（`tests/test_e2e_regression.mjs`：172 → 179；**[8i]** 新增 7 条）
 - 插件侧闸门 26 项（`tests/gate_plugin_side.sh`：25 → 26；+ 🔴-R3③ 独立一段）
 - 发布面自检 43 项（不变）

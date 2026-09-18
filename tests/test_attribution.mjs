@@ -1221,6 +1221,23 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
       /真宿主下(\*\*)?不可达/.test(r26Row) || /真宿主下插件无法构造/.test(r26Row));
     eq('R26 口径：RISKS R26 写明经 env/argv 不可达 + 同进程其它手段仍可达（事实陈述）', true,
       /经 env \/ argv 不可达/.test(r26Row) && /同进程/.test(r26Row));
+    // ⑦ 🟡-A 措辞守卫（评审复评 §五）：**现在时**不得写成「nonce 经 argv/env 传入」——
+    // 实现是 **stdin** 下发。此前两处注释写反且**无守卫**（改这两处四套件仍全绿 ⇒ 文档债静默存活）。
+    // 守卫只判这两份文件的注释/文案面；口径陈述（「经 env/argv 不可达」）是**事实陈述**，不在守卫内。
+    {
+      const forgedSrc = readText(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'utf8');
+      const e2eSrc = readText(path.join(ROOT, 'tests/test_e2e_regression.mjs'), 'utf8');
+      eq('🟡-A 措辞：伪造夹具注释不再写「经 argv/env 传入」（实现是 stdin，回退即红）', false,
+        /经 argv\/env 传入/.test(forgedSrc));
+      eq('🟡-A 措辞：伪造夹具残留边界不再写「读自己的 argv/env 拿到 nonce」（实现是 stdin，回退即红）', false,
+        /读自己的 argv\/env 拿到 nonce/.test(forgedSrc));
+      eq('🟡-A 措辞：e2e 注释不再写「argv/env 传递」（实现是 stdin，回退即红）', false,
+        /argv\/env 传递/.test(e2eSrc));
+      eq('🟡-A 措辞：伪造夹具改写成 stdin 事实（正面锚，删掉即红）', true,
+        /经 \*\*stdin\*\* 下发/.test(forgedSrc));
+      eq('🟡-A 措辞：e2e 注释改写成 stdin 事实（正面锚，删掉即红）', true,
+        /\*\*stdin\*\* 下发/.test(e2eSrc));
+    }
   }
 }
 
