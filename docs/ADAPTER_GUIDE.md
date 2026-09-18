@@ -172,29 +172,49 @@ node /path/to/hub/src/cli.mjs watch
 > **优先于**上游漂移相关性——即使上游此刻正在漂移，你的保留名冲突也会如实归因为
 > `PLUGIN_REGRESSION`，不会被甩成「上游变了，不是你的问题」。
 
-**17 项检查清单**（三通道一致）：
+**17 项检查清单**（三通道一致；**顺序 = 探针实际输出顺序**，见 `src/harness/probe-template.mjs`）：
 
 ```
-host.tools_ready        宿主 ToolRuntime 就绪
-detect.flavor_known     版本线可判定
-contract.probe_disposed 契约探测采集后已全部卸载（无残留）
-guard.reserved_name     中台保留名护栏可用（中台自检，非插件违规）
-compat.schema_flatten   schema 压平后无违规
-plugin.loaded           插件导出 apply(ctx)（import 失败/未导出 → 插件侧失败）
-plugin.apply_ok         插件 apply(ctx) 执行成功
-registry.exact          注册工具清单精确匹配
-dispatch.execute_ok     真实 dispatch 成功
-dispatch.render_projected  output.render 投影正确
-dispatch.echo_payload   业务返回值正确（插件无 *echo 工具时自动跳过）
-dispatch.abort_semantics  exec.signal 取消语义生效
-plugin.definitions_ok   插件导出可用的 definitions 数组
-lifecycle.disposer_count disposer 数量正确（按可注册定义数计）
-lifecycle.registered    独立上下文注册成功
-lifecycle.dispose       卸载后无残留
-guard.reserved_rejected 插件声明的保留名必须被拒绝并上报（声明即判失败）
+ 1 host.tools_ready        宿主 ToolRuntime 就绪
+ 2 detect.flavor_known     版本线可判定
+ 3 contract.probe_disposed 契约探测采集后已全部卸载（无残留）
+ 4 guard.reserved_name     中台保留名护栏可用（中台自检，非插件违规）
+ 5 compat.schema_flatten   schema 压平后无违规
+ 6 plugin.loaded           插件导出 apply(ctx)（import 失败/未导出 → 插件侧失败）
+ 7 plugin.apply_ok         插件 apply(ctx) 执行成功
+ 8 registry.exact          注册工具清单精确匹配
+ 9 dispatch.execute_ok     真实 dispatch 成功
+10 dispatch.render_projected  output.render 投影正确
+11 dispatch.echo_payload   业务返回值正确（插件无 *echo 工具时自动跳过）
+12 dispatch.abort_semantics  exec.signal 取消语义生效
+13 plugin.definitions_ok   插件导出可用的 definitions 数组
+14 lifecycle.disposer_count disposer 数量正确（按可注册定义数计）
+15 lifecycle.registered    独立上下文注册成功
+16 lifecycle.dispose       卸载后无残留
+17 guard.reserved_rejected 插件声明的保留名必须被拒绝并上报（声明即判失败）
 ```
 
-> 顺序即探针实际执行顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
+> 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
+> 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
+
+**归因优先级**（`attributionReasons` 判据链按此顺序取第一条命中）：
+
+```
+1. 宿主/环境侧    结构化字段 hostFatal[] 非空（或失败项属宿主侧 check）
+2. 版本线 unknown 探针无法判定版本线
+3. 插件侧硬证据   插件声明了 DSH 保留名（guard.reserved_rejected）——**优先于契约漂移相关性**
+4. 契约漂移相关   漂移字段与失败 check 相关（guard.reserved_name / compat.schema_flatten / dispatch.*）
+5. 无可用基线     契约 check 失败且首次采集 → 保守判漂移（让人确认）
+6. 插件侧 check   插件侧 / 中台契约层检查失败（上游契约与基线一致）
+7. UNKNOWN        有失败但无可识别 check（被外力打断）→ 不猜、不甩锅
+```
+
+> 第 3 条是「漂移窗口内的插件 bug」不被吞的关键：上游取消保留名 = 契约漂移（照实记录），
+> 但插件**仍不得**声明 `run_code`——两者互不抵消。
+>
+> 排障口径（漂移窗口首跑顺序）：**判定漂移以首次运行或干净副本为准**。
+> 漂移窗口内若先跑健康插件，该通道 `ok` → 漂移契约被写进基线，后续运行 `contractDrift.changed=false`，
+> 漂移信号消失（这是「仅 ok 更新基线」的必要设计，见 `docs/RISKS.md` R18）。
 
 ---
 

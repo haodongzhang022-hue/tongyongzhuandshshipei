@@ -70,6 +70,56 @@ for (const file of ['docs/ADAPTER_GUIDE.md', 'README.md', 'src/index.mjs']) {
   else bad(`${file} 的 import 路径`, `未定义子路径：${unknown.join(', ')}`);
 }
 
+// ---- 2b. 文档 17 项检查清单：顺序 = 探针实际输出顺序（防「集合对、顺序错」漂移） ----
+console.log('  [2b] 文档检查清单顺序与探针一致');
+{
+  const probeSource = readFileSync(path.join(ROOT, 'src/harness', 'probe-template.mjs'), 'utf8');
+  // 探针 check() 调用顺序 = 报告里 checks[] 顺序；同名只取首次（前置失败会 skipAll，不重复声明）
+  const seen = new Set();
+  const probeOrder = [...probeSource.matchAll(/check\(\s*'([^']+)'/g)]
+    .map((m) => m[1])
+    .filter((name) => (seen.has(name) ? false : (seen.add(name), true)));
+  ok('探针 check 数量 = 17 项', String(probeOrder.length));
+
+  /**
+   * 抽取文档「17 项检查清单」段落正文里的检查名（按出现顺序）。
+   *
+   * 两种承载形式都支持：Markdown 表格（`docs/INDEX.md`）与代码围栏块（`docs/ADAPTER_GUIDE.md`）。
+   * 只认全量 17 项集合内的名字，避免把正文里其他位置的引用算进顺序。
+   */
+  const checklistOrderOf = (file) => {
+    const text = readFileSync(path.join(ROOT, file), 'utf8');
+    // 段落标题两种写法：`docs/INDEX.md` 用 `## 四、17 项验收检查索引`，指南用 `**17 项检查清单**（…）`。
+    // 必须**行首锚定**（标题行 / 加粗行首），否则会先命中正文表格里的「17 项检查（…）」引用。
+    const heading = /^(?:#{1,6}|\*\*)17 项[^\n]*检查[^\n]*$/m.exec(text)
+      ?? /^(?:#{1,6}|\*\*)[^\n]*17 项[^\n]*检查[^\n]*$/m.exec(text);
+    if (!heading) return null;
+    const idx = heading.index;
+    const rest = text.slice(idx);
+    // 取到下一个二级标题为止，作为清单正文范围
+    const nextHeading = rest.indexOf('\n## ');
+    const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+    const found = [];
+    for (const m of section.matchAll(/([a-z_]+\.[a-z_]+)/g)) {
+      const name = m[1];
+      if (probeOrder.includes(name) && !found.includes(name)) found.push(name);
+    }
+    return found;
+  };
+
+  for (const file of ['docs/INDEX.md', 'docs/ADAPTER_GUIDE.md']) {
+    const docOrder = checklistOrderOf(file);
+    if (docOrder === null) { bad(`${file} 有「17 项检查清单」段落`, '未找到清单段落'); continue; }
+    const missing = probeOrder.filter((n) => !docOrder.includes(n));
+    if (missing.length > 0) { bad(`${file} 覆盖全部 17 项检查`, `缺：${missing.join(', ')}`); continue; }
+    if (JSON.stringify(docOrder) === JSON.stringify(probeOrder)) {
+      ok(`${file} 清单顺序 = 探针输出顺序`, `${docOrder.length} 项`);
+    } else {
+      bad(`${file} 清单顺序`, `文档：${docOrder.join(' > ')}\n     探针：${probeOrder.join(' > ')}`);
+    }
+  }
+}
+
 // ---- 3. 模板拷贝可用（按模板 README 指引：拷贝 + 改 import 行） ----
 console.log('  [3] 模板拷贝可用（改 import 后）');
 const work = mkdtempSync(path.join(tmpdir(), 'dsh-template-'));

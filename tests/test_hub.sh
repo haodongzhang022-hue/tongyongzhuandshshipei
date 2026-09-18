@@ -28,12 +28,12 @@ else
   bad "离线单元测试失败"; tail -20 /tmp/offline.log
 fi
 if "$NODE_BIN" "$ROOT/tests/test_attribution.mjs" > /tmp/attribution.log 2>&1; then
-  ok "归因离线回归全绿（61 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 判据表完备性）"
+  ok "归因离线回归全绿（69 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + 判据表完备性）"
 else
   bad "归因离线回归失败"; tail -20 /tmp/attribution.log
 fi
 if "$NODE_BIN" "$ROOT/tests/test_exports.mjs" > /tmp/exports.log 2>&1; then
-  ok "发布面自检全绿（exports 全解析 + 模板拷贝可用，16 项）"
+  ok "发布面自检全绿（exports 全解析 + 模板拷贝可用 + 文档清单顺序一致，19 项）"
 else
   bad "发布面自检失败"; tail -20 /tmp/exports.log
 fi
@@ -87,7 +87,7 @@ step "4. 归因端到端回归（真宿主；上游取消保留名 / 插件侧�
 "$NODE_BIN" "$ROOT/tests/test_e2e_regression.mjs" > /tmp/e2e.log 2>&1
 E2E_EXIT=$?
 if [[ "$E2E_EXIT" -eq 0 ]]; then
-  ok "归因端到端回归全绿（40 项；含 🔴-A / 🔴-B / 🔴-C 原始复现场景）"
+  ok "归因端到端回归全绿（43 项；含 🔴-A / 🔴-B / 🔴-C 原始复现场景 + attribution/verdict 双断言）"
 elif [[ "$E2E_EXIT" -eq 2 ]]; then
   echo "  ⚠️ 无宿主缓存，端到端回归跳过（前一步 verify 已建立缓存，正常不会走到这里）"
   ok "端到端回归显式跳过（不假装通过）"

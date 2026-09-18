@@ -35,11 +35,11 @@
 | 二级信息汇报 | `src/report/secondary.mjs` | 代码 | JSON + Markdown 双视图 |
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 59 项，无网可跑 |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 61 项：契约采集无残留 + 判据只读结构化字段（含 🔴-C 自由文本反例）+ 硬证据优先 + 判据表完备性（无网可跑） |
-| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 40 项：真宿主复现 🔴-A / 🔴-B / 🔴-C（漂移吞硬违规 + 自由文本翻案）场景 |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 60 项，无网可跑 |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 69 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + 判据表完备性（无网可跑） |
+| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 43 项：真宿主复现 🔴-A / 🔴-B / 🔴-C（漂移吞硬违规 + 自由文本翻案）场景，含 attribution + verdict 双断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程 |
-| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用（16 项） |
+| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序一致（19 项） |
 | 示例插件 | `tests/fixtures/demo-plugin.mjs` | 测试 | 同时是接入模板 |
 | 负例插件 | `tests/fixtures/broken-plugin.mjs` | 测试 | 验证护栏不静默失效 |
 | CI 流水线 | `.cnb.yml` | 配置 | push/PR/crontab/web_trigger |

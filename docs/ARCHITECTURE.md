@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 59 项 + 归因离线回归 48 项 + 发布面自检 16 项 ✅   归因端到端回归 34 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
+离线单测 60 项 + 归因离线回归 69 项 + 发布面自检 19 项 ✅   归因端到端回归 43 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
 ```
 
 ---
@@ -191,9 +191,9 @@ tongyongzhuandshshipei/
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 59 项离线单测（无网可跑）
-│   ├── test_attribution.mjs           # 48 项归因离线回归（契约采集无残留 + 判据结构化 + 🔴-C 硬证据优先 + 判据表完备性）
-│   ├── test_e2e_regression.mjs        # 34 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C 复现）
+│   ├── test_offline.sh                # 60 项离线单测（无网可跑）
+│   ├── test_attribution.mjs           # 69 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏）
+│   ├── test_e2e_regression.mjs        # 43 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C 复现，含 verdict 断言）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
 │   └── fixtures/{demo,broken}-plugin.mjs
@@ -300,7 +300,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 59 项 + 归因离线回归 48 项 + 发布面自检 16 项 + 归因端到端回归 34 项 + 负例拦下 | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 60 项 + 归因离线回归 69 项 + 发布面自检 19 项 + 归因端到端回归 43 项 + 负例拦下（含漂移窗口） | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |

@@ -21,6 +21,8 @@
 | R10 | **LOW** | 同层重复注册同名工具 | 插件多次 `apply` | `is already registered` 抛错 | `adapter.disposeAll()` / 独立 `Context` | 探针含 `lifecycle.*` 检查，CI 可发现 |
 
 | R16 | **MEDIUM** | 漂移相关性吞掉插件侧硬违规（历史缺陷，评审二轮 🔴-C）：上游放宽保留名校验时，插件声明保留名被归因为上游漂移 | 漂移窗口（`reservedName` 变化）+ 插件声明 `run_code` | 插件违规被甩给上游，责任错、修错方向；负例闸门同步静默失效 | 插件侧硬证据 `PLUGIN_HARD_EVIDENCE`（`guard.reserved_rejected`）**优先于**漂移相关性；相关性收窄为只对应中台自检 `guard.reserved_name`（不用 `guard.*` 通配） | 离线回归 [4b] + 端到端 [5]（同窗口健康插件仍须 PASS，防过度修正） |
+| R17 | **LOW** | 归因判据**扫自由文本**（历史缺陷，评审二轮 🔴-C 活口二）：宿主侧信号靠 `errors` 文本里的前缀字面量区分，插件侧 stack / 文件路径 / CI 工作目录恰好含 `fatal(host)` 即翻案 | 插件放在含 `fatal(host)` 的目录；或插件错误串原样透传上游日志 | 插件 bug 被报成「上游变了，不是你的问题」，修复方向错 | 宿主侧信号落**结构化字段** `hostFatal[]`（`pushHostFatal()` 同时写字段与人读日志）；归因判据**只读 `hostFatal[]` 与 check 名**，`errors[]` 退化为纯日志、任何判据不读 | 离线 [3.1] + 源码守卫（判据代码不得出现 `errors.join`/`errors.includes`/`HOST_FATAL_PREFIX`）；真宿主 [6]（插件目录名含 `fatal(host)` → 仍判插件）+ [7]（真漂移不丢：离线缺缓存 → `hostFatal` 非空） |
+| R18 | **MEDIUM** | **漂移窗口内首跑顺序影响后续归因**：漂移窗口内若先跑**健康**插件，该通道 `ok` → 漂移契约被写进基线，后续运行 `contractDrift.changed=false`，漂移信号消失 | 同一漂移窗口内先跑健康插件、再跑负例插件（或反之） | 排障时误判「没有漂移」；同一条命令在不同顺序下结论不同，责任判定被顺序左右 | 口径已明确（**非缺陷**，是「仅 ok 更新基线」的必要设计，不改）：① 判定漂移以**首次运行**或**干净副本**为准；② 复测/排障先跑负例或先隔离副本（`test_e2e_regression.mjs` 每个场景用全新仓库副本 + 独立 `TMPDIR` 缓存，正是为此）；③ 看 `attributionReasons` 里已无「契约指纹漂移」字样时，先查该通道基线是否被上一次 ok 运行刷新 | `docs/RISKS.md` 本行 + `tests/test_offline.sh`（基线只在 ok 时更新 / 失败不覆盖）已固化；排障规程见 `docs/ADAPTER_GUIDE.md` §4 |
 
 ## 待人类拍板项（不拍板则按现状执行）
 

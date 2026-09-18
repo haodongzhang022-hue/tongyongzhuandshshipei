@@ -129,7 +129,9 @@ function verify(pluginPath, tools, { tmp = SOURCE_CACHE, channelName = CHANNEL, 
     });
   } catch { /* 非零退出是预期路径之一；报告仍会落盘 */ }
   if (!existsSync(out)) throw new Error(`验收未产出报告（plugin=${pluginPath}）`);
-  return JSON.parse(readFileSync(out, 'utf8')).channels[0];
+  const full = JSON.parse(readFileSync(out, 'utf8'));
+  // 通道报告 + 顶层 summary：闸门断言要 verdict（评审要求「C 的用例必须断言 attribution 与 verdict」）
+  return { ...full.channels[0], summary: full.summary };
 }
 
 try {
@@ -142,6 +144,7 @@ try {
     ok('打补丁生效（模拟上游取消保留名）', `${patchedFiles} 个文件`);
     const report = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status', { tmp: patchedTmp });
     eq('上游接受 run_code 时健康插件仍 GREEN', 'PASS', report.attribution);
+    eq('上游接受 run_code 时 verdict=GREEN', 'GREEN', report.summary?.verdict);
     eq('上游接受 run_code 时无失败项（契约探测无残留）', 0, (report.checks ?? []).filter((c) => c.status === 'fail').length);
     eq('契约探测卸载 check 通过', 'pass', (report.checks ?? []).find((c) => c.name === 'contract.probe_disposed')?.status);
     eq('漂移如实记录 reservedName（不静默）', 'ACCEPTED(unexpected)', report.contract?.reservedName);
@@ -185,6 +188,7 @@ try {
   console.log('  [4] 负例插件（声明保留名）仍被拦下');
   const broken = verify(path.join(ROOT, 'tests/fixtures/broken-plugin.mjs'), 'broken_ok');
   eq('声明保留名 → PLUGIN_REGRESSION（基线一致时）', 'PLUGIN_REGRESSION', broken.attribution);
+  eq('声明保留名 → verdict=RED（不放行）', 'RED', broken.summary?.verdict);
   eq('失败项为 guard.reserved_rejected', true, (broken.checks ?? []).some((c) => c.name === 'guard.reserved_rejected' && c.status === 'fail'));
   // ---- 8. 🔴-C 原始复现：漂移窗口内插件侧硬违规不得被吞成上游漂移 ----
   // 上游放宽保留名校验（= reservedName 漂移）时，插件声明保留名仍必须判 PLUGIN_REGRESSION；
@@ -195,8 +199,11 @@ try {
   } else {
     const driftBroken = verify(path.join(ROOT, 'tests/fixtures/broken-plugin.mjs'), 'broken_ok', { tmp: patchedTmp });
     eq('漂移窗口 + 声明保留名 → PLUGIN_REGRESSION（不被漂移吞掉）', 'PLUGIN_REGRESSION', driftBroken.attribution);
+    // 评审要求：🔴-C 用例必须**同时断言 attribution 与 verdict**（只看 attribution 会漏掉闸门层）
+    eq('漂移窗口 + 声明保留名 → verdict=RED（不是 AMBER 放行）', 'RED', driftBroken.summary?.verdict);
     eq('漂移确实存在（reservedName 变了）', true, (driftBroken.contractDrift?.items ?? []).some((item) => item.field === 'reservedName'));
-    eq('失败项仍是 guard.reserved_rejected', true, (driftBroken.checks ?? []).some((c) => c.name === 'guard.reserved_rejected' && c.status === 'fail'));
+    eq('失败项仍是 guard.reserved_rejected（无噪音失败）', 'guard.reserved_rejected',
+      (driftBroken.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name).join(','));
     eq('归因理由链指向插件侧硬证据', true, (driftBroken.attributionReasons ?? []).some((reason) => reason.includes('guard.reserved_rejected')));
     eq('判决不是 AMBER（责任未被甩给上游）', true, driftBroken.attribution !== 'UPSTREAM_DRIFT');
     // 反向护栏：同一漂移窗口内，健康插件仍须 PASS（🔴-A 场景不得被打穿）
