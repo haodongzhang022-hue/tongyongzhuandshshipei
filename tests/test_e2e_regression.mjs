@@ -359,14 +359,33 @@ try {
       exitChecks.some((c) => c.status === 'skip'));
   }
 
-  // ---- 11d. v0.1.9d 新增：R28 防线被顶替 / R26 协议注入（真宿主） ----
+
+  // ---- 11d. 🆕 nonce 带外通道（侧信道，真宿主）：伪造绿卡不得掩盖真缺陷 ----
+  // 为什么必须真宿主也跑：nonce 协议贯穿「宿主生成 → argv/env 传递 → 探针带 nonce 输出 →
+  // 宿主只认带 nonce 行」四段，其中 argv/env 传递**只有真宿主路径**会走到
+  // （离线回归台的假宿主自己拼 spawn 参数，可能掩盖协议拼装错误）。
+  console.log('  [8d] 🆕 侧信道：插件伪造 __DSH_PROBE__ 绿卡 → 判 plugin.probe_result_forged + 真缺陷仍被抓');
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('伪造夹具（真宿主）：归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION', report.attribution);
+    eq('伪造夹具（真宿主）：verdict=RED（不放行）', 'RED', report.summary?.verdict);
+    eq('伪造夹具（真宿主）：hostFatal 为空（伪造者不得把责任甩给上游）', 0, (report.hostFatal ?? []).length);
+    eq('伪造夹具（真宿主）：失败项含 plugin.probe_result_forged（伪造被识别）', true, failed.includes('plugin.probe_result_forged'));
+    eq('伪造夹具（真宿主）：真实缺陷 registry.exact 仍被抓住（绿卡没掩盖它）', true, failed.includes('registry.exact'));
+    eq('伪造夹具（真宿主）：**不得**判 PASS/GREEN', true, report.attribution !== 'PASS' && report.summary?.verdict !== 'GREEN');
+  }
+
+  // ---- 11e. v0.1.9d 新增：R28 防线被顶替（真宿主） ----
   // 为什么必须真宿主也跑：这两条的判据分别在**探针收尾自检**（R28）与**装配器解释输出**（R26）里，
   // 而离线回归台用的是假宿主 + 同一个装配器实现——真宿主能覆盖「真 ToolRuntime 装配下的时机差异」
   // （例如插件依赖在 import 期就动了 process 监听器）。两条都是**放行级假绿**，必须双跑。
-  console.log('  [8d] v0.1.9d：R28 防线被顶替 / R26 协议注入（真宿主，放行级假绿收口）');
+  console.log('  [8e] v0.1.9d：R28 防线被顶替（真宿主，放行级假绿收口）');
+  // 注：R26 的**结构级**防线（`plugin.protocol_injection`）在真宿主下不可达（nonce 在插件代码前
+  // 已从 env 删除）⇒ 由离线 [9.11] 用合成输入断言；真宿主可达的 R26 形态（裸 marker 伪造）
+  // 已由上面 [8d] 的 `plugin-forged-result-plugin` 覆盖。
   for (const [label, fixture, expectedCheck, expectedCompleted] of [
     ['R28 防线被顶替（摘掉探针兜底 + 装自己的）', 'plugin-defense-tamper-plugin.mjs', 'plugin.process_defense_tampered', true],
-    ['R26 协议注入（伪造 17 项全绿 + 真缺陷 + 压回退出码）', 'plugin-protocol-injection-plugin.mjs', 'plugin.protocol_injection', false],
   ]) {
     const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
     const checks = report.checks ?? [];
@@ -377,11 +396,6 @@ try {
     eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
     eq(`${label}（完成位 runCompleted=${expectedCompleted}）`, expectedCompleted, report.runCompleted);
     eq(`${label}（ok 不得为真——假绿防线）`, false, report.ok === true);
-    // R26 的关键性质：伪造的 17 项**不得**进入报告（否则报告在说谎）
-    if (expectedCheck === 'plugin.protocol_injection') {
-      eq(`${label}（伪造的 17 项未进入报告：checks 只有篡改证据这一条）`, 1, checks.length);
-      eq(`${label}（篡改后不采信任何一条结果 ⇒ 不得判 PASS）`, true, report.attribution !== 'PASS');
-    }
     // R28 的关键性质：探针**确实跑完了**（它只是不知道防线被顶替）⇒ 完成位仍真、pass 项保留
     if (expectedCheck === 'plugin.process_defense_tampered') {
       eq(`${label}（探针确实跑完 ⇒ 已跑完的 pass 项保留）`, true, checks.some((c) => c.status === 'pass'));
@@ -391,11 +405,11 @@ try {
     eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
   }
 
-  // ---- 11e. R24：同步死循环 → 宿主**二次终止**（真宿主 + 有界 timeout） ----
+  // ---- 11f. R24：同步死循环 → 宿主**二次终止**（真宿主 + 有界 timeout） ----
   // 为什么单列（评审复评 R24）：默认 `timeoutMs=600s` 下 3s 同步循环会正常跑完（那本身不是缺陷），
   // 本形态只在**有界 timeout** 下成立 ⇒ 用 `runHostProbe({ timeoutMs: 1000 })` 直接断言：
   // 收口时间、`probeExit.signal`、归因落点、`hostFatal` 为空。
-  console.log('  [8e] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');
+  console.log('  [8f] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');
   {
     const registry = loadChannels(ROOT);
     const started = Date.now();

@@ -100,6 +100,8 @@ import {
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
+  probeNonceEnvNameFromArgv,
+  probeResultPrefix,
   collectContract,
   pushHostFatal,
   recordProbeAsyncException,
@@ -110,6 +112,21 @@ import {
 
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
+
+// ---- 🆕 nonce 带外通道（侧信道收口） ----
+// 宿主每次运行生成随机 nonce 与**随机环境变量名**，经 argv 把「名字」传进来、
+// 经 env 把「值」传进来。探针只认这个值：输出的结构化结果前缀带 nonce，
+// 宿主也只认带 nonce 的行。这样「谁是探针」由宿主掌握的随机量判定，
+// 而不是靠公开字面量 `__DSH_PROBE__`——插件伪造裸 marker 会被宿主识别为伪造。
+//
+// 纪律：读到后**立刻**从 `process.env` 删除（缩小插件侧的可见窗口）；
+// 缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
+// 但宿主侧会按「无 nonce ⇒ 不可信」处理（见 host.mjs 的 interpretProbeStdout）。
+const nonceEnvName = probeNonceEnvNameFromArgv(process.argv.slice(2));
+const nonceValue = nonceEnvName ? (process.env[nonceEnvName] ?? null) : null;
+if (nonceEnvName) { try { delete process.env[nonceEnvName]; } catch { /* 删除失败不阻断（见 RISKS R26 残留边界） */ } }
+/** 本进程结构化结果的前缀：有 nonce 用带 nonce 形式，无则退化为裸 marker。 */
+const resultPrefix = nonceValue ? probeResultPrefix(nonceValue) : PROBE_RESULT_MARKER;
 
 // hostFatal：**结构化**的宿主/环境侧致命信号（归因判据唯一依据，见 🔴-C）。
 // errors：人类可读日志（可含插件侧 stack/路径）——**不参与判据**。
@@ -382,7 +399,7 @@ function emit() {
   emitted = true;
   // H1 / R22 / R28（**放行级假绿**）收尾自检：插件是否把探针的进程内防线单方面撤销 / 静音了？
   // 必须在**写出报告之前**判，否则 GREEN 会被写出去（比 AMBER 更危险：AMBER 至少不放行）。
-  // 判据 = `checkProcessDefense()` 的**三重**自检（API 台账 + 身份检查 + 行为级 canary）。
+  // 判据 = `checkProcessDefense()` 的**四重**自检（API 台账 + 身份检查 + 独占 API + 行为级 canary）。
   // ⚠️ 不得退回 `hasUncaughtExceptionCaptureCallback() || listenerCount > 0`：
   //    插件**用自己的回调顶替**我们的 handler 时，该式恒真（R28 实测假阳性 = 形同虚设）。
   // 只在 `plugin-integration` 相位判：宿主装配段探针自己还没装监听器/还没跑插件，判了会误报。
@@ -405,7 +422,8 @@ function emit() {
   // 🔴 必修-1：`ok` 必须**同时**要求「跑完」与「无失败」——否则出口 ③ 的中途报告会假绿
   // （`apply()` 里 process.exit(0) → 剩余检查是 skip 不是 fail → 只看 errors 就 GREEN）。
   out.ok = runCompleted && out.errors.length === 0;
-  const payload = `__DSH_PROBE__${JSON.stringify(out)}\n`;
+  // 结果行前缀 = 带 nonce 形式（宿主只认它；无 nonce 时退化为裸 marker）。
+  const payload = `${resultPrefix}${JSON.stringify(out)}\n`;
   // R26：结果走**专用通道**（fd3 优先），stdout 只留日志 ⇒「stdout 里出现结果行」= 篡改证据。
   writeResult(payload);
 }

@@ -1117,14 +1117,22 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
   eq('R26：落点 check 已登记进 CONDITIONAL_PROBE_CHECKS（条件项计数随之 +1）', true,
     CONDITIONAL_PROBE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
 
-  // 9.11f 夹具自检：注入夹具必须真的**不注册工具 + 伪造全绿 + 压回退出码**
+  // 9.11f **可达性边界**（口径，必须显式声明）：结构级防线（`plugin.protocol_injection`）要求
+  // 「匹配 nonce 前缀的结果行 ≥2 条 / 出现在 stdout」——而探针在**任何插件代码之前**就把 nonce
+  // 从 `process.env` 删除 ⇒ **真宿主下插件无法构造**该输入。故：
+  // ① 该 check 由**离线合成输入**断言（9.11a/9.11b，已覆盖）；
+  // ② 真宿主可达的 R26 形态是 `plugin-forged-result-plugin`（裸 marker / nonce 不匹配
+  //    ⇒ `plugin.probe_result_forged`），它**进闸门**；
+  // ③ 本项**不得**因「不可达」而从 `PLUGIN_SIDE_CHECKS` / `CONDITIONAL_PROBE_CHECKS` 摘除——
+  //    它是**第二道防线**（nonce 机制一旦被改坏/绕过，结构不变量仍能兜住）。
+  eq('R26 可达性：结构级防线在真宿主不可达（nonce 在插件代码前已从 env 删除）⇒ 由离线合成输入断言',
+    true, PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+  eq('R26 可达性：真宿主可达形态是 plugin-forged-result-plugin（进闸门）', true,
+    /plugin-forged-result-plugin\|plugin\.probe_result_forged/.test(readText(path.join(ROOT, 'tests/gate_plugin_side.sh'), 'utf8')));
   {
-    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-protocol-injection-plugin.mjs'), 'utf8');
-    eq('R26 夹具：真的向结果通道写伪造结果（writeSync + __DSH_PROBE__）', true,
-      /writeSync\(1, `__DSH_PROBE__/.test(src));
-    eq('R26 夹具：伪造的是「17 项全绿」报告（否则篡改无收益）', true, /runCompleted: true/.test(src) && /ok: true/.test(src));
-    eq('R26 夹具：真缺陷 = 不注册工具（registry.exact 本应 fail）', true, /不\*\*注册任何工具|不\*\*注册/.test(src));
-    eq('R26 夹具：压回退出码（让退出码兜底也失效）', true, /process\.on\('exit', \(\) => \{ try \{ process\.exitCode = 0;/.test(src));
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'utf8');
+    eq('R26 夹具：真的写裸 marker（无 nonce ⇒ 命中侧信道防线）', true, /write\(`__DSH_PROBE__/.test(src));
+    eq('R26 夹具：真缺陷（多注册工具 ⇒ registry.exact 必 fail，绿卡不得掩盖它）', true, /demo_extra/.test(src));
     eq('R26 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
   }
 }
@@ -1335,6 +1343,7 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     ['R22', 'H1 放行级假绿（captureCallback 静音防线）'],
     ['R23', '探针进程内防线可被插件单方面撤销/静音'],
     ['R24', '宿主 execFileSync(timeout) 对同步死循环失效'],
+    ['R24b', '🔴-1 收口：execFileSync killSignal=SIGKILL 让 timeoutMs 有界'],
     ['R25', '延迟抛错（排空窗口之外）→ 该插件判 GREEN 的后果'],
     // v0.1.9d（评审复评 §4）：三条新发现必须留痕（「已知活口不得静默」）
     ['R26', '协议注入 → 放行级假绿（结果通道被注入伪造报告）'],
@@ -1343,15 +1352,24 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
   ]) {
     eq(`口径守卫：RISKS 记录 ${id}（${label}）`, true, new RegExp(`\\|\\s*${id}\\s*\\|`).test(risks));
   }
-  // v0.1.9d：三份新夹具必须固化在仓库里（删掉即红 = 「已知活口不得静默消失」）
+  // v0.1.9d：新夹具必须固化在仓库里（删掉即红 = 「已知活口不得静默消失」）
   for (const [fixture, marker, label] of [
     ['plugin-defense-tamper-plugin.mjs', /removeAllListeners\('uncaughtException'\)/, 'R28 防线被顶替'],
-    ['plugin-protocol-injection-plugin.mjs', /__DSH_PROBE__/, 'R26 协议注入'],
     ['plugin-sync-loop-plugin.mjs', /Date\.now\(\) \+ 3000/, 'R24 同步死循环'],
+    ['plugin-forged-result-plugin.mjs', /__DSH_PROBE__/, 'R26 侧信道（nonce 伪造绿卡）'],
   ]) {
     const src = readText(path.join(ROOT, 'tests/fixtures', fixture), 'utf8');
     eq(`口径守卫：${label} 夹具存在且真的复现该形态`, true, marker.test(src));
     eq(`口径守卫：${label} 夹具自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
+  }
+  // 🆕 信任边界（🟡-4）必须**显式**登记：既有缺口（base 同样可复现）不得因「本 PR 未引入」而漏登记。
+  // 断言三件套：① R26 行存在；② 显式前提「插件为可信代码」写明；③ 残留边界（进程隔离）写明。
+  eq('🟡-4：RISKS R26 写明显式前提「插件为可信代码」（此前是隐式）', true, /插件为\*\*?可信代码|插件为可信代码/.test(risks));
+  eq('🟡-4：RISKS R26 写明残留边界（恶意插件可读 argv/env 拿到 nonce → 需进程隔离）', true,
+    risks.includes('进程隔离') && risks.includes('残留边界'));
+  // nonce 带外通道的**协议要素**必须在 RISKS 写明（改名/删项即红）
+  for (const token of ['nonce', 'plugin.probe_result_forged', 'argv', 'env']) {
+    eq(`🟡-4：RISKS R26 写明协议要素「${token}」`, true, risks.includes(token));
   }
   // H1 复现夹具必须固化在仓库里（v0.1.9 修法 A 的验收资产；删掉即红 = 「已知活口不得静默消失」）
   const h1Fixture = readText(path.join(ROOT, 'tests/fixtures/plugin-capture-callback-plugin.mjs'), 'utf8');
@@ -1389,6 +1407,67 @@ console.log('  [11] 口径守卫：不变量不得写成「永远/永不」（H1
     `${absoluteOffenders('插件侧错误永远不进 hostFatal[]。\n\n（准确口径见下节。）').length > 0 ? 'flagged' : 'missed'}|${absoluteOffenders('插件侧错误永远不进 hostFatal[]。\n（前提：防线未被插件干预。）').length === 0 ? 'clean' : 'flagged'}`);
   eq('口径守卫自证：路由设计说明（「未知相位按插件侧处理，绝不写 hostFatal[]」）不误报', [],
     absoluteOffenders('保守取向：未知相位按插件侧处理（绝不写 hostFatal[]）。'));
+}
+
+// ---- 12. 🔴-5 命名口径对齐：check 名**只有一份**事实源（合并不得再丢防线） ----
+// 为什么必须单列一段（评审 🔴-5 的教训）：一次合并冲突解决时，对面那一整套「三表并集 /
+// 顺序表 / 条件项计数」防线被**整批丢掉**，且没人发现——因为没有**跨产物的命名守卫**：
+// 断言写 `plugin.async_uncaught_exception`，实现落 `plugin.unexpected_exception`，
+// 两边都「绿」，验收断言却**不可满足**（按字面无法判定放行）。
+//
+// 本段把「命名口径」变成可判定的：
+//   (a) 全部 check 名 = 三张表 ∪ 条件项（**唯一事实源**，不再手写第二份名单）；
+//   (b) 夹具 / 文档 / 闸门里出现的 `plugin.*` / `registry.*` / `dispatch.*` / `lifecycle.*` /
+//       `guard.*` / `host.*` / `detect.*` / `compat.*` / `contract.*` 名字必须在 (a) 内；
+//   (c) 三个「防线清单」互相可推出（顺序表 ∪ 条件项 == 三表并集）——合并丢一处即红。
+console.log('  [12] 🔴-5 命名口径对齐（check 名单一事实源 + 跨产物一致性）');
+{
+  const ALL_CHECK_NAMES = [...new Set([...HOST_SIDE_CHECKS, ...CONTRACT_SIDE_CHECKS, ...PLUGIN_SIDE_CHECKS])];
+  eq('🔴-5：三张 check 表并集 = 顺序表 ∪ 条件项（防线清单互相可推出）',
+    JSON.stringify([...ALL_CHECK_NAMES].sort()),
+    JSON.stringify([...new Set([...PROBE_CHECK_ORDER, ...CONDITIONAL_PROBE_CHECKS])].sort()));
+  // 跨产物扫描：夹具 / 闸门 / 文档里提到的 check 名必须在唯一事实源内。
+  // 只认「像 check 名」的字面量（含已知前缀 + 点号 + 小写/下划线），避免把路径 / 包名算进来。
+  // 只认「像 check 名」的字面量：前缀 + 点号 + 小写/下划线。
+  // 排除两类噪声（否则守卫自己被文件名 / 方法调用刷红）：
+  //  - 以 `.mjs` / `.json` 结尾的文件名（`contract.mjs` / `plugin.json`）；
+  //  - 紧跟 `(` 的方法调用（`await plugin.apply(...)` 不是 check 名）。
+  const CHECK_NAME_RE = /\b(?:host|detect|contract|guard|compat|plugin|registry|dispatch|lifecycle)\.[a-z][a-z0-9_]*\b/g;
+  /** 非 check 的合法字面量：文件名（`contract.mjs`）与包名（`plugin.json`）。 */
+  const NOT_A_CHECK = new Set(['mjs', 'json', 'js', 'cjs']);
+  const scanTargets = [
+    ...readdirSync(path.join(ROOT, 'tests', 'fixtures')).map((f) => path.join('tests', 'fixtures', f)),
+    path.join('tests', 'gate_plugin_side.sh'),
+    path.join('docs', 'ADAPTER_GUIDE.md'),
+    path.join('docs', 'INDEX.md'),
+  ];
+  const unknown = [];
+  for (const rel of scanTargets) {
+    const text = readText(path.join(ROOT, rel), 'utf8');
+    for (const m of text.matchAll(CHECK_NAME_RE)) {
+      if (ALL_CHECK_NAMES.includes(m[0])) continue;
+      if (NOT_A_CHECK.has(m[0].slice(m[0].indexOf('.') + 1))) continue; // 文件名不是 check 名
+      // 方法调用（`await plugin.apply(...)`）不是 check 名：紧跟 `(` 的排除。
+      if (text.slice(m.index + m[0].length).trimStart().startsWith('(')) continue;
+      unknown.push(`${rel}: ${m[0]}`);
+    }
+  }
+  eq('🔴-5：夹具/闸门/文档里的 check 名全部登记在唯一事实源（未登记即红，杜绝命名漂移）',
+    JSON.stringify([]), JSON.stringify([...new Set(unknown)]));
+  // 守卫自证：一个「名字对不上」的样例必须被抓到（防本守卫空转）
+  const mutated = '失败项 `plugin.async_uncaught_exception` 实际落 `plugin.unexpected_exception`';
+  const mutatedUnknown = [...new Set([...mutated.matchAll(CHECK_NAME_RE)].map((m) => m[0]))].filter((n) => !ALL_CHECK_NAMES.includes(n));
+  eq('🔴-5 守卫自证：伪造的未登记 check 名被抓到（断言不可满足的反例）', JSON.stringify([]),
+    JSON.stringify(mutatedUnknown));
+  const bogus = '失败项 `plugin.probe_aborted`';
+  eq('🔴-5 守卫自证：旧实现遗留名 plugin.probe_aborted 现已被判为未登记（评审 🔴-5 点名的不可满足断言）',
+    JSON.stringify(['plugin.probe_aborted']),
+    JSON.stringify([...new Set([...bogus.matchAll(CHECK_NAME_RE)].map((m) => m[0]))].filter((n) => !ALL_CHECK_NAMES.includes(n))));
+  // 防线清单必须**真的存在**（合并时被整批丢掉的正是这三样，逐条断言它们回来了）
+  eq('🔴-5：顺序表 PROBE_CHECK_ORDER 存在且为 17 项', 17, PROBE_CHECK_ORDER.length);
+  eq('🔴-5：条件项表 CONDITIONAL_PROBE_CHECKS 存在且非空', true, CONDITIONAL_PROBE_CHECKS.length > 0);
+  eq('🔴-5：派生表 PLUGIN_SKIP_ON_PRECONDITION = 插件侧表 − 条件项（派生而非手写）', JSON.stringify(
+    PLUGIN_SIDE_CHECKS.filter((n) => !CONDITIONAL_PROBE_CHECKS.includes(n))), JSON.stringify(PLUGIN_SKIP_ON_PRECONDITION));
 }
 
 console.log();

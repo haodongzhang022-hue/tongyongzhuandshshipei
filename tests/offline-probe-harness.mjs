@@ -25,8 +25,9 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { interpretProbeStdout, probeSpawnOptions } from '../src/harness/host.mjs';
-import { PROBE_PHASE } from '../src/harness/contract.mjs';
+import { PROBE_PHASE, createProbeNonce } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { loadChannels } from '../src/harness/host.mjs';
 
@@ -107,20 +108,22 @@ export function runOfflineProbe(options) {
 
     // 3. 跑探针（子进程；非零退出是预期路径之一，stdout / 结果通道仍要拿回来）
     //
-    // ⚠️ 这里**镜像生产路径**（`host.mjs` 的 `probeSpawnOptions()`）：`spawnSync` + 结果走 fd3
-    // （R26 通道隔离）。若这里退回 `execFileSync` 只读 stdout，本回归台就测不到「通道隔离」这一层
-    // ——回归台与生产路径不同构，等于把防线留在 CI 之外。
+    // ⚠️ 这里**镜像生产路径**（`host.mjs` 的 `probeSpawnOptions()`）：`spawnSync` + nonce 带外通道
+    // + 结果走 fd3（R26 两条防线）。若这里退回 `execFileSync` 只读 stdout、或自己拼 spawn 参数，
+    // 本回归台就测不到「通道隔离 / nonce 协议拼装」这两层——回归台与生产路径不同构，
+    // 等于把防线留在 CI 之外。
+    const nonce = createProbeNonce(randomBytes);
     let stdout = '';
     let resultFd = '';
     let exit = { status: 0, signal: null };
-    const probeOptions = probeSpawnOptions({ hubRoot: ROOT, pluginPath, expectedTools, timeoutMs });
+    const probeOptions = probeSpawnOptions({ hubRoot: ROOT, pluginPath, expectedTools, timeoutMs, nonce });
     const probeRun = spawnSync('node', probeOptions.args, {
       ...probeOptions,
       cwd: work,
       // 唯一与生产不同的一处：stderr 也接回（生产是 `inherit`，让 CI 日志看得见探针的原始报错）。
       // 回归台若 inherit，负例夹具的 stack 会直接打进测试输出、淹没断言结果。
       stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
+      env: { ...process.env, [nonce.envName]: nonce.value, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
     });
     stdout = `${probeRun.stdout ?? ''}`;
     resultFd = `${probeRun.output?.[3] ?? ''}`;
@@ -133,7 +136,7 @@ export function runOfflineProbe(options) {
       install: 'fake-host', cacheHit: false, durationMs: 0,
     };
     result.probeExit = exit;
-    interpretProbeStdout(result, stdout, resultFd);
+    interpretProbeStdout(result, stdout, { resultFd, nonce: nonce.value });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');
     return { result, attribution: detail.attribution, reasons: detail.reasons, exit, stdout, resultFd, stderr: `${probeRun.stderr ?? ''}` };

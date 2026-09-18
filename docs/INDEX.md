@@ -32,7 +32,7 @@
 | 工具契约适配 | `src/compat/tool.mjs` | 代码 | 保留名护栏 / 默认 render / 取消语义 |
 | 一站式适配器 | `src/adapter.mjs` | 代码 | 插件侧唯一 import 面 |
 | 隔离宿主装配 | `src/harness/host.mjs` | 代码 | 真宿主 + 缓存 + 离线 |
-| 验收探针 | `src/harness/probe-template.mjs` | 代码 | 17 项检查 + **7 项条件检查**（临时目录内执行；**按相位**归因：宿主装配段信号落结构化 `hostFatal[]`，插件集成段一律落 check；**四条出口**逐条闭合——同步 `catch` / `uncaughtException`+`unhandledRejection` / `process.on('exit')`+信号 / **无条件**看门狗；**完成位** `runCompleted` 使「未跑完」绝不假绿；另打相位信标供不可捕获终止归因） |
+| 验收探针 | `src/harness/probe-template.mjs` | 代码 | 17 项检查 + **8 项条件检查**（临时目录内执行；**按相位**归因：宿主装配段信号落结构化 `hostFatal[]`，插件集成段一律落 check；**四条出口**逐条闭合——同步 `catch` / `uncaughtException`+`unhandledRejection` / `process.on('exit')`+信号 / **无条件**看门狗；**完成位** `runCompleted` 使「未跑完」绝不假绿；另打相位信标供不可捕获终止归因） |
 | 契约指纹采集 | `src/harness/contract.mjs` | 代码 | 探测后**立即卸载**（可离线单测；防残留污染工具清单）；★ 归因判据表唯一事实源（`HOST_FATAL_FIELD` / 三张 check 表 / `PROBE_CHECK_ORDER` / `CONDITIONAL_PROBE_CHECKS` / 相位路由） |
 | 双通道验收 | `src/verify/runner.mjs` | 代码 | 判决 + 归因（漂移相关性表**从 `triage` import**，不在此硬编码） |
 | 上游侦测 | `src/watch/upstream.mjs` | 代码 | dist-tag 漂移 + 契约 diff |
@@ -40,9 +40,9 @@
 | 二级信息汇报 | `src/report/secondary.mjs` | 代码 | JSON + Markdown 双视图 |
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 113 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 [16]**） |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 387 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9]（无网可跑） |
-| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 149 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** 场景，含 attribution + verdict + **完成位**三重断言 |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 124 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🆕 nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**v0.1.9d R28/R26/R24 三形态 [18]**） |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 401 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **v0.1.9d [9.10] R28 判据 / [9.11] R26 协议注入 / [9.12] R24 行为级**（无网可跑） |
+| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 146 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d] 侧信道 / [8e] R28+R26 / [8f] R24** 场景，含 attribution + verdict + **完成位**三重断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 4b 步插件侧闸门 / 第 7 步「文档计数防漂移」） |
 | 插件侧闸门 | `tests/gate_plugin_side.sh` | 测试 | ★ 唯一事实源：四条出口 + SIGKILL 边界 + **防过度修正**（健康插件 17/17）；`.cnb.yml` push/PR 两段共用同一份 |
 | 离线探针回归台 | `tests/offline-probe-harness.mjs` | 测试 | 最小假宿主 + 真实探针子进程 + **装配器真实实现**解释输出（秒级覆盖四条出口；边界：假宿主通过 ≠ 真宿主适配通过） |
@@ -55,7 +55,9 @@
 | 负例插件（🔴 边界） | `tests/fixtures/plugin-sigkill-plugin.mjs` | 测试 | **不可捕获**终止（`SIGKILL`）→ 按相位信标落 `plugin.abnormal_termination`、`hostFatal=[]` |
 | 负例插件（H1/R28 防线干预） | `tests/fixtures/plugin-defense-tamper-plugin.mjs` | 测试 | 摘掉探针 handler 后装**自己的**（计数判据假阳性形态）→ `plugin.process_defense_tampered`、`hostFatal=[]` |
 | 负例插件（R24 同步死循环） | `tests/fixtures/plugin-sync-loop-plugin.mjs` | 测试 | `apply()` 内**同步**死循环（3s）→ 宿主 `killSignal:'SIGKILL'` 二次终止收口，`plugin.abnormal_termination`（信标）/ `hostFatal=[]` |
-| 负例插件（R26 协议注入） | `tests/fixtures/plugin-protocol-injection-plugin.mjs` | 测试 | 向结果通道**注入伪造结果**（17 项全绿 + 真缺陷）→ `plugin.protocol_injection`、`hostFatal=[]`、不放行 |
+| 负例插件（🆕 侧信道） | `tests/fixtures/plugin-forged-result-plugin.mjs` / `plugin-event-loop-hog-plugin.mjs` | 测试 | 伪造裸 marker 绿卡 → `plugin.probe_result_forged`；永久占死事件循环 → timeoutMs **有界**（SIGKILL） |
+| 负例插件（H1/R28 防线干预） | `tests/fixtures/plugin-defense-tamper-plugin.mjs` | 测试 | 摘掉探针 handler 后装**自己的**（计数判据假阳性形态）→ `plugin.process_defense_tampered`、`hostFatal=[]` |
+| 负例插件（R24 同步死循环） | `tests/fixtures/plugin-sync-loop-plugin.mjs` | 测试 | `apply()` 内**同步**死循环（3s）→ 宿主 `killSignal:'SIGKILL'` 二次终止收口，`plugin.abnormal_termination`（信标）/ `hostFatal=[]` |
 | CI 流水线 | `.cnb.yml` | 配置 | push/PR/crontab/web_trigger |
 | 页面按钮 | `.cnb/web_trigger.yml` | 配置 | 人不用记命令 |
 
@@ -94,7 +96,7 @@
 > 序号 = **探针实际输出顺序**（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
 
-**另有 7 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `src/harness/contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS`）：
+**另有 8 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `src/harness/contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS`）：
 
 | 条件检查 | 出口 | 触发场景 |
 |---|---|---|
@@ -105,6 +107,7 @@
 | `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM）——探针来不及写报告，装配器按**相位信标**归因 |
 | `plugin.process_defense_tampered` | ⑤ 防线被静音 | 插件抢占 `setUncaughtExceptionCaptureCallback`（Sentry / APM / 日志库常见）或 `removeAllListeners` ⇒ 探针进程级兜底被**静音**，后台抛错不可见 → 探针收尾自检判本项（**防放行级假绿**） |
 | `plugin.protocol_injection` | ⑥ 结果通道被注入 | 插件向探针的结果通道**注入伪造结果**（抢首位 / 多结果行 / 走错通道）⇒ 真报告被顶替 → 装配器 `interpretProbeStdout()` 判本项（**防放行级假绿**） |
+| `plugin.probe_result_forged` | 🆕 侧信道 | 探针输出面出现**无 nonce / nonce 不匹配**的结构化结果行（插件自造绿卡 / 甩锅上游）⇒ 装配器只认带 nonce 的报告，伪造即判本项（与 ⑥ 是**两条独立证据链**） |
 
 > 本表项数由 `tests/test_exports.mjs` 断言与 `CONDITIONAL_PROBE_CHECKS.length` 相等（改一处漏一处即红）。
 > 「17 项 ∪ 条件项 == 三张 check 表并集」与「`PROBE_CHECK_ORDER` == 探针实际输出顺序」由

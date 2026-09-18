@@ -72,7 +72,10 @@ main:
             # ⚠️ 口径前提（v0.1.9b 收窄，评审复评 H1）：以「探针进程内防线未被插件干预」为前提——
             #    插件可 setUncaughtExceptionCaptureCallback() 静音防线（放行级假绿），见 docs/RISKS.md R22/R23。
             # 四条出口（同步 / 异步 / 进程 exit / run() 被拖住）+ 不可捕获边界（SIGKILL）
+            # + 侧信道（🆕 nonce：伪造 __DSH_PROBE__ 绿卡 → 判 plugin.probe_result_forged）
             # + **防过度修正**（健康插件仍须 17/17 GREEN）。
+            # 断言口径（🟡-3）：逐夹具断言**完整失败项集合**（多一条噪音失败也红），
+            # 不再只断「含期望项」——后者会静默放行夹具退化出的额外失败。
             #
             # 口径与夹具清单的唯一事实源是 tests/gate_plugin_side.sh —— push 段与 PR 段
             # **共用同一份**（评审 🟢 重复项：此前两段各自维护，54 行差异 ⇒ 迟早一处加了
@@ -133,7 +136,7 @@ main:
         - name: plugin-error-not-host-signal
           script: |
             # 🔴-D / 🔴 必修-2/3 闸门（同 push 段，**同一份脚本**）：
-            # 四条出口 + 不可捕获边界 + 防过度修正（健康插件 17/17）。
+            # 四条出口 + 不可捕获边界 + 🆕 侧信道（nonce 伪造）+ 完整失败项集合 + 防过度修正（健康插件 17/17）。
             DSH_PROBE_RUN_WATCHDOG_MS=5000 bash tests/gate_plugin_side.sh
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
