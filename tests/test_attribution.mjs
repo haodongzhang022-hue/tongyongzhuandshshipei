@@ -1755,6 +1755,9 @@ console.log('  [9.13] 🔴 必修-4 同族假绿：猴子补丁 JSON.stringify�
 
 
 // ---- 9.14. R26 残留边界②（**fail-open**）：fd3 隔离在「探针未 emit」时回退信任 stdout ----
+// ⚠️ 本段在 v0.2.5 被 **🔴-R3′ 的宿主侧通道观测**部分收窄：**自称走 fd3 而宿主侧 fd3 为空**的
+//   形态（原「形态 D」）**不再被采信**（判 `plugin.protocol_injection`，见 [9.15]）。
+//   仍未收窄的是「伪造行写进 **fd3 本身**」（原「形态 C」）——那需要批 2 的「独立 fd 且永不回退 stdout」。
 // 为什么单列（评审复评 §四，本轮实测）：结果通道隔离的判定依据是「**fd3 有没有内容**」
 // （`isolated = channelText.trim().length > 0`），而**不是**「探针**是否**报告过」。于是：
 //   · 探针**正常 emit** → fd3 有内容 → `isolated=true` → 插件多出来的那条行 = 篡改证据 → RED；
@@ -1797,13 +1800,18 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
     eq('R26 残留②：形态 C 无任何篡改证据（`checks` 里只有伪造项）', 0,
       r.checks.filter((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK).length);
   }
-  // ② 形态 D：伪造写 **stdout**、探针**来不及 emit** ⇒ **同样**被采信
-  //    ⇒ 证明「写对通道」不是使能条件（评审复评 §二-② 的实测结论）
+  // ② 形态 D：伪造写 **stdout**、探针**来不及 emit** ⇒ **v0.2.5 起不再被采信**（🔴-R3′ 的修法）
+  //    判据：报告**自称**走 fd3（`resultChannel === 'fd3'`）而**宿主侧 fd3 为空**、stdout 却有
+  //    匹配 nonce 的结果行 ⇒ 通道被重定向 ⇒ 判 `plugin.protocol_injection`、不采信任何一条。
+  //    ⚠️ 与形态 C 的分工：C 把伪造行写进 **fd3 本身**（宿主侧"有内容"）⇒ 本判据**不**命中，
+  //    仍属批 2 残留边界。⇒「写对通道」不是使能条件，但**「自称的通道与宿主侧观测矛盾」**是铁证。
   {
     const r = run(forgedLine, '');
-    eq('R26 残留②（fail-open·形态 D）：**给定已拿到 nonce** + 伪造写 **stdout** + 探针未 emit ⇒ **同样**被采信',
-      true, r.ok === true);
-    eq('R26 残留②：C/D 两形态**同判**（⇒ 通道选择不是关键，写对 fd3 不是使能条件）', true,
+    eq('R26 残留②（形态 D，v0.2.5 起收窄）：自称 fd3 + 宿主侧 fd3 为空 + stdout 有匹配 nonce 行 ⇒ **不得**被采信',
+      false, r.ok === true);
+    eq('R26 残留②：形态 D 判 plugin.protocol_injection（宿主侧通道观测交叉校验）', true,
+      r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('R26 残留②：C/D 两形态**不再同判**（C 仍属批 2 残留边界；D 已被宿主侧观测收窄）', false,
       run('', forgedLine).ok === run(forgedLine, '').ok);
   }
   // ③ 对照（防线**生效**形态）：探针 emit（fd3 有真报告）+ stdout 出现伪造行 ⇒ 判篡改、不放行
@@ -1837,6 +1845,134 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
     eq('R26 残留②：REDO-PROPOSAL 形态表登记 fail-open 形态（⑤b）', true, redo.includes('| ⑤b |'));
   }
   eq('R26 残留②：本段为「已知边界」的显式锚点（批 2 落地后必须翻面为「不得被采信」）', true, FAIL_OPEN_KNOWN);
+}
+
+// ---- 9.15. 🔴-R3′（评审复评，收窄后的活口）：结果通道**重定向** + 压退出码 ⇒ 宿主侧通道观测交叉校验 ----
+// 为什么单列（评审 §3）：`plugin.exit_code_mismatch` 的判据是「报告 `ok=true` 而退出码非 0」——
+// 但**退出码与报告同属探针进程的可写状态**：插件在 `'exit'` 钩子里 `process.exitCode = 0` 即可压掉。
+// 完整形态（本仓夹具 `plugin-channel-redirect-plugin`，真宿主实测）：
+//   ① `closeSync(3)` + `openSync(<file>)` ⇒ **fd3 被换成普通文件**（宿主侧管道读端只见 EOF）；
+//   ② 探针收尾把**真报告**写进那个文件 ⇒ 插件在 `'exit'` 钩子里读回它，**连 nonce 前缀一起拿到**
+//      （不必反读 env / argv —— 探针自己把凭据写给了它）；
+//   ③ 用该前缀把全绿卡写进 **stdout**，并压 `process.exitCode = 0`。
+// ⇒ 旧实现三条防线全失效：`isolated=false` ⇒ 回退信任 stdout（伪造行成为唯一 marker）；
+//   退出码被压成 0 ⇒ 退出码交叉不命中 ⇒ **GREEN 放行**（真缺陷 `registry.exact` 被绿卡掩盖）。
+//
+// 收口判据（**宿主侧通道观测**）：报告**自称**走 fd3 而**宿主侧该通道无任何内容**、且 stdout
+// 反而出现**匹配 nonce** 的结果行 ⇒ 判 `plugin.protocol_injection`、**不采信任何一条**。
+// 为什么这条腿插件压不掉：它**只依赖宿主进程看到的东西**（管道读端为空），不依赖探针自报、
+// 也不依赖退出码 ⇒ 防线从「报告 + 退出码」两条信道升级为「+ **宿主侧通道观测**」三条。
+console.log('  [9.15] 🔴-R3′：通道重定向 + 压退出码（宿主侧通道观测交叉校验）');
+{
+  const mkPayload = (channel = 'fd3') => JSON.stringify({
+    checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [],
+    ok: true, runCompleted: true, phase: 'plugin-integration', resultChannel: channel,
+  });
+  const nonce = createProbeNonce(randomBytes).value;
+  const line = (payload) => `${probeResultPrefix(nonce)}${payload}\n`;
+  const run = (stdout, resultFd) => {
+    const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly', runCompleted: false };
+    interpretProbeStdout(r, stdout, { resultFd, nonce });
+    return r;
+  };
+  const hit = (r) => r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK);
+
+  // ① 正向（可证伪）：自称 fd3 + 宿主侧 fd3 为空 + stdout 有匹配 nonce 行 ⇒ 必须命中
+  {
+    const r = run(line(mkPayload()), '');
+    eq('🔴-R3′ 正向：自称走 fd3 而**宿主侧 fd3 为空** + stdout 出现匹配 nonce 的结果行 ⇒ 判 plugin.protocol_injection', true, hit(r));
+    eq('🔴-R3′ 正向：命中即不放行（ok=false / 完成位 false）', 'false|false', `${r.ok}|${r.runCompleted}`);
+    eq('🔴-R3′ 正向：hostFatal 为空（插件侧错误不进判据字段）', 0, r.hostFatal.length);
+  }
+  // ② 反向护栏 a（防过度修正）：**健康路径**——自称 fd3 且宿主侧 fd3 确实有报告 ⇒ **不得**命中
+  {
+    const r = run('', line(mkPayload()));
+    eq('🔴-R3′ 反向 a：自称 fd3 且**宿主侧 fd3 有内容**（正常路径）⇒ 不误报', false, hit(r));
+    eq('🔴-R3′ 反向 a：正常路径仍被采信（ok=true）', true, r.ok === true);
+  }
+  // ③ 反向护栏 b：老探针 / 合成 payload **无** `resultChannel` 字段 ⇒ 不追溯判（向后兼容，不制造假红）
+  {
+    const legacy = JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true });
+    const r = run(line(legacy), '');
+    eq('🔴-R3′ 反向 b：老探针无 resultChannel 字段 ⇒ 本判据不误判（向后兼容）', false, hit(r));
+  }
+  // ④ 反向护栏 c：**降级**形态（自称 stdout-degraded）⇒ 由降级路径处理，不由本判据判
+  {
+    const r = run(line(mkPayload('stdout-degraded')), '');
+    eq('🔴-R3′ 反向 c：自称 stdout-degraded（降级形态）⇒ 不由本判据判（降级有独立归因路径）', false, hit(r));
+  }
+  // ⑤ 边界（**不越权承诺**）：伪造行写进 **fd3 本身**（自称 fd3 且宿主侧 fd3 有内容）⇒ 本判据不命中
+  //    那需要批 2 的「独立 fd 且永不回退 stdout」——把边界固化成断言，修好即红。
+  {
+    const r = run('', line(mkPayload()));
+    eq('🔴-R3′ 边界：伪造行写进 **fd3 本身**（自称与观测一致）⇒ 本判据不命中（批 2 残留边界，不越权承诺）',
+      false, hit(r));
+  }
+
+  // ⑥ 行为级（**真协议**跑夹具）：两种形态都必须 RED / 判插件侧 / hostFatal 为空
+  {
+    const fixture = path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs');
+    for (const [mode, label] of [['all', 'R3′（重定向 + 压退出码）'], ['no-squelch', 'R3 主形态（只重定向）']]) {
+      process.env.DSH_CHANNEL_REDIRECT_MODE = mode;
+      const r = runOfflineProbe({ pluginPath: fixture, expectedTools: ['demo_echo'] });
+      const failed = r.result.checks.filter((c) => c.status === 'fail').map((c) => c.name);
+      eq(`🔴-R3′ 行为（${label}）：归因 PLUGIN_REGRESSION（不甩锅上游）`, 'PLUGIN_REGRESSION', r.attribution);
+      eq(`🔴-R3′ 行为（${label}）：**不得**判通过（ok=false）`, false, r.result.ok === true);
+      eq(`🔴-R3′ 行为（${label}）：失败项含 plugin.protocol_injection`, true, failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+      eq(`🔴-R3′ 行为（${label}）：hostFatal 为空（插件侧错误不进判据字段）`, 0, r.result.hostFatal.length);
+    }
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+  }
+
+  // ⑦ 变异自证（**回退即红**，两条腿各自独立成立）
+  {
+    const fixture = path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs');
+    const hostSrc = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
+    const mutatedHost = hostSrc.replace(
+      'if (claimedChannel === RESULT_CHANNEL_FD3 && !isolated && matchingOnStdout.length > 0) {',
+      'if (false && claimedChannel === RESULT_CHANNEL_FD3 && !isolated && matchingOnStdout.length > 0) {');
+    eq('🔴-R3′ 变异自证：变异（关掉宿主侧通道观测）确实改动了源码', true, mutatedHost !== hostSrc);
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'all';
+    const off = await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ['demo_echo'], hostSource: mutatedHost });
+    eq('🔴-R3′ 变异回退：关掉宿主侧观测后夹具**复现假绿**（ok=true，即本条腿是唯一兜底）', true, off.result.ok === true);
+    // 只重定向（不压退出码）的形态在变异下仍由**退出码交叉**兜住 ⇒ 两条腿互相独立
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'no-squelch';
+    const offNoSquelch = await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ['demo_echo'], hostSource: mutatedHost });
+    eq('🔴-R3′ 变异回退：R3 主形态（不压退出码）仍由退出码交叉兜住（两条腿独立）', true,
+      offNoSquelch.result.checks.some((c) => c.name === PLUGIN_EXIT_CODE_MISMATCH_CHECK));
+    eq('🔴-R3′ 变异回退：R3 主形态在变异下仍不放行', false, offNoSquelch.result.ok === true);
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+  }
+
+  // ⑧ 源码守卫（判据的落点与用词，改名 / 回退即红）
+  {
+    const hostCode = codeOnly(readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8'));
+    eq('🔴-R3′ 源码守卫：判据用**唯一事实源**常量 RESULT_CHANNEL_FD3（不写裸字面量）', true,
+      /claimedChannel === RESULT_CHANNEL_FD3/.test(hostCode));
+    eq('🔴-R3′ 源码守卫：判据依赖**宿主侧观测**（!isolated + stdout 出现匹配 nonce 的行）', true,
+      /!isolated && matchingOnStdout.length > 0/.test(hostCode));
+    eq('🔴-R3′ 源码守卫：判据落进 injectionEvidence（与结构不变量同一条不采信路径）', true,
+      /claimedChannel === RESULT_CHANNEL_FD3[\s\S]{0,400}?injectionEvidence\.push\(/.test(hostCode));
+    eq('🔴-R3′ 落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
+      PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+  }
+
+  // ⑨ 夹具自检（否则上面的行为断言空转）
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'utf8');
+    eq('🔴-R3′ 夹具：真的关掉 fd 3 再把同一 fd 号指向普通文件（通道重定向）', true,
+      /closeSync\(3\)/.test(src) && /openSync\(REDIRECT_PATH/.test(src));
+    eq('🔴-R3′ 夹具：真的在 exit 钩子里读回探针写进文件的**真报告**（凭据来自探针自报，不必反读 env/argv）', true,
+      /readFileSync\(REDIRECT_PATH/.test(src));
+    eq('🔴-R3′ 夹具：真的把绿卡写进 **stdout**（伪造结果行）', true, /writeSync\(1,/.test(src));
+    eq('🔴-R3′ 夹具：两段式（all = 重定向 + 压退出码；no-squelch = 只重定向）', true,
+      /DSH_CHANNEL_REDIRECT_MODE/.test(src) && /mode === 'all'\) process\.exitCode = 0/.test(src));
+    eq('🔴-R3′ 夹具：真缺陷（多注册 demo_extra ⇒ registry.exact 应红，绿卡不得掩盖它）', true,
+      /demo_extra/.test(src));
+    eq('🔴-R3′ 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+    eq('🔴-R3′ 夹具：自述口径不越权（残留边界指向批 2 / REDO-PROPOSAL）', true,
+      src.includes('进程级对抗') && src.includes('REDO-PROPOSAL'));
+  }
 }
 
 console.log();

@@ -364,6 +364,11 @@ export function collectProbeResultLines(text) {
  *   出现裸 `__DSH_PROBE__` / nonce 不匹配的行 ⇒ 判**伪造**（{@link PLUGIN_PROBE_FORGED_RESULT_CHECK}），
  *   且**不得**把它当作报告（否则插件 `write('__DSH_PROBE__{绿卡}')` 就能自我发绿卡）。
  *   不传 `nonce`（离线单测 / 手工调用）时退化为「认裸 marker」的历史行为。
+ * **D · 宿主侧通道观测**（🔴-R3′，v0.2.5）：报告**自称**走 fd3 而**宿主侧该通道无内容**、
+ *   而 stdout 反而出现**匹配 nonce** 的结果行 ⇒ 通道被**重定向**（插件 `closeSync(3)` +
+ *   `openSync(<file>)` 把 fd3 换成文件，再把真报告里的 nonce 前缀抄进伪造行）。
+ *   ⚠️ 本判据**只依赖宿主侧对 fd3 的实际观测**（管道读端为空），既**不**依赖探针自报、
+ *   也**不**依赖退出码 ⇒ 插件从探针进程内压不掉（退出码交叉只能把门槛抬一层）。
  *
  * 归因顺序（**协议注入防线最优先**）：
  * 0. **结果通道被篡改** → 落插件侧 check `plugin.protocol_injection`、`runCompleted=false`、
@@ -413,6 +418,31 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   if (markers.length > 1) injectionEvidence.push(`结果通道出现 ${markers.length} 条结果行（正常恒为 1 条）`);
   if (isolated && matchingOnStdout.length > 0) {
     injectionEvidence.push(`结果走独立通道，但 stdout 里也出现 ${matchingOnStdout.length} 条结果行（探针只写结果通道）`);
+  }
+  // ---- 🔴-R3′（评审复评）：**宿主侧通道观测**交叉校验 ----
+  // 形态（本仓夹具 `plugin-channel-redirect-plugin`，真宿主实测）：插件 `closeSync(3)` 后
+  // `openSync(<file>)` ⇒ **fd3 被换成普通文件**（探针 `writeSync(3, …)` 照旧"写成功"，
+  // 宿主侧管道读端只见 EOF ⇒ `channelText` 为空）；探针收尾的真报告落进那个文件，
+  // 插件在 `exit` 钩子里读回它（**连 nonce 前缀一起拿到**，不必反读 env / argv），
+  // 再把全绿卡写进 **stdout**，并把 `process.exitCode` 压回 0。
+  // ⇒ 旧实现下三条防线全失效：`isolated=false` ⇒ 回退信任 stdout（伪造行成为唯一 marker）、
+  // 退出码被压成 0 ⇒ 退出码交叉不命中 ⇒ **GREEN 放行**（真缺陷被绿卡掩盖）。
+  //
+  // 判据：报告**自称**走 fd3（`resultChannel === fd3`）而**宿主侧该通道无任何内容**、
+  // 且 stdout 反而出现**匹配 nonce** 的结果行 ⇒ 通道被重定向 ⇒ 判篡改、**不采信任何一条**。
+  //
+  // 为什么这条腿插件压不掉（与退出码交叉的分工）：它**只依赖宿主侧对 fd3 的实际观测**
+  // （管道读端为空），既**不**依赖探针自报、也**不**依赖退出码——通道重定向发生在**探针进程内**，
+  // 插件改不动宿主进程看到的东西。于是防线从「报告 + 退出码」两条信道升级为
+  // 「报告 + 退出码 + **宿主侧通道观测**」三条。
+  // ⚠️ 边界（不越权承诺）：把伪造行写进 **fd3 本身**（= 探针来不及 emit 时占住真通道，自称与观测
+  // 一致）仍不可区分，属批 2（`docs/REDO-PROPOSAL.md`：独立 fd 且永不回退 stdout）。
+  if (marker) {
+    let claimedChannel = null;
+    try { claimedChannel = JSON.parse(marker.slice(expectedPrefix.length))?.resultChannel ?? null; } catch { claimedChannel = null; }
+    if (claimedChannel === RESULT_CHANNEL_FD3 && !isolated && matchingOnStdout.length > 0) {
+      injectionEvidence.push(`报告自称走独立通道（${RESULT_CHANNEL_FD3}），但**宿主侧该通道无任何内容**、而 stdout 出现 ${matchingOnStdout.length} 条匹配 nonce 的结果行（结果通道被重定向）`);
+    }
   }
   if (injectionEvidence.length > 0) {
     result.runCompleted = false;

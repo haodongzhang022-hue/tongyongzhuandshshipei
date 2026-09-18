@@ -43,9 +43,9 @@
 | 结构性重做一页方案 | `docs/REDO-PROPOSAL.md` | 文档 | 批 1（fd3 + nonce）**已落地** / 批 2（进程隔离）**已立项在办**（总师裁定；R29 证逐点补不可穷尽） |
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 163 项，无网可跑（含 `summarize()` verdict 优先级 [13]、nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**nonce 侧信道 + v0.1.9d 三形态 [18]**、**批 1.5 通道可见化/降级不放行/§3 反例/exit 台账 [19]**、**🔴 必修-4 同族假绿 [20]**） |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 509 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **[9.10]-[9.14] R28/R26/R24/🔴 必修-4/R26 残留② fail-open**（无网可跑） |
-| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 163 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d]-[8g] 侧信道 / R28+R26 / R24 / §3 反例 / 🔴 必修-4** 场景，含 attribution + verdict + **完成位**三重断言 |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 178 项，无网可跑（含 `summarize()` verdict 优先级 [13]、nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**nonce 侧信道 + v0.1.9d 三形态 [18]**、**批 1.5 通道可见化/降级不放行/§3 反例/exit 台账 [19]**、**🔴 必修-4 同族假绿 [20]**、**🔴-R3′ 通道重定向 + 压退出码 [21]**） |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 541 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **[9.10]-[9.15] R28/R26/R24/🔴 必修-4/R26 残留② fail-open/🔴-R3′ 通道重定向**（无网可跑） |
+| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 172 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d]-[8h] 侧信道 / R28+R26 / R24 / §3 反例 / 🔴 必修-4 / 🔴-R3′ 通道重定向** 场景，含 attribution + verdict + **完成位**三重断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 4b 步插件侧闸门 / 第 7 步「文档计数防漂移」） |
 | 插件侧闸门 | `tests/gate_plugin_side.sh` | 测试 | ★ 唯一事实源：四条出口 + SIGKILL 边界 + **§3 反例固化** + **exit 钩子台账** + **防过度修正**（健康插件 17/17）；`.cnb.yml` push/PR 两段共用同一份 |
 | 离线探针回归台 | `tests/offline-probe-harness.mjs` | 测试 | 最小假宿主 + 真实探针子进程 + **装配器真实实现**解释输出（秒级覆盖四条出口；边界：假宿主通过 ≠ 真宿主适配通过） |
@@ -59,6 +59,7 @@
 | 负例插件（H1/R28 防线干预） | `tests/fixtures/plugin-defense-tamper-plugin.mjs` | 测试 | 摘掉探针 handler 后装**自己的**（计数判据假阳性形态）→ `plugin.process_defense_tampered`、`hostFatal=[]` |
 | 负例插件（R24 同步死循环） | `tests/fixtures/plugin-sync-loop-plugin.mjs` | 测试 | `apply()` 内**同步**死循环（3s）→ 宿主 `killSignal:'SIGKILL'` 二次终止收口，`plugin.abnormal_termination`（信标）/ `hostFatal=[]` |
 | 负例插件（🆕 侧信道） | `tests/fixtures/plugin-forged-result-plugin.mjs` / `plugin-event-loop-hog-plugin.mjs` | 测试 | 伪造裸 marker 绿卡 → `plugin.probe_result_forged`；永久占死事件循环 → timeoutMs **有界**（SIGKILL） |
+| 负例插件（🆕 🔴-R3′ 通道重定向） | `tests/fixtures/plugin-channel-redirect-plugin.mjs` | 测试 | `closeSync(3)` + `openSync(<file>)` 把 **fd3 换成文件** ⇒ 从探针写进文件的**真报告**里抄 nonce 前缀 ⇒ 把绿卡写进 stdout + 压 `process.exitCode = 0`（旧实现 **GREEN 放行**）→ 现判 `plugin.protocol_injection`（**宿主侧通道观测**）、不采信任何一条、**不得** GREEN |
 | 负例插件（🆕 §3 反例固化） | `tests/fixtures/plugin-host-tamper-poc-plugin.mjs` | 测试 | 反读 nonce + 写 fd3 绿卡 + 摘 `exit` 钩子 + `exit(0)` 抢跑（原始 PoC 曾判 GREEN）→ 现判 `plugin.probe_result_forged` + `plugin.abnormal_termination`、**不得** GREEN |
 | 负例插件（🆕 批 1.5 出口钩子） | `tests/fixtures/plugin-exit-hook-tamper-plugin.mjs` | 测试 | **只摘**出口③ 的 `exit` 钩子（其余健康）→ `plugin.process_defense_tampered`、`hostFatal=[]`（原先**不可判定**） |
 | 负例插件（H1/R28 防线干预） | `tests/fixtures/plugin-defense-tamper-plugin.mjs` | 测试 | 摘掉探针 handler 后装**自己的**（计数判据假阳性形态）→ `plugin.process_defense_tampered`、`hostFatal=[]` |
@@ -111,7 +112,7 @@
 | `plugin.run_incomplete` | ④ `run()` 被拖住 | 插件挂住事件循环 / `apply()` 返回永不 resolve 的 Promise（**无条件**看门狗接住） |
 | `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM）——探针来不及写报告，装配器按**相位信标**归因 |
 | `plugin.process_defense_tampered` | ⑤ 防线被静音 / 出口钩子被摘 | 插件抢占 `setUncaughtExceptionCaptureCallback`（Sentry / APM / 日志库常见）、`removeAllListeners`，或**摘掉出口③ 的 `exit` 钩子**（批 1.5：钩子具名登记 + 身份检查覆盖 `'exit'`）⇒ 探针进程级兜底被**静音** / 提前退出的记账能力被撤销 → 探针收尾自检判本项（**防放行级假绿**） |
-| `plugin.protocol_injection` | ⑥ 结果通道被注入 / 被关闭 | 插件向探针的结果通道**注入伪造结果**（抢首位 / 多结果行 / 走错通道），或**在插件代码运行期间关闭 fd3**（早探测可写 → 收尾不可写）⇒ 真报告被顶替 / 降级 → 装配器 `interpretProbeStdout()` 判本项（**防放行级假绿**） |
+| `plugin.protocol_injection` | ⑥ 结果通道被注入 / 被关闭 / **被重定向** | 插件向探针的结果通道**注入伪造结果**（抢首位 / 多结果行 / 走错通道）；**在插件代码运行期间关闭 fd3**（早探测可写 → 收尾不可写）；或**把 fd3 换成普通文件**（`closeSync(3)` + `openSync(<file>)`）后用从真报告抄到的 nonce 前缀把绿卡写进 stdout（🔴-R3′：报告**自称**走 fd3 而**宿主侧该通道无内容** ⇒ **宿主侧通道观测**命中）⇒ 真报告被顶替 / 降级 → 装配器 `interpretProbeStdout()` 判本项（**防放行级假绿**） |
 | `plugin.probe_result_forged` | 🆕 侧信道 | 探针输出面出现**无 nonce / nonce 不匹配**的结构化结果行（插件自造绿卡 / 甩锅上游）⇒ 装配器只认带 nonce 的报告，伪造即判本项（与 ⑥ 是**两条独立证据链**） |
 | `plugin.exit_code_mismatch` | 🔴 必修-4 退出码交叉 | 报告自称通过（`ok=true`）但探针**进程退出码非 0**（或带终止信号）⇒ **两个独立产物互相矛盾**即篡改（退出码由探针内存算出、不经序列化；报告字节可被插件的 `JSON.stringify` 替换）⇒ 装配器判本项（**防放行级假绿**） |
 

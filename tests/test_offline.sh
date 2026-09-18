@@ -702,6 +702,72 @@ assert "🔴-4 变异回退 B：真缺陷 registry.exact 仍被判失败" "true"
 assert "🔴-4 双回退（残留边界）：复现「绿卡被采信」（两条防线都关 ⇒ ok=true）——口径不得越权承诺" "true" "$(k20 bothOff '.ok')"
 assert "🔴-4 反向护栏：健康插件同参数下仍 17/17 全绿 + 跑完" "17|0|true|0" "$(k20 healthy '.pass+"|"+c.fails+"|"+c.completed+"|"+c.hostFatal')"
 
+echo "  [21] 🔴-R3′ 通道重定向 + 压退出码（宿主侧通道观测交叉校验）"
+# 为什么必须有（评审复评 🔴-R3′，收窄后的活口）：`plugin.exit_code_mismatch` 判的是「报告 ok=true
+# 而退出码非 0」——但**退出码与报告同属探针进程的可写状态**：插件在 `'exit'` 钩子里
+# `process.exitCode = 0` 即可压掉，于是旧实现下**GREEN 放行**（真缺陷被绿卡掩盖）。
+# 完整形态（夹具 `plugin-channel-redirect-plugin`）：`closeSync(3)` + `openSync(<file>)` 把 fd3
+# 换成普通文件 ⇒ 宿主侧管道读端只见 EOF；探针收尾把**真报告**写进那个文件 ⇒ 插件在 `exit`
+# 钩子里读回它（**连 nonce 前缀一起拿到**，不必反读 env / argv）；再用该前缀把绿卡写进 stdout。
+# 收口判据 = **宿主侧通道观测**（只依赖宿主进程看到的东西，插件压不掉）。
+REDIRECT_OUT="$("$NODE_BIN" --input-type=module -e '
+import path from "node:path";
+import { runOfflineProbe, runOfflineProbeWithSources } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+import { readFileSync } from "node:fs";
+const ROOT = "'"$ROOT"'";
+const fixture = path.join(ROOT, "tests/fixtures/plugin-channel-redirect-plugin.mjs");
+const hostSrc = readFileSync(path.join(ROOT, "src/harness/host.mjs"), "utf8");
+const snap = (r) => ({
+  attribution: r.attribution, ok: r.result.ok === true, hostFatal: r.result.hostFatal.length,
+  completed: r.result.runCompleted, exitStatus: r.exit.status,
+  fails: r.result.checks.filter((c) => c.status === "fail").map((c) => c.name),
+});
+// ① 生产口径：两段式夹具（all = 重定向 + 压退出码；no-squelch = 只重定向）
+process.env.DSH_CHANNEL_REDIRECT_MODE = "all";
+const fixedAll = snap(runOfflineProbe({ pluginPath: fixture, expectedTools: ["demo_echo"] }));
+process.env.DSH_CHANNEL_REDIRECT_MODE = "no-squelch";
+const fixedNoSquelch = snap(runOfflineProbe({ pluginPath: fixture, expectedTools: ["demo_echo"] }));
+// ② 变异 A：关掉**宿主侧通道观测** ⇒ R3′ 形态复现假绿（证明这条腿是唯一兜底）
+const mutatedHost = hostSrc.replace(
+  "if (claimedChannel === RESULT_CHANNEL_FD3 && !isolated && matchingOnStdout.length > 0) {",
+  "if (false && claimedChannel === RESULT_CHANNEL_FD3 && !isolated && matchingOnStdout.length > 0) {");
+process.env.DSH_CHANNEL_REDIRECT_MODE = "all";
+const offAll = snap(await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ["demo_echo"], hostSource: mutatedHost }));
+// ③ 变异 A 下**不压退出码**的形态仍由退出码交叉兜住（两条腿互相独立）
+process.env.DSH_CHANNEL_REDIRECT_MODE = "no-squelch";
+const offNoSquelch = snap(await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ["demo_echo"], hostSource: mutatedHost }));
+delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+// ④ 反向护栏：健康插件同参数下仍 17/17（防过度修正）
+const healthy = runOfflineProbe({ pluginPath: path.join(ROOT, "tests/fixtures/demo-plugin.mjs"), expectedTools: ["demo_echo", "demo_status"] });
+console.log(JSON.stringify({
+  fixedAll, fixedNoSquelch, offAll, offNoSquelch,
+  healthy: {
+    pass: healthy.result.checks.filter((c) => c.status === "pass").length,
+    fails: healthy.result.checks.filter((c) => c.status === "fail").length,
+    completed: healthy.result.runCompleted, hostFatal: healthy.result.hostFatal.length, ok: healthy.result.ok === true,
+  },
+}));
+')"
+k21() { echo "$REDIRECT_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);const c=r['$1'];console.log(eval('c$2'))})"; }
+assert "🔴-R3′ 生产口径（all：重定向 + 压退出码）：不得假绿（ok=false）" "false" "$(k21 fixedAll '.ok')"
+assert "🔴-R3′ 生产口径（all）：判 plugin.protocol_injection（宿主侧通道观测命中）" "true" "$(k21 fixedAll '.fails.includes("plugin.protocol_injection")')"
+assert "🔴-R3′ 生产口径（all）：归因 PLUGIN_REGRESSION + hostFatal 为空 + 未跑完" "PLUGIN_REGRESSION|0|false" "$(k21 fixedAll '.attribution+"|"+c.hostFatal+"|"+c.completed')"
+assert "🔴-R3′ 生产口径（all）：插件压掉的退出码确实为 0（证明退出码交叉**不再**是唯一兜底）" "0" "$(k21 fixedAll '.exitStatus')"
+assert "🔴-R3′ 生产口径（no-squelch：只重定向）：同样判 plugin.protocol_injection" "true" "$(k21 fixedNoSquelch '.fails.includes("plugin.protocol_injection")')"
+assert "🔴-R3′ 变异回退（关掉宿主侧观测）：R3′ 形态**复现假绿**（ok=true，口径不得越权承诺）" "true" "$(k21 offAll '.ok')"
+assert "🔴-R3′ 变异回退：不压退出码的形态仍由退出码交叉兜住（两条腿独立）" "true" "$(k21 offNoSquelch '.fails.includes("plugin.exit_code_mismatch")')"
+assert "🔴-R3′ 变异回退：该形态在变异下仍不放行" "false" "$(k21 offNoSquelch '.ok')"
+assert "🔴-R3′ 反向护栏：健康插件同参数下仍 17/17 全绿 + 跑完" "17|0|true|0" "$(k21 healthy '.pass+"|"+c.fails+"|"+c.completed+"|"+c.hostFatal')"
+
+# 夹具自检：否则上面的行为断言空转
+REDIRECT_FIXTURE="$ROOT/tests/fixtures/plugin-channel-redirect-plugin.mjs"
+assert "🔴-R3′ 夹具存在（真宿主侧进闸门的对象）" "yes" "$([[ -f "$REDIRECT_FIXTURE" ]] && echo yes || echo no)"
+assert "🔴-R3′ 夹具：真的把 fd 3 换成普通文件（closeSync(3) + openSync）" "yes" "$(grep -q 'closeSync(3)' "$REDIRECT_FIXTURE" && grep -q 'openSync(REDIRECT_PATH' "$REDIRECT_FIXTURE" && echo yes || echo no)"
+assert "🔴-R3′ 夹具：真的从重定向文件里读回探针的**真报告**（拿到 nonce 前缀）" "yes" "$(grep -q 'readFileSync(REDIRECT_PATH' "$REDIRECT_FIXTURE" && echo yes || echo no)"
+assert "🔴-R3′ 夹具：真的把伪造绿卡写进 stdout" "yes" "$(grep -q 'writeSync(1,' "$REDIRECT_FIXTURE" && echo yes || echo no)"
+assert "🔴-R3′ 夹具：真的压退出码（R3′ 相对 R3 的唯一增量）" "yes" "$(grep -q 'process.exitCode = 0' "$REDIRECT_FIXTURE" && echo yes || echo no)"
+assert "🔴-R3′ 夹具：真缺陷（多注册 demo_extra ⇒ registry.exact 应红）" "yes" "$(grep -q 'demo_extra' "$REDIRECT_FIXTURE" && echo yes || echo no)"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

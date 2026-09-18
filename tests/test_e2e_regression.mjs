@@ -429,6 +429,33 @@ try {
       failed.includes('plugin.exit_code_mismatch'));
   }
 
+  // ---- 11h. 🔴-R3′（真宿主）：结果通道重定向 + 压退出码 ⇒ 宿主侧通道观测交叉校验 ----
+  // 为什么必须真宿主也跑（评审复评 §3）：本形态的**三件套**（fd3 被换成文件 / 探针把真报告写进
+  // 文件 / 插件在 exit 钩子里读回凭据）全都依赖**真宿主路径**的 spawn 参数与 fd 布局——
+  // 离线台是假宿主，可能掩盖协议拼装错误。收口判据（宿主侧通道观测）也只有在真装配器
+  // （真的 spawn + 真的读管道）下才有意义。
+  console.log('  [8h] 🔴-R3′：结果通道重定向 + 压退出码（宿主侧通道观测，真宿主）');
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3′（真宿主）：**不得** GREEN / PASS（旧实现下放行级假绿）', true,
+      report.summary?.verdict !== 'GREEN' && report.attribution !== 'PASS');
+    eq('🔴-R3′（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${report.attribution}|${report.summary?.verdict}`);
+    eq('🔴-R3′（真宿主）：失败项含 plugin.protocol_injection（通道被重定向）', true,
+      failed.includes('plugin.protocol_injection'));
+    eq('🔴-R3′（真宿主）：hostFatal 为空（插件侧错误不进判据字段）', 0, (report.hostFatal ?? []).length);
+    eq('🔴-R3′（真宿主）：完成位 false（不采信任何一条 ⇒ 未跑完）', false, report.runCompleted);
+    eq('🔴-R3′（真宿主）：ok 不得为真（假绿防线）', false, report.ok === true);
+    eq('🔴-R3′（真宿主）：插件压掉的退出码确实为 0（⇒ 退出码交叉不再是唯一兜底）', 0, report.probeExit?.status ?? null);
+    eq('🔴-R3′（真宿主）：报告不可信 ⇒ 真缺陷 registry.exact 不采信（整轮丢弃，不误报为通过）', false,
+      failed.includes('registry.exact') && report.ok === true);
+    // 反向护栏：健康插件在同一次运行里仍 17/17（防过度修正）
+    const healthy = verify(path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('🔴-R3′ 反向护栏（真宿主）：健康插件仍 PASS / 17 项全绿 / 未降级', 'PASS|17|false',
+      `${healthy.attribution}|${(healthy.checks ?? []).length}|${healthy.resultChannelDegraded}`);
+  }
+
   console.log('  [8f] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');
   {
     const registry = loadChannels(ROOT);
