@@ -17,6 +17,8 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { HUB_ROOT, loadChannels, runHostProbe } from '../harness/host.mjs';
 import { CONTRACT_SIDE_CHECKS, HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS } from '../harness/contract.mjs';
+// 漂移相关性表的唯一事实源（与 `docs/ARCHITECTURE.md` 判据表第 3 条、triage 影响面同源）
+import { DRIFT_IMPACT } from '../triage/index.mjs';
 import { channelContractDrift, contractSnapshot } from '../watch/upstream.mjs';
 
 /**
@@ -109,6 +111,7 @@ export { HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CH
  *    → `PLUGIN_REGRESSION`，**优先于任何漂移相关性**：插件违反宿主硬约束与上游契约是否
  *    漂移无关，漂移窗口内也必须判插件（评审 🔴-C；精确 check 名，不用 `guard.*` 通配）；
  * 3. **契约指纹与基线不一致且漂移字段与失败 check 相关** → `UPSTREAM_DRIFT`；
+ *    （相关性表唯一事实源 = `triage/index.mjs` 的 `DRIFT_IMPACT`，精确 check 名匹配）；
  * 4. **中台契约 check 失败且无可用基线**（首次采集，无法判定上游是否变了）→ 保守判 `UPSTREAM_DRIFT`；
  * 5. **插件侧 check 失败** → `PLUGIN_REGRESSION`；
  * 6. 有失败但无任何可识别 check（探针被外力打断等）→ `UNKNOWN`（不猜、不甩锅）。
@@ -168,14 +171,15 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
   const drift = evidence.contractDrift;
   if (drift?.changed && drift.items?.length > 0) {
     const fields = new Set(drift.items.map((item) => item.field));
-    const related =
-      // P2-6：`guard.reserved_rejected` **不入表**（已由 2b 硬证据优先拦下）；`reservedName` 漂移
-      // 只对应中台自检 `guard.reserved_name`——上游取消保留名 + 插件自己声明保留名时，
-      // 判漂移等于把插件违规甩给上游。
-      (fields.has('reservedName') && failedNames.has('guard.reserved_name'))
-      || (fields.has('schemaSubset') && failedNames.has('compat.schema_flatten'))
-      || (fields.has('configProjection') && failedNames.has('detect.flavor_known'))
-      || (fields.has('outputShape') && [...failedNames].some((name) => name.startsWith('dispatch.')));
+    // P2-6 / v0.1.7：漂移相关性**不在本文件硬编码**——唯一事实源是 `triage/index.mjs` 的
+    // `DRIFT_IMPACT`（字段 → 受影响 check 名，精确匹配，不用 `dispatch.` 这类前缀通配）。
+    // 为什么去硬编码：过去这里是 4 条手写 `||`，与文档里的相关性表、triage 影响面表**三处各自维护**，
+    // 任何一处新增字段都会静默漏判（漂移相关=判上游，漏了就把插件 bug 甩给上游）。
+    // 现在三处共用一份：改 `DRIFT_IMPACT` 一处即全生效，漏登记字段会被 triage 标 `known:false` 显式暴露。
+    //
+    // 纪律（不得回退）：`PLUGIN_HARD_EVIDENCE`（`guard.reserved_rejected`）**永不入表**——
+    // 它已在 2b 优先拦下；把它算作「漂移相关」= 插件违规甩锅上游（历史缺陷 🔴-C）。
+    const related = [...fields].some((field) => (DRIFT_IMPACT[field]?.checks ?? []).some((name) => failedNames.has(name)));
     if (related) {
       return {
         attribution: 'UPSTREAM_DRIFT',

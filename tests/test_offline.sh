@@ -319,6 +319,57 @@ assert "漂移+回归混合 → RED（回归优先，不被降级）" "RED" "$(e
 assert "混合判决与通道顺序无关（回归在后也 RED）" "RED" "$(echo "$OUT" | sed -n 5p)"
 assert "失败但无法归因 → UNKNOWN（不猜）" "UNKNOWN" "$(echo "$OUT" | sed -n 6p)"
 
+echo "  [14] 漂移相关性表唯一事实源（v0.1.7：runner 不得回退手写判据 / 不得前缀通配）"
+CHECK_JS="$(mktemp).mjs"
+cat > "$CHECK_JS" <<'JS'
+import { readFileSync } from 'node:fs';
+import { DRIFT_IMPACT, DRIFT_FIELDS } from 'ROOT/src/triage/index.mjs';
+import { PLUGIN_HARD_EVIDENCE, CONTRACT_SIDE_CHECKS, PLUGIN_SIDE_CHECKS, HOST_SIDE_CHECKS } from 'ROOT/src/harness/contract.mjs';
+const runner = readFileSync('ROOT/src/verify/runner.mjs', 'utf8');
+const out = [];
+out.push(/import \{[^}]*DRIFT_IMPACT[^}]*\} from '\.\.\/triage\/index\.mjs'/.test(runner) ? 'import-ok' : 'import-missing');
+const hardcoded = DRIFT_FIELDS.filter((f) => new RegExp("fields\\.has\\('" + f + "'\\)").test(runner));
+out.push(hardcoded.length === 0 ? 'no-hardcoded' : 'hardcoded:' + hardcoded.join(','));
+out.push(runner.includes("startsWith('dispatch.')") ? 'prefix-wildcard' : 'no-prefix-wildcard');
+const leaked = Object.values(DRIFT_IMPACT).flatMap((v) => v.checks).filter((n) => PLUGIN_HARD_EVIDENCE.includes(n));
+out.push(leaked.length === 0 ? 'hard-evidence-excluded' : 'hard-evidence-leaked:' + leaked.join(','));
+const known = new Set([...HOST_SIDE_CHECKS, ...CONTRACT_SIDE_CHECKS, ...PLUGIN_SIDE_CHECKS,
+  'host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed',
+  'guard.reserved_name', 'compat.schema_flatten', 'guard.reserved_rejected',
+  'plugin.loaded', 'plugin.apply_ok', 'plugin.definitions_ok', 'registry.exact',
+  'dispatch.execute_ok', 'dispatch.render_projected', 'dispatch.echo_payload', 'dispatch.abort_semantics',
+  'lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose']);
+const unknown = Object.values(DRIFT_IMPACT).flatMap((v) => v.checks).filter((n) => !known.has(n));
+out.push(unknown.length === 0 ? 'checks-known' : 'checks-unknown:' + unknown.join(','));
+console.log(out.join('\n'));
+JS
+sed -i "s#ROOT#$ROOT#g" "$CHECK_JS"
+OUT="$("$NODE_BIN" "$CHECK_JS")"
+rm -f "$CHECK_JS"
+assert "runner 判定式从唯一事实源 import DRIFT_IMPACT" "import-ok" "$(echo "$OUT" | sed -n 1p)"
+assert "runner 判定式不再硬编码契约字段名" "no-hardcoded" "$(echo "$OUT" | sed -n 2p)"
+assert "runner 判定式不使用 dispatch. 前缀通配" "no-prefix-wildcard" "$(echo "$OUT" | sed -n 3p)"
+assert "硬证据（guard.reserved_rejected）永不入漂移相关性表" "hard-evidence-excluded" "$(echo "$OUT" | sed -n 4p)"
+assert "漂移相关性表的 check 名均属唯一事实源名单" "checks-known" "$(echo "$OUT" | sed -n 5p)"
+
+echo "  [15] watch 自动归因影响面（v0.1.7：CLI watch 接 triage，支持 --contract-from / --markdown）"
+DRIFT_REPORT="$(mktemp).json"
+cat > "$DRIFT_REPORT" <<'JSON'
+{ "channels": [ { "channel": "dev", "ok": true, "contract": {
+  "configProjection": "{ mode?: \"native\" | \"ptc\" | \"both\", maxParallelSubCalls?: number }",
+  "reservedName": "tool name \"run_script\" is reserved for the X transport and cannot be registered or shadowed",
+  "schemaSubset": "unsupported JSON schema: schema.properties.a.type must be one of object/array/string/number/integer/boolean/null/fn",
+  "outputShape": "tool \"probe_no_render\" must declare output { schema, render, presentationMeta? }"
+} } ] }
+JSON
+OUT="$(TMPDIR="$(mktemp -d)" "$NODE_BIN" "$ROOT/src/cli.mjs" watch --contract-from "$DRIFT_REPORT" --markdown 2>&1 || true)"
+assert "watch --markdown 输出「上游漂移影响面」标题" "yes" "$(echo "$OUT" | grep -q '上游漂移影响面' && echo yes || echo no)"
+assert "影响面表列出 reservedName → guard.reserved_name" "yes" "$(echo "$OUT" | grep -q 'guard.reserved_name' && echo yes || echo no)"
+assert "影响面指明中台要改的文件（定向修）" "yes" "$(echo "$OUT" | grep -q 'src/compat/schema.mjs' && echo yes || echo no)"
+assert "新增保留名被点名 → 插件必须改名" "yes" "$(echo "$OUT" | grep -q '必须' && echo yes || echo no)"
+assert "建议里声明 advice 不得回灌判据" "yes" "$(echo "$OUT" | grep -q '不得.*判据' && echo yes || echo no)"
+rm -f "$DRIFT_REPORT"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

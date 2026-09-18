@@ -165,6 +165,10 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
     '[2b]': expSrc,
     '[2c]': expSrc,
     '[13]': offlineSrc,
+    // v0.1.7 新增防线：漂移相关性表唯一事实源（离线）与 triage 影响面（离线）
+    '[7c]': attrSrc,
+    '[9]': attrSrc,
+    '[14]': offlineSrc,
   };
   const claimed = new Set();
   // 只扫「回归防线」列与「防线编号」提及，避免把正文里对其他编号的引用算成自述

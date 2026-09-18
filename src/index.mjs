@@ -33,6 +33,7 @@ export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, pruneHostC
 export { verifyChannel, verifyAll, summarize, attributeFailure, attributionDetail, resolvePlugin } from './verify/runner.mjs';
 export { collectContract, pushHostFatal, CONTRACT_PROBES, CONTRACT_PROBE_NAMES, HOST_FATAL_PREFIX, HOST_FATAL_FIELD } from './harness/contract.mjs';
 export { watchUpstream, fetchDistTags, contractSnapshot, diffContracts } from './watch/upstream.mjs';
+export { classifyDrift, diffReservedNames, triageUpstream, toTriageMarkdown, DRIFT_IMPACT, DRIFT_FIELDS } from './triage/index.mjs';
 export { buildSecondary, toMarkdown } from './report/secondary.mjs';
 export { createAdapter } from './adapter.mjs';
 export { VERSION } from './version.mjs';

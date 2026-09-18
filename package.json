@@ -13,7 +13,8 @@
     "./detect": "./src/detect/index.mjs",
     "./harness": "./src/harness/index.mjs",
     "./verify": "./src/verify/runner.mjs",
-    "./watch": "./src/watch/upstream.mjs"
+    "./watch": "./src/watch/upstream.mjs",
+    "./triage": "./src/triage/index.mjs"
   },
   "files": [
     "src",

@@ -2,7 +2,7 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.1.7`（module `adapt-hub`，🔴-D 收口：`hostFatal[]` 写入端分相位）
+> 版本：`dsh-adapt-hub v0.1.7`（module `adapt-hub`；🔴-D 收口 `hostFatal[]` 写入端分相位 + 漂移相关性表唯一事实源 + 上游漂移自动归因影响面）
 
 ---
 
@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 70 项 + 归因离线回归 128 项 + 发布面自检 27 项 ✅   归因端到端回归 64 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
+离线单测 76 项 + 归因离线回归 165 项 + 发布面自检 28 项 ✅   归因端到端回归 64 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
 ```
 
 ---
@@ -186,13 +186,14 @@ tongyongzhuandshshipei/
 │   ├── detect/{index.mjs,flavor.mjs}  # 版本线探测（+ 导出面）
 │   ├── compat/{schema,tool}.mjs       # 契约兼容层
 │   ├── harness/{host.mjs,probe-template.mjs}  # 隔离真宿主装配 + 探针
-│   ├── verify/runner.mjs              # 双通道验收 + 归因
+│   ├── verify/runner.mjs              # 双通道验收 + 归因（漂移相关性表**不在此硬编码**）
+│   ├── triage/index.mjs               # ★ 上游漂移**自动归因影响面**（唯一事实源：DRIFT_IMPACT）
 │   ├── watch/upstream.mjs             # 上游侦测 + 契约 diff
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 70 项离线单测（无网可跑）
-│   ├── test_attribution.mjs           # 128 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b]）
+│   ├── test_offline.sh                # 76 项离线单测（无网可跑；含 [14] 漂移相关性表唯一事实源 / [15] watch 影响面）
+│   ├── test_attribution.mjs           # 165 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9]）
 │   ├── test_e2e_regression.mjs        # 64 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D 复现，含 verdict 断言）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
@@ -230,7 +231,7 @@ export function apply(ctx) {
 |---|---|---|
 | `dsh-adapt matrix` | 0 | 打印通道矩阵 |
 | `dsh-adapt verify --channel stable\|dev\|legacy\|all` | 0 = GREEN；1 = 有失败；2 = 用法/参数错误 | 验收（`all` = stable+dev+legacy） |
-| `dsh-adapt watch` | 0 = 无漂移；1 = 有漂移；2 = 离线 | 上游侦测 |
+| `dsh-adapt watch [--json <out>] [--markdown] [--contract-from <verify-json>]` | 0 = 无漂移；1 = 有漂移（版本或契约）；2 = 离线 | 上游侦测 **+ 自动归因影响面**（`--markdown` 出人类视图） |
 | `dsh-adapt report --markdown` | 同 verify | 二级信息 |
 
 **③ 归因契约（`verify` 报告，机器可读）**
@@ -264,16 +265,17 @@ export function apply(ctx) {
 > `guard.reserved_name` 是**中台自检**（hub 自身护栏），不属硬证据——用 `guard.*`
 > 通配会过度修正（评审 🟡-1）。
 >
-> 判据表**唯一事实源**在 `src/harness/contract.mjs`（探针与执行器共用，防两侧漂移）。
+> 判据表**唯一事实源**有两处，各管一半（缺一即红）：
+> - check 名单与宿主侧字段的唯一事实源：`src/harness/contract.mjs`（探针与执行器共用，防两侧漂移）。
+> - 漂移相关性表的唯一事实源：`src/triage/index.mjs` 的 `DRIFT_IMPACT`（执行器与影响面报告共用，防三处各自维护）。
 >
 > **四条纪律（判据只认结构化证据 —— 评审 🔴-C 活口二的收口口径，文档侧对齐）**：
 > 1. 宿主/环境侧信号**只认结构化字段 `hostFatal[]`**（`HOST_FATAL_FIELD`）与 `HOST_SIDE_CHECKS` 名单；
 >    `errors[]`（含 `fatal(host):` 前缀行）是**人读日志**，**任何判据不读** —— 插件侧 stack / 文件路径 /
 >    CI 工作目录里出现该字面量**不得**翻案（实现见 `src/verify/runner.mjs` 判据 1）。
 > 2. 插件侧硬证据 `PLUGIN_HARD_EVIDENCE` **优先于**任何漂移相关性。
-> 3. 漂移字段必须与失败 check **一一对应**才判上游漂移（不把插件 bug 甩给上游）。
-> 4. 判据表**唯一事实源**在 `src/harness/contract.mjs`；本表由 `tests/test_attribution.mjs` [7b] 守住，
->    与唯一事实源口径不一致即红（**文档即防线**）。
+> 3. 漂移字段必须与失败 check **一一对应**才判上游漂移（不把插件 bug 甩给上游；对应表 = `DRIFT_IMPACT`，**不得**在 `runner.mjs` 里手写 `||`，也**不得**用 `dispatch.` 前缀通配）。
+> 4. 判据表**唯一事实源**在 `src/harness/contract.mjs`（check 名单/结构化字段）与 `src/triage/index.mjs`（漂移相关性表）；本表由 `tests/test_attribution.mjs` [7b]/[7c] 与 `tests/test_offline.sh` [14] 守住，与唯一事实源口径不一致即红（**文档即防线**）。
 
 **④ 通道定义契约（`registry/channels.json`）**
 
@@ -320,10 +322,11 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 70 项 + 归因离线回归 128 项 + 发布面自检 27 项 + 归因端到端回归 64 项 + 负例拦下（含漂移窗口） | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 76 项 + 归因离线回归 165 项 + 发布面自检 28 项 + 归因端到端回归 64 项 + 负例拦下（含漂移窗口）+ 变异复测 14/14 拦下 | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |
+| M9 上游自动归因 | `triage` 影响面：漂移到哪 / 影响谁 / 改哪一处 / 插件要不要动 | ✅ done（v0.1.7） |
 
 **暂停确认点**
 
@@ -343,6 +346,7 @@ export function apply(ctx) {
 | 能力索引 | `docs/INDEX.md` | 一页找齐 |
 | 通道钉版表 | `registry/channels.json` | 唯一事实源 |
 | 契约指纹基线 | `registry/contract-snapshots/latest.json` | 漂移对比 |
+| 漂移影响面归因 | `src/triage/index.mjs` | 漂移字段 → 受影响检查 → 责任方 → 中台改哪一处 |
 | 验收执行器 | `src/verify/runner.mjs` | CI 调用 |
 | 页面按钮 | `.cnb/web_trigger.yml` | 人不用记命令 |
 | CI 流水线 | `.cnb.yml` | push/PR/crontab/web_trigger |
@@ -372,6 +376,6 @@ export function apply(ctx) {
 | 要素 | 内容 |
 |---|---|
 | **做对了** | ① 先真宿主验证再设计（A7 直接推翻「用 latest 当稳定线」的想当然）；② 把「归因」做成核心能力而非附属；③ 插件侧零宿主 import |
-| **做错了/差点错** | 初版 schema 校验器把「无 type 节点」误判为违规（实测宿主接受）——靠真宿主验收抓到，已修 |
+| **做错了/差点错** | ① 初版 schema 校验器把「无 type 节点」误判为违规（实测宿主接受）——靠真宿主验收抓到，已修；② 漂移相关性判据曾在 `runner.mjs` 手写 4 条 `||`，与文档表/影响面表**三处各自维护**（v0.1.7 收归 `DRIFT_IMPACT` 唯一事实源）；③ 护栏自查发现两个活口：纪律③的字面量断言删条件语义仍绿、正文声明句删除后**由纪律④顶包**仍绿（v0.1.7 已堵） |
 | **没做** | npm 发布、跨仓批量体检、PTC-only 增强（均显式暂缓，非遗忘） |
 | **下一步** | CP2 放行后：接首个真实插件 → 验证「改中台一处、插件零改动」的闭环 |

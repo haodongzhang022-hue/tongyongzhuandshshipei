@@ -22,7 +22,7 @@
  *
  * 退出码：0 = 全绿；1 = 有失败。
  */
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +44,7 @@ import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '.
 import { channelFingerprint, loadChannels, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
 // 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
 import { codeOnly, stripComments } from './source-scan.mjs';
+import { DRIFT_FIELDS, DRIFT_IMPACT, classifyDrift, diffReservedNames, triageUpstream } from '../src/triage/index.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -377,13 +378,142 @@ console.log('  [7b] ARCHITECTURE 归因判据表与唯一事实源一致（文�
     (discText['1'] ?? '').includes('errors[]') && (discText['1'] ?? '').includes('任何判据不读'));
   eq('纪律②（定位：该条行内）写明硬证据优先于漂移相关性', true,
     (discText['2'] ?? '').includes('PLUGIN_HARD_EVIDENCE') && /优先于/.test(discText['2'] ?? ''));
-  eq('纪律③（定位：该条行内）写明漂移字段与失败 check 一一对应', true,
-    (discText['3'] ?? '').includes('一一对应'));
+  // 🟠P1-新-2（v0.1.7）：纪律③ 断言曾写成 `(discText['3'] ?? '').includes('一一对应')`——
+  // **单值 includes = 非定位断言**：它只问「这两字在不在」，删掉「必须…才判」的条件语义、
+  // 或把「一一对应」换成同义改写，断言照样绿。现改为**成对**断言：
+  // 「漂移字段」+「失败 check」+「一一对应」三者**同一纪律条目内**同时出现，且不得退回
+  // 「有漂移即判」（= 把插件 bug 甩给上游的旧口径），并给出理由。
+  const disc3 = discText['3'] ?? '';
+  eq('🟠P1-新-2：纪律③ 条内同时写明「漂移字段」+「失败 check」+「一一对应」', true,
+    disc3.includes('漂移字段') && disc3.includes('失败 check') && disc3.includes('一一对应'));
+  eq('🟠P1-新-2：纪律③ 条内写明判定条件（才判上游漂移）与理由（不把插件 bug 甩给上游）', true,
+    /才判上游漂移/.test(disc3) && /插件 bug|插件侧/.test(disc3));
+  eq('🟠P1-新-2：纪律③ 条内不得退回「有漂移即判」旧口径', 'no-loosened-wording',
+    /有漂移即判|漂移即判上游/.test(disc3) ? 'loosened-wording-present' : 'no-loosened-wording');
   eq('纪律④（定位：该条行内）写明唯一事实源 contract.mjs', true,
     (discText['4'] ?? '').includes('src/harness/contract.mjs') && (discText['4'] ?? '').includes('唯一事实源'));
+
+  // 🟠P1-新-?（v0.1.7）：上轮 M06「删唯一事实源声明句」**逃逸**，根因是本段断言用的是
+  // `lineOf(predicate)` = 段内**首个**匹配行，而纪律④（line 28）也含
+  // 「唯一事实源」+ `src/harness/contract.mjs` → 删掉正文声明句后由纪律④**顶包**，断言照绿。
+  // 修正：把「正文声明句」与「纪律④」两处**分开定位、分别断言**（按纪律小节作为分界，
+  // 声明句必须落在纪律小节**之前**），另加「同句必须点名唯一事实源 = 唯一事实源文件」的语义断言。
+  const factLines = section.split('\n').filter((line) => /唯一事实源/.test(line) && /src\/harness\/contract\.mjs/.test(line));
+  // 纪律小节起点：由此把段内切成「表格/声明区」与「纪律区」，两区各自至少 1 条命中
+  const discHeaderLine = section.split('\n').findIndex((line) => /四条纪律/.test(line));
+  const before = discHeaderLine === -1 ? section.split('\n') : section.split('\n').slice(0, discHeaderLine);
+  // 只取「本表声明块」的行：以「判据表**唯一事实源**有两处」为锚，往下到纪律小节。
+  // （段内别处也有 '唯一事实源 + contract.mjs' —— 如 🔴-D「写入端纪律」里的「归属路由的唯一事实源」，
+  //  那是**另一条口径**，不应被算进本表的声明块，否则计数断言会被它顶包/干扰。）
+  const declStart = before.findIndex((line) => /唯一事实源\*\*有两处|唯一事实源.*有两处/.test(line));
+  const declBlock = declStart === -1 ? before : before.slice(declStart);
+  const declLines = declBlock.filter((line) => /唯一事实源/.test(line));
+  eq('🟠P1-新-?：判据表**正文**（纪律小节之前）独立给出「唯一事实源」声明句', true, declLines.length > 0);
+  // 🟠P1-新-?（v0.1.7 二轮）：**每处各占一行、逐行断言**。
+  // 上一版把两个事实源写在**同一行**、用 `/共用|唯一事实源口径/` 做行级 includes——
+  // 删掉前一半的「探针与执行器共用」后，**同一行后文字段**里的「共用」（影响面报告共用）顶包 → 逃逸。
+  // 教训：一行承载两个事实时，行级 includes 永远守不住其中任意一个。现在两处必须各自成行。
+  const declContract = declLines.filter((line) => line.includes('src/harness/contract.mjs'));
+  const declTriage = declLines.filter((line) => line.includes('src/triage/index.mjs') || line.includes('DRIFT_IMPACT'));
+  eq('🟠P1-新-?：check 名单唯一事实源独立成行（contract.mjs）', 1, declContract.length);
+  eq('🟠P1-新-?：contract.mjs 那行写全「唯一事实源」+「探针与执行器共用」+ 防漂移理由', true,
+    declContract.some((line) => line.includes('唯一事实源') && /探针与执行器共用/.test(line) && /防两侧漂移/.test(line)));
+  eq('🟠P1-新-?：漂移相关性表唯一事实源独立成行（triage/index.mjs 的 DRIFT_IMPACT）', 1, declTriage.length);
+  eq('🟠P1-新-?：triage 那行写全「漂移相关性表」+「DRIFT_IMPACT」+ 共用户（执行器与影响面报告）', true,
+    declTriage.some((line) => /漂移相关性表/.test(line) && line.includes('DRIFT_IMPACT') && /执行器与影响面报告共用/.test(line)));
+  // 两处必须落在**不同行**（同一条命中两处 = 单条顶包，删任一处仍绿）
+  eq('🟠P1-新-?：两处唯一事实源落在不同行（防单条顶包）', true, declContract.length > 0 && declTriage.length > 0 && declContract[0] !== declTriage[0]);
+  // 🟠P1-新-?（v0.1.7 三轮）：**总起句**必须存在且写明「两处 + 各管一半 + 缺一即红」。
+  // 二轮把两个事实源拆成子项后，总起句（「有两处，各管一半（缺一即红）」）可被整行删除而
+  // 两个子项仍在 → 断言照绿（「拆行」把守点从「一处」变成「三处」，总起句漏守）。
+  // 教训：拆行是必要的，但**拆出来的每一层都要有人守**，否则只是把活口挪了个位置。
+  eq('🟠P1-新-?：总起句写明「两处 / 各管一半 / 缺一即红」（防整行删除）', true,
+    before.some((line) => /唯一事实源/.test(line) && /有两处/.test(line) && /各管一半/.test(line) && /缺一即红/.test(line)));
+  eq('🟠P1-新-?：纪律④ 条内同样给出唯一事实源（两处独立，不互相顶包）', true,
+    (discText['4'] ?? '').includes('src/harness/contract.mjs') && (discText['4'] ?? '').includes('唯一事实源'));
+  // 声明句与纪律④ 必须在**不同行**（同一条命中两处 = 纪律④ 顶包，删声明句后仍绿）
+  eq('🟠P1-新-?：声明句与纪律④ 是两条独立行（防单条顶包）', true, factLines.length >= 2);
   // 2b 行必须在 3 行之前的**文档理由**也要在（防「改了顺序、理由段说谎」）
   const whyLine = lineOf((line) => /2b 为什么必须在 3 之前/.test(line));
   eq('2b 行序理由段存在且写明「在 3 之前」', true, whyLine.length > 0);
+}
+
+// ---- 7c. 漂移相关性表：唯一事实源（v0.1.7） ----
+// 为什么守：v0.1.6 前，漂移相关性在 `verify/runner.mjs` 里是 **4 条手写 `||`**，
+// 与 ARCHITECTURE 文档表、triage 影响面表**三处各自维护**——新增契约字段时静默漏判
+// （漏判 = 漂移相关性弱于实际 → 插件 bug 可能被甩给上游）。现在唯一事实源 = `DRIFT_IMPACT`。
+console.log('  [7c] 漂移相关性表唯一事实源（runner 不再硬编码 / 硬证据不入表）');
+{
+  const runnerCode = readText(path.join(ROOT, 'src/verify/runner.mjs'), 'utf8');
+  const triageCode = readText(path.join(ROOT, 'src/triage/index.mjs'), 'utf8');
+
+  // 1. runner 必须 import 唯一事实源，且**不得**再出现字段名字面量硬编码
+  eq('runner 从 triage 引入 DRIFT_IMPACT（唯一事实源）', true,
+    /import \{[^}]*DRIFT_IMPACT[^}]*\} from '\.\.\/triage\/index\.mjs'/.test(runnerCode));
+  const hardCoded = DRIFT_FIELDS.filter((field) => new RegExp(`fields\\.has\\('${field}'\\)`).test(runnerCode));
+  eq('runner 判定式不再硬编码任何登记字段（改一处即全生效）', [], hardCoded);
+  // 2. 旧的前缀通配（dispatch.）不得回退：它会把「新增 dispatch 类字段」误判成漂移相关
+  eq('runner 判定式不使用 dispatch. 前缀通配（回退即红）', false,
+    runnerCode.includes("startsWith('dispatch.')"));
+
+  // 3. 硬证据（PLUGIN_HARD_EVIDENCE）永不入漂移相关性表（🔴-C 防复发）
+  const hardInTable = Object.values(DRIFT_IMPACT).flatMap((v) => v.checks).filter((n) => PLUGIN_HARD_EVIDENCE.includes(n));
+  eq('🔴-C 防复发：DRIFT_IMPACT 不含 PLUGIN_HARD_EVIDENCE 任何条目', [], hardInTable);
+
+  // 4. 表内 check 名必须在唯一事实源的 check 名单里（不新造名字）
+  const knownChecks = new Set([...HOST_SIDE_CHECKS, ...CONTRACT_SIDE_CHECKS, ...PLUGIN_SIDE_CHECKS,
+    'host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed',
+    'guard.reserved_name', 'compat.schema_flatten', 'guard.reserved_rejected',
+    'plugin.loaded', 'plugin.apply_ok', 'plugin.definitions_ok', 'registry.exact',
+    'dispatch.execute_ok', 'dispatch.render_projected', 'dispatch.echo_payload', 'dispatch.abort_semantics',
+    'lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose']);
+  const unknownChecks = Object.values(DRIFT_IMPACT).flatMap((v) => v.checks).filter((n) => !knownChecks.has(n));
+  eq('DRIFT_IMPACT 内 check 名均属唯一事实源名单（不新造）', [], unknownChecks);
+
+  // 5. 判据只读结构化字段的纪律，在本模块产出的 advice 里也被显式声明（不得回灌判据）
+  eq('triage 声明「人类排障建议不得回灌进 verify 判据」', true,
+    triageCode.includes('不得**回灌进') || triageCode.includes('不得回灌进'));
+}
+
+// ---- 9. triage 上游影响面（v0.1.7 新能力：从「有没有漂移」推到「漂移到哪 / 影响谁 / 改哪」） ----
+console.log('  [9] triage 上游漂移自动归因（影响面 + 迁移建议）');
+{
+  // 9a. 保留名漂移：新出现的保留名必须被显式点名（插件必须改名）
+  eq('diffReservedNames：新出现保留名被识别', ['run_script'],
+    diffReservedNames('tool name "run_code" is reserved for X', 'tool name "run_script" is reserved for X').appeared);
+  eq('diffReservedNames：措辞无引号时兜底识别', ['run_script'],
+    diffReservedNames('run_code is reserved', 'run_script is reserved').appeared);
+
+  // 9b. 四类已登记字段 → 影响面 / 责任方 / 中台文件 必须齐备
+  for (const field of DRIFT_FIELDS) {
+    const [item] = classifyDrift({ items: [{ channel: 'dev', field, before: 'a', after: 'b' }] });
+    eq(`classifyDrift(${field})：known=true 且给出受影响检查`, true, item.known === true && item.checks.length > 0);
+    eq(`classifyDrift(${field})：点名中台要改的文件且文件真实存在`, true,
+      item.hubFiles.length > 0 && item.hubFiles.every((f) => existsSync(path.join(ROOT, f))));
+    eq(`classifyDrift(${field})：给出一步动作`, true, typeof item.action === 'string' && item.action.length > 10);
+  }
+
+  // 9c. 未登记字段：**不猜**（known=false），且不得给出「改插件」的建议
+  const [unknownField] = classifyDrift({ items: [{ channel: 'dev', field: 'brandNewField', before: 'a', after: 'b' }] });
+  eq('未登记字段 → known=false（不猜）', false, unknownField.known);
+  eq('未登记字段 → 不给中台文件（不瞎指）', [], unknownField.hubFiles);
+  eq('未登记字段 → 插件影响为「未知，不得据此改插件」', true, unknownField.pluginImpact.includes('未知'));
+
+  // 9d. 汇总：版本漂移 + 契约漂移 → hubFiles / plugins / advice 齐备
+  const triage = triageUpstream({
+    report: { drift: [{ channel: 'dev', pkg: '@deepseek-ai/dsh-tools', pinned: '0.1.6-alpha.2', latest: '0.1.6-alpha.3' }] },
+    contractDrift: { changed: true, items: [{ channel: 'dev', field: 'reservedName', before: 'tool name "run_code" is reserved', after: 'tool name "run_script" is reserved' }] },
+  });
+  eq('triage.hasDrift（版本漂移也算）', true, triage.hasDrift);
+  eq('triage 汇总出中台要改的文件', true, triage.hubFiles.length > 0);
+  eq('triage 汇总出插件义务（新增保留名 → 必须改名）', true, triage.plugins.some((t) => t.includes('必须')));
+  eq('triage 版本漂移给出三步动作（bump → verify → 定向修）', 3, triage.versions[0].step.length);
+  eq('triage 建议里写明「advice 不得回灌判据」', true, triage.advice.some((a) => a.includes('不得') && a.includes('判据')));
+
+  // 9e. 无漂移：hasDrift=false 且给「无需动作」
+  const calm = triageUpstream({ report: { drift: [] }, contractDrift: { changed: false, items: [] } });
+  eq('无漂移 → hasDrift=false', false, calm.hasDrift);
+  eq('无漂移 → 建议「无需动作」', true, calm.advice.some((a) => a.includes('无需动作')));
 }
 
 // ---- 8. 装配器：宿主/环境侧失败必须落结构化字段（离线缺缓存路径，无网可跑） ----

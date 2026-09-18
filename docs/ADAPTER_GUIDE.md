@@ -16,6 +16,7 @@
 | 在 `execute` 里尊重 `exec.signal` | ✅ 中台统一包装 |
 | 写双版本适配验收脚本 | ✅ 中台 `verify --channel stable|dev` |
 | 盯上游有没有发新版 | ✅ 中台 `watch` + crontab |
+| 上游发版后「漂移到哪、影响谁、我要不要动」 | ✅ 中台 `watch --markdown`（**影响面自动归因**，直接点名中台改哪一处） |
 
 ---
 
@@ -145,8 +146,12 @@ node /path/to/hub/src/cli.mjs verify --channel stable --plugin ./index.mjs --too
 # 三通道全跑（all = stable + dev + legacy，与页面按钮同义）
 node /path/to/hub/src/cli.mjs verify --channel all --plugin ./index.mjs --tools myplugin_echo,myplugin_status
 
-# 看上游有没有发新版
-node /path/to/hub/src/cli.mjs watch
+# 看上游有没有发新版 + 影响面自动归因（漂移到哪 / 影响谁 / 改哪一处）
+node /path/to/hub/src/cli.mjs watch --markdown
+
+# CI 上：把验收报告喂进来，watch 同时给出「版本漂移 + 契约漂移 + 影响面」（不必再跑真宿主）
+node /path/to/hub/src/cli.mjs verify --channel all --plugin ./index.mjs --tools a,b --json ./verify.json
+node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 ```
 
 ---
@@ -206,7 +211,8 @@ node /path/to/hub/src/cli.mjs watch
 1. 宿主/环境侧    结构化字段 hostFatal[] 非空（或失败项属宿主侧 check）
 2. 版本线 unknown 探针无法判定版本线
 3. 插件侧硬证据   插件声明了 DSH 保留名（guard.reserved_rejected）——**优先于契约漂移相关性**
-4. 契约漂移相关   漂移字段与失败 check 相关（guard.reserved_name / compat.schema_flatten / dispatch.*）
+4. 契约漂移相关   漂移字段与失败 check **一一对应**（表 = src/triage/index.mjs 的 DRIFT_IMPACT；
+                  含 guard.reserved_name / compat.schema_flatten / detect.flavor_known / dispatch 四项精确名）
 5. 无可用基线     契约 check 失败且首次采集 → 保守判漂移（让人确认）
 6. 插件侧 check   插件侧 / 中台契约层检查失败（上游契约与基线一致）
 7. UNKNOWN        有失败但无可识别 check（被外力打断）→ 不猜、不甩锅
@@ -223,6 +229,9 @@ node /path/to/hub/src/cli.mjs watch
 
 > 第 3 条是「漂移窗口内的插件 bug」不被吞的关键：上游取消保留名 = 契约漂移（照实记录），
 > 但插件**仍不得**声明 `run_code`——两者互不抵消。
+>
+> 上游发版后先跑 `watch --markdown`：它会把「契约字段漂移 → 受影响检查 → 责任方 → 中台改哪个文件 →
+> 插件要不要动」一次列清（未登记的契约字段会显式标「未登记、先补表」，**不瞎指**）。
 >
 > 排障口径（漂移窗口首跑顺序）：**判定漂移以首次运行或干净副本为准**。
 > 漂移窗口内若先跑健康插件，该通道 `ok` → 漂移契约被写进基线，后续运行 `contractDrift.changed=false`，
