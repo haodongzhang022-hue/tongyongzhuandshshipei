@@ -41,17 +41,29 @@ main:
               --json ./.ci/verify-dev.json --markdown
         - name: guardrail-negative
           script: |
-            # 负例：违反宿主硬约束的插件必须被拦下（防止护栏静默失效）
+            # 负例：违反宿主硬约束的插件必须被拦下，**且归因必须是插件侧**
+            # （只看退出码不够：AMBER 漂移窗口内负例也会 fail，闸门会静默失效）
             if node src/cli.mjs verify --channel stable \
                  --plugin ./tests/fixtures/broken-plugin.mjs \
                  --tools broken_ok --json ./.ci/verify-broken.json; then
               echo "❌ 负例插件被误判为通过：护栏失效"; exit 1
             fi
-            echo "✅ 负例插件被正确拦下"
+            node -e '
+              const r = require("./.ci/verify-broken.json");
+              const c = r.channels[0];
+              const guard = (c.checks || []).find((x) => x.name === "guard.reserved_rejected");
+              const bad = [];
+              if (!guard || guard.status !== "fail") bad.push("失败项不是 guard.reserved_rejected");
+              if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因不是 PLUGIN_REGRESSION（实得 " + c.attribution + "）");
+              if (r.summary.verdict === "AMBER") bad.push("判决为 AMBER（负例被归因成上游漂移）");
+              if (bad.length) { console.error("❌ 负例闸门失败：" + bad.join("；")); process.exit(1); }
+              console.log("✅ 负例插件被正确拦下，且归因为 PLUGIN_REGRESSION（verdict=" + r.summary.verdict + "）");
+            '
         - name: attribution-e2e
           script: |
             # 归因端到端回归（真宿主）：上游取消保留名 → GREEN 且记漂移；
             # 插件 apply 抛错 / 语法错误 / 缺 apply / 多余工具 → PLUGIN_REGRESSION；
+            # 漂移窗口 + 插件声明保留名 → 仍 PLUGIN_REGRESSION（🔴-C 原始复现）；
             # hub 路径含 npm 不得翻案（🔴-A / 🔴-B 原始复现场景）
             node tests/test_e2e_regression.mjs
     - name: upstream-watch
@@ -100,6 +112,10 @@ main:
               --plugin ./tests/fixtures/demo-plugin.mjs \
               --tools demo_echo,demo_status \
               --json ./.ci/verify-legacy.json --markdown
+        - name: attribution-e2e
+          script: |
+            # 归因端到端回归（含 🔴-C 漂移窗口不吞插件硬违规）
+            node tests/test_e2e_regression.mjs
         - name: attribution-e2e
           script: |
             node tests/test_e2e_regression.mjs

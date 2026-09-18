@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 59 项 + 归因离线回归 43 项 + 发布面自检 16 项 ✅   归因端到端回归 28 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
+离线单测 59 项 + 归因离线回归 48 项 + 发布面自检 16 项 ✅   归因端到端回归 34 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
 ```
 
 ---
@@ -192,8 +192,8 @@ tongyongzhuandshshipei/
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
 │   ├── test_offline.sh                # 59 项离线单测（无网可跑）
-│   ├── test_attribution.mjs           # 43 项归因离线回归（契约采集无残留 + 判据结构化 + 判据表完备性）
-│   ├── test_e2e_regression.mjs        # 28 项归因端到端回归（真宿主；🔴-A / 🔴-B 复现）
+│   ├── test_attribution.mjs           # 48 项归因离线回归（契约采集无残留 + 判据结构化 + 🔴-C 硬证据优先 + 判据表完备性）
+│   ├── test_e2e_regression.mjs        # 34 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C 复现）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
 │   └── fixtures/{demo,broken}-plugin.mjs
@@ -233,7 +233,29 @@ export function apply(ctx) {
 | `dsh-adapt watch` | 0 = 无漂移；1 = 有漂移；2 = 离线 | 上游侦测 |
 | `dsh-adapt report --markdown` | 同 verify | 二级信息 |
 
-**③ 通道定义契约（`registry/channels.json`）**
+**③ 归因契约（`verify` 报告，机器可读）**
+
+判据按优先级（**结构化**，不用裸关键词）：
+
+| 优先级 | 证据 | 归因 |
+|---|---|---|
+| 1 | 错误串含 `fatal(host)`，或失败项属 `HOST_SIDE_CHECKS`（`host.tools_ready` / `detect.flavor_known` / `contract.probe_disposed`） | `UPSTREAM_DRIFT` |
+| 2 | 版本线探测为 `unknown` | `UPSTREAM_DRIFT` |
+| **2b** | 失败项属 **`PLUGIN_HARD_EVIDENCE`**（`guard.reserved_rejected`）—— 插件违反宿主硬约束，**优先于任何漂移相关性** | `PLUGIN_REGRESSION` |
+| 3 | 契约指纹漂移，且漂移字段与失败 check **一一对应**（`reservedName`↔`guard.reserved_name`、`schemaSubset`↔`compat.schema_flatten`、`configProjection`↔`detect.flavor_known`、`outputShape`↔`dispatch.*`） | `UPSTREAM_DRIFT` |
+| 4 | 契约 check 失败且**无可用基线**（首次采集，无法判定上游） | `UPSTREAM_DRIFT`（保守） |
+| 5 | 失败项属 `PLUGIN_SIDE_CHECKS` / `CONTRACT_SIDE_CHECKS`（基线一致） | `PLUGIN_REGRESSION` |
+| 6 | 有失败但无可识别 check（被外力中断等） | `UNKNOWN`（不猜、不甩锅） |
+
+> **2b 为什么必须在 3 之前**：上游若放宽保留名校验（`reservedName` 漂移），
+> `guard.reserved_rejected` 仍会 fail。若让漂移相关性先判，插件侧硬违规会被吞成
+> `UPSTREAM_DRIFT`/AMBER，责任被甩给上游（评审 🔴-C）。
+> `guard.reserved_name` 是**中台自检**（hub 自身护栏），不属硬证据——用 `guard.*`
+> 通配会过度修正（评审 🟡-1）。
+>
+> 判据表**唯一事实源**在 `src/harness/contract.mjs`（探针与执行器共用，防两侧漂移）。
+
+**④ 通道定义契约（`registry/channels.json`）**
 
 ```json
 {
@@ -278,7 +300,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 59 项 + 归因离线回归 43 项 + 发布面自检 16 项 + 归因端到端回归 28 项 + 负例拦下 | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 59 项 + 归因离线回归 48 项 + 发布面自检 16 项 + 归因端到端回归 34 项 + 负例拦下 | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |

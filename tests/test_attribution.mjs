@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync as readText } from 'node:fs';
-import { CONTRACT_SIDE_CHECKS, HOST_SIDE_CHECKS, PLUGIN_SIDE_CHECKS, collectContract } from '../src/harness/contract.mjs';
+import { CONTRACT_SIDE_CHECKS, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS, collectContract } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
 import { channelFingerprint, loadChannels, pruneHostCache } from '../src/harness/host.mjs';
@@ -130,6 +130,26 @@ eq('契约 check 失败但基线一致 → PLUGIN_REGRESSION', 'PLUGIN_REGRESSIO
   eq('旧版死判据不再出现', 'no-dead-criteria',
     /register\.count|register\.no_issues/.test(attributeFailure.toString()) ? 'dead-criteria-present' : 'no-dead-criteria');
 }
+
+// ---- 4b. 插件侧硬证据优先于漂移相关性（评审 🔴-C） ----
+console.log('  [4b] 插件侧硬证据优先于漂移相关性（🔴-C）');
+eq('硬证据清单精确到 guard.reserved_rejected（不含 guard.* 通配）', JSON.stringify(['guard.reserved_rejected']), JSON.stringify(PLUGIN_HARD_EVIDENCE));
+eq('漂移窗口 + 插件声明保留名 → PLUGIN_REGRESSION（不被吞成漂移）', 'PLUGIN_REGRESSION',
+  attributeFailure(probeOf(['guard.reserved_rejected: 插件声明了 DSH 保留名 run_code'], [failCheck('guard.reserved_rejected')]), channel, 'dev',
+    { contractDrift: { changed: true, items: [{ field: 'reservedName' }] } }));
+{
+  const detail = attributionDetail(probeOf(['guard.reserved_rejected: 插件声明了 DSH 保留名 run_code'], [failCheck('guard.reserved_rejected')]), channel, 'dev',
+    { contractDrift: { changed: true, items: [{ field: 'reservedName' }] } });
+  eq('硬证据理由链可审计（指明与漂移无关）', true, detail.reasons.some((reason) => reason.includes('guard.reserved_rejected') && reason.includes('漂移')));
+}
+// 反向护栏：中台自检 guard.reserved_name + 漂移 → 仍判漂移（不得过度修正）
+eq('反向护栏：漂移窗口 + guard.reserved_name fail → 仍 UPSTREAM_DRIFT（中台自检，不算插件违规）', 'UPSTREAM_DRIFT',
+  attributeFailure(probeOf(['guard.reserved_name: tool name "run_code" is reserved'], [failCheck('guard.reserved_name')]), channel, 'dev',
+    { contractDrift: { changed: true, items: [{ field: 'reservedName' }] } }));
+// 反向护栏：同一漂移窗口内的插件侧业务失败仍判插件
+eq('反向护栏：漂移窗口 + registry.exact fail → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
+  attributeFailure(probeOf(['registry.exact: 期望 a / 实得 b'], [failCheck('registry.exact')]), channel, 'dev',
+    { contractDrift: { changed: true, items: [{ field: 'reservedName' }] } }));
 
 // ---- 5. CLI 参数契约（P2-1 / P2-2） ----
 console.log('  [5] CLI 参数契约');

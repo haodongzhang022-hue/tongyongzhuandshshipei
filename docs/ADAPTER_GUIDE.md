@@ -168,27 +168,33 @@ node /path/to/hub/src/cli.mjs watch
 
 > 报告里的 `attributionReasons` 是**判据链**：告诉你这次为什么这么判（哪条信号命中），不必猜。
 
+> **优先级提醒**：插件侧**硬证据**（声明 DSH 保留名 → `guard.reserved_rejected` fail）
+> **优先于**上游漂移相关性——即使上游此刻正在漂移，你的保留名冲突也会如实归因为
+> `PLUGIN_REGRESSION`，不会被甩成「上游变了，不是你的问题」。
+
 **17 项检查清单**（三通道一致）：
 
 ```
 host.tools_ready        宿主 ToolRuntime 就绪
 detect.flavor_known     版本线可判定
 contract.probe_disposed 契约探测采集后已全部卸载（无残留）
+guard.reserved_name     中台保留名护栏可用（中台自检，非插件违规）
+compat.schema_flatten   schema 压平后无违规
 plugin.loaded           插件导出 apply(ctx)（import 失败/未导出 → 插件侧失败）
 plugin.apply_ok         插件 apply(ctx) 执行成功
-plugin.definitions_ok   插件导出可用的 definitions 数组
 registry.exact          注册工具清单精确匹配
 dispatch.execute_ok     真实 dispatch 成功
 dispatch.render_projected  output.render 投影正确
 dispatch.echo_payload   业务返回值正确（插件无 *echo 工具时自动跳过）
 dispatch.abort_semantics  exec.signal 取消语义生效
-guard.reserved_name     中台保留名护栏可用（run_code 被插件侧拒绝）
-compat.schema_flatten   schema 压平后无违规
-guard.reserved_rejected 插件声明的保留名必须被拒绝并上报（声明即判失败）
+plugin.definitions_ok   插件导出可用的 definitions 数组
 lifecycle.disposer_count disposer 数量正确（按可注册定义数计）
 lifecycle.registered    独立上下文注册成功
 lifecycle.dispose       卸载后无残留
+guard.reserved_rejected 插件声明的保留名必须被拒绝并上报（声明即判失败）
 ```
+
+> 顺序即探针实际执行顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 
 ---
 

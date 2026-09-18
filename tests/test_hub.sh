@@ -6,7 +6,7 @@
 #  2. stable 通道：示例插件必须通过
 #  3. dev 通道：示例插件必须通过
 #  4. legacy 通道：示例插件必须通过（防「为适配新版把旧版装崩」）
-#  5. 负例插件：必须被中台拦下（保留名 / schema 子集），且归因为插件侧问题
+#  5. 负例插件：必须被中台拦下（保留名 / schema 子集），且**归因必须是插件侧**（不得被漂移吞掉）
 #  6. 归因端到端回归：上游取消保留名 → GREEN；插件侧失败 → PLUGIN_REGRESSION
 #  7. 上游变更侦测可运行（离线时允许返回 2，不视为失败）
 set -uo pipefail
@@ -28,7 +28,7 @@ else
   bad "离线单元测试失败"; tail -20 /tmp/offline.log
 fi
 if "$NODE_BIN" "$ROOT/tests/test_attribution.mjs" > /tmp/attribution.log 2>&1; then
-  ok "归因离线回归全绿（43 项：契约采集无残留 + 归因判据结构化 + 判据表完备性）"
+  ok "归因离线回归全绿（48 项：契约采集无残留 + 归因判据结构化 + 🔴-C 硬证据优先 + 判据表完备性）"
 else
   bad "归因离线回归失败"; tail -20 /tmp/attribution.log
 fi
@@ -50,7 +50,7 @@ for channel in $CHANNELS; do
   fi
 done
 
-step "3. 负例插件 · 必须被拦下，且失败原因必须是保留名冲突"
+step "3. 负例插件 · 必须被拦下，且归因必须是插件侧（不得被漂移吞掉）"
 if "$NODE_BIN" "$ROOT/src/cli.mjs" verify --channel stable \
     --plugin "$ROOT/tests/fixtures/broken-plugin.mjs" \
     --tools broken_ok --json /tmp/verify-broken.json > /tmp/verify-broken.log 2>&1; then
@@ -60,21 +60,34 @@ else
 const r = require('/tmp/verify-broken.json');
 const c = r.channels[0];
 const guard = (c.checks || []).find((x) => x.name === 'guard.reserved_rejected');
-console.log(r.summary.verdict + '|' + (r.summary.pluginRegression.join(',') || 'none') + '|' + (guard ? guard.status : 'missing'));
+console.log([r.summary.verdict, c.attribution, guard ? guard.status : 'missing'].join('|'));
 " 2>/dev/null || echo 'parse-failed|none|missing')"
   echo "     负例判决：$ATTRIBUTION"
+  # 断言 1：失败项确为 guard.reserved_rejected（名符实）
   if [[ "$ATTRIBUTION" == *"|fail" ]]; then
-    ok "负例插件被拦下，且失败项为 guard.reserved_rejected（保留名冲突，非巧合）"
+    ok "负例插件被拦下，失败项为 guard.reserved_rejected（保留名冲突，非巧合）"
   else
     bad "负例未因保留名冲突被拦下（断言名不符实）：$ATTRIBUTION"
   fi
+  # 断言 2：归因必须是 PLUGIN_REGRESSION（漂移窗口内不得被 UPSTREAM_DRIFT 吞掉）
+  if [[ "$ATTRIBUTION" == *"|PLUGIN_REGRESSION|"* ]]; then
+    ok "负例归因为 PLUGIN_REGRESSION（插件侧硬证据优先于漂移相关性）"
+  else
+    bad "负例归因不是 PLUGIN_REGRESSION（被漂移吞掉？）：$ATTRIBUTION"
+  fi
+  # 断言 3：判决不得为 AMBER（AMBER = 归因到上游，负例护栏在漂移窗口内静默失效）
+  if [[ "$ATTRIBUTION" == AMBER"|"* ]]; then
+    bad "负例判决为 AMBER（负例被归因成上游漂移，护栏静默失效）：$ATTRIBUTION"
+  else
+    ok "负例判决非 AMBER（verdict=${ATTRIBUTION%%|*}）"
+  fi
 fi
 
-step "4. 归因端到端回归（真宿主；上游取消保留名 / 插件侧失败）"
+step "4. 归因端到端回归（真宿主；上游取消保留名 / 插件侧失败 / 漂移窗口不吞插件硬违规）"
 "$NODE_BIN" "$ROOT/tests/test_e2e_regression.mjs" > /tmp/e2e.log 2>&1
 E2E_EXIT=$?
 if [[ "$E2E_EXIT" -eq 0 ]]; then
-  ok "归因端到端回归全绿（28 项；含 🔴-A / 🔴-B 原始复现场景）"
+  ok "归因端到端回归全绿（34 项；含 🔴-A / 🔴-B / 🔴-C 原始复现场景）"
 elif [[ "$E2E_EXIT" -eq 2 ]]; then
   echo "  ⚠️ 无宿主缓存，端到端回归跳过（前一步 verify 已建立缓存，正常不会走到这里）"
   ok "端到端回归显式跳过（不假装通过）"

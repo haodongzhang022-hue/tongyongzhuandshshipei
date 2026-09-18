@@ -16,7 +16,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { HUB_ROOT, loadChannels, runHostProbe } from '../harness/host.mjs';
-import { CONTRACT_SIDE_CHECKS, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, PLUGIN_SIDE_CHECKS } from '../harness/contract.mjs';
+import { CONTRACT_SIDE_CHECKS, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS } from '../harness/contract.mjs';
 import { channelContractDrift, contractSnapshot } from '../watch/upstream.mjs';
 
 /**
@@ -88,7 +88,7 @@ export function verifyChannel(options) {
  */
 
 // 判据表由 `harness/contract.mjs` 提供（探针与执行器共用同一份，防两侧漂移）。
-export { HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CHECKS, PLUGIN_SIDE_CHECKS };
+export { HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS };
 
 /**
  * 失败归因（详细版）：区分「上游漂移」与「插件回归」，并给出可审计的理由链。
@@ -97,6 +97,9 @@ export { HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CHECKS, PLUGIN_SIDE_
  * 1. **宿主/环境侧**：错误串含 `fatal(host)`，或失败项属 {@link HOST_SIDE_CHECKS}
  *    （宿主未就绪 / 版本线不可判定 / 契约探测未卸载）→ `UPSTREAM_DRIFT`；
  * 2. **版本线 unknown** → `UPSTREAM_DRIFT`；
+ * 2b. **插件侧硬证据**（{@link PLUGIN_HARD_EVIDENCE}，如 `guard.reserved_rejected`）
+ *    → `PLUGIN_REGRESSION`，**优先于任何漂移相关性**：插件违反宿主硬约束与上游契约是否
+ *    漂移无关，漂移窗口内也必须判插件（评审 🔴-C；精确 check 名，不用 `guard.*` 通配）；
  * 3. **契约指纹与基线不一致且漂移字段与失败 check 相关** → `UPSTREAM_DRIFT`；
  * 4. **中台契约 check 失败且无可用基线**（首次采集，无法判定上游是否变了）→ 保守判 `UPSTREAM_DRIFT`；
  * 5. **插件侧 check 失败** → `PLUGIN_REGRESSION`；
@@ -127,12 +130,24 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
   if (probe?.profile && probe.profile.flavor === 'unknown') reasons.push(`[${channelName}] 版本线探测为 unknown（${probe.profile.evidence ?? ''}）`);
   if (reasons.length > 0) return { attribution: 'UPSTREAM_DRIFT', channel: channelName, reasons };
 
+  // 2b. 插件侧硬证据：优先于漂移相关性（漂移窗口内插件违规仍判插件，评审 🔴-C）
+  const hardEvidence = PLUGIN_HARD_EVIDENCE.filter((name) => failedNames.has(name));
+  if (hardEvidence.length > 0) {
+    return {
+      attribution: 'PLUGIN_REGRESSION',
+      channel: channelName,
+      reasons: [`[${label}] 插件侧硬证据：${hardEvidence.join(',')}（违反宿主硬约束，与上游契约是否漂移无关 → 优先于漂移相关性）`],
+    };
+  }
+
   // 3. 契约指纹漂移：仅当**漂移字段与失败点相关**时判上游漂移（不把插件 bug 甩给上游）
+  //    注意 `reservedName` 只对应中台自检 `guard.reserved_name`——插件侧的
+  //    `guard.reserved_rejected` 已在 2b 拦下，不会被漂移吞掉。
   const drift = evidence.contractDrift;
   if (drift?.changed && drift.items?.length > 0) {
     const fields = new Set(drift.items.map((item) => item.field));
     const related =
-      (fields.has('reservedName') && (failedNames.has('guard.reserved_name') || failedNames.has('guard.reserved_rejected')))
+      (fields.has('reservedName') && failedNames.has('guard.reserved_name'))
       || (fields.has('schemaSubset') && failedNames.has('compat.schema_flatten'))
       || (fields.has('configProjection') && failedNames.has('detect.flavor_known'))
       || (fields.has('outputShape') && [...failedNames].some((name) => name.startsWith('dispatch.')));

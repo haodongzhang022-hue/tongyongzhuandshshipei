@@ -13,6 +13,8 @@
  * 3. **插件语法错误** → 期望 `PLUGIN_REGRESSION`。
  * 4. **插件未导出 `apply`** → 期望 `PLUGIN_REGRESSION`。
  * 5. **插件多注册工具** → 期望 `PLUGIN_REGRESSION`（且路径含 `npm` 也照样判插件）。
+ * 6. **漂移窗口 + 插件声明保留名**（评审 🔴-C 原始复现）→ 仍须 `PLUGIN_REGRESSION`，
+ *    且同窗口内的健康插件仍须 `PASS`（反向护栏不被打穿）。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
@@ -178,6 +180,24 @@ try {
   const broken = verify(path.join(ROOT, 'tests/fixtures/broken-plugin.mjs'), 'broken_ok');
   eq('声明保留名 → PLUGIN_REGRESSION（基线一致时）', 'PLUGIN_REGRESSION', broken.attribution);
   eq('失败项为 guard.reserved_rejected', true, (broken.checks ?? []).some((c) => c.name === 'guard.reserved_rejected' && c.status === 'fail'));
+
+  // ---- 8. 🔴-C 原始复现：漂移窗口内插件侧硬违规不得被吞成上游漂移 ----
+  // 上游放宽保留名校验（= reservedName 漂移）时，插件声明保留名仍必须判 PLUGIN_REGRESSION；
+  // 历史缺陷：漂移相关性判据把 guard.reserved_rejected 一起算作「相关」→ 误判 UPSTREAM_DRIFT/AMBER。
+  console.log('  [5] 🔴-C 原始复现：漂移窗口 + 插件声明保留名 → 仍须 PLUGIN_REGRESSION');
+  if (patchedFiles === 0) {
+    console.log('  ⏭️ 打补丁未生效，跳过 🔴-C 漂移窗口用例（不假装通过）');
+  } else {
+    const driftBroken = verify(path.join(ROOT, 'tests/fixtures/broken-plugin.mjs'), 'broken_ok', { tmp: patchedTmp });
+    eq('漂移窗口 + 声明保留名 → PLUGIN_REGRESSION（不被漂移吞掉）', 'PLUGIN_REGRESSION', driftBroken.attribution);
+    eq('漂移确实存在（reservedName 变了）', true, (driftBroken.contractDrift?.items ?? []).some((item) => item.field === 'reservedName'));
+    eq('失败项仍是 guard.reserved_rejected', true, (driftBroken.checks ?? []).some((c) => c.name === 'guard.reserved_rejected' && c.status === 'fail'));
+    eq('归因理由链指向插件侧硬证据', true, (driftBroken.attributionReasons ?? []).some((reason) => reason.includes('guard.reserved_rejected')));
+    eq('判决不是 AMBER（责任未被甩给上游）', true, driftBroken.attribution !== 'UPSTREAM_DRIFT');
+    // 反向护栏：同一漂移窗口内，健康插件仍须 PASS（🔴-A 场景不得被打穿）
+    const driftHealthy = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status', { tmp: patchedTmp });
+    eq('反向护栏：漂移窗口 + 健康插件 → 仍 PASS', 'PASS', driftHealthy.attribution);
+  }
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

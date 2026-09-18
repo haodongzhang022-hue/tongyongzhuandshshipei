@@ -73,7 +73,24 @@ export const HOST_SIDE_CHECKS = ['host.tools_ready', 'detect.flavor_known', 'con
 /** 中台自身契约检查项（失败是否算上游漂移，取决于契约基线是否漂移）。 */
 export const CONTRACT_SIDE_CHECKS = ['guard.reserved_name', 'compat.schema_flatten'];
 
-/** 插件侧检查项（失败即判插件回归；归因优先级低于宿主侧）。 */
+/**
+ * 插件侧**硬证据**检查项：失败即插件违反宿主硬约束，判 `PLUGIN_REGRESSION`，
+ * **优先于任何漂移相关性**（漂移窗口内也必须成立，见评审 🔴-C）。
+ *
+ * 纪律：**精确 check 名，不做前缀通配**。
+ * - `guard.reserved_rejected`：插件声明了 DSH 保留名（插件侧违规，与上游契约无关）；
+ * - `guard.reserved_name` **不在**此列：它是中台自检（hub 自身护栏坏了），
+ *   不是插件违规；把它算进硬证据会过度修正（评审 🟡-1）。
+ *
+ * 反例（为什么必须优先）：上游若放宽保留名校验（`reservedName` 漂移），
+ * `guard.reserved_rejected` 仍会 fail——若让漂移相关性先判，插件侧硬违规会被
+ * 吞成 `UPSTREAM_DRIFT`/AMBER，责任被甩给上游（历史缺陷 🔴-C）。
+ *
+ * @type {readonly string[]}
+ */
+export const PLUGIN_HARD_EVIDENCE = ['guard.reserved_rejected'];
+
+/** 插件侧检查项（失败即判插件回归；归因优先级低于宿主侧与插件侧硬证据）。 */
 export const PLUGIN_SIDE_CHECKS = [
   'plugin.loaded',
   'plugin.apply_ok',

@@ -20,6 +20,8 @@
 | R9 | **LOW** | Schema 子集收窄 | 上游新增/收紧 keyword 白名单 | 部分 schema 被拒 | `normalizeSchema` 白名单化 + 注册前 `issues` 上报 | 违规清单进报告，不静默丢字段 |
 | R10 | **LOW** | 同层重复注册同名工具 | 插件多次 `apply` | `is already registered` 抛错 | `adapter.disposeAll()` / 独立 `Context` | 探针含 `lifecycle.*` 检查，CI 可发现 |
 
+| R16 | **MEDIUM** | 漂移相关性吞掉插件侧硬违规（历史缺陷，评审二轮 🔴-C）：上游放宽保留名校验时，插件声明保留名被归因为上游漂移 | 漂移窗口（`reservedName` 变化）+ 插件声明 `run_code` | 插件违规被甩给上游，责任错、修错方向；负例闸门同步静默失效 | 插件侧硬证据 `PLUGIN_HARD_EVIDENCE`（`guard.reserved_rejected`）**优先于**漂移相关性；相关性收窄为只对应中台自检 `guard.reserved_name`（不用 `guard.*` 通配） | 离线回归 [4b] + 端到端 [5]（同窗口健康插件仍须 PASS，防过度修正） |
+
 ## 待人类拍板项（不拍板则按现状执行）
 
 | 项 | 现状 | 建议 | 影响面 |
