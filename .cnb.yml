@@ -1,0 +1,133 @@
+# DSH 适配中台 · 云原生构建流水线
+#
+# 设计要点（对应需求「跟着官方文档和新版本做适配」）：
+# 1. push / PR：离线单测 + **stable 与 dev 双通道真宿主验收**（legacy 走 crontab 周检，省额度）；
+# 2. crontab：每日侦测上游 dist-tag 漂移（越不稳定越需要自动化侦测）；
+# 3. web_trigger / web_trigger_watch：页面上给两个按钮，人不用记命令。
+main:
+  push:
+    - name: offline-unit
+      docker:
+        image: node:22
+      stages:
+        - name: offline-tests
+          script: |
+            bash tests/test_offline.sh
+    - name: dual-channel-verify
+      docker:
+        image: node:22
+      stages:
+        - name: stable-channel
+          script: |
+            # 稳定版通道：失败 = 插件回归，必须修
+            node src/cli.mjs verify --channel stable \
+              --plugin ./tests/fixtures/demo-plugin.mjs \
+              --tools demo_echo,demo_status \
+              --json ./.ci/verify-stable.json --markdown
+        - name: dev-channel
+          script: |
+            # 开发版通道：越不稳定越要跑；失败时归因区分「上游漂移 / 插件回归」
+            node src/cli.mjs verify --channel dev \
+              --plugin ./tests/fixtures/demo-plugin.mjs \
+              --tools demo_echo,demo_status \
+              --json ./.ci/verify-dev.json --markdown
+        - name: guardrail-negative
+          script: |
+            # 负例：违反宿主硬约束的插件必须被拦下（防止护栏静默失效）
+            if node src/cli.mjs verify --channel stable \
+                 --plugin ./tests/fixtures/broken-plugin.mjs \
+                 --tools broken_ok --json ./.ci/verify-broken.json; then
+              echo "❌ 负例插件被误判为通过：护栏失效"; exit 1
+            fi
+            echo "✅ 负例插件被正确拦下"
+    - name: upstream-watch
+      docker:
+        image: node:22
+      stages:
+        - name: watch-dist-tags
+          script: |
+            # 上游有新版本时退出码 1：不阻断主干（漂移不是错误，是信号），但显式可见
+            node src/cli.mjs watch --json ./.ci/watch.json || true
+            cat ./.ci/watch.json
+  pull_request:
+    - name: offline-unit
+      docker:
+        image: node:22
+      stages:
+        - name: offline-tests
+          script: |
+            bash tests/test_offline.sh
+    - name: dual-channel-verify
+      docker:
+        image: node:22
+      stages:
+        - name: stable-channel
+          script: |
+            node src/cli.mjs verify --channel stable \
+              --plugin ./tests/fixtures/demo-plugin.mjs \
+              --tools demo_echo,demo_status \
+              --json ./.ci/verify-stable.json --markdown
+        - name: dev-channel
+          script: |
+            node src/cli.mjs verify --channel dev \
+              --plugin ./tests/fixtures/demo-plugin.mjs \
+              --tools demo_echo,demo_status \
+              --json ./.ci/verify-dev.json --markdown
+        - name: legacy-guard
+          script: |
+            # 防「为适配新版把旧版装崩」
+            node src/cli.mjs verify --channel legacy \
+              --plugin ./tests/fixtures/demo-plugin.mjs \
+              --tools demo_echo,demo_status \
+              --json ./.ci/verify-legacy.json --markdown
+  # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
+  "crontab: 30 3 * * *":
+    - name: upstream-drift-scan
+      docker:
+        image: node:22
+      stages:
+        - name: watch
+          script: |
+            node src/cli.mjs watch --json ./.ci/watch.json
+        - name: legacy-weekly
+          script: |
+            # 历史线周检：仅周日跑 legacy 全量验收，避免每日消耗
+            if [ "$(date +%u)" = "7" ]; then
+              node src/cli.mjs verify --channel legacy \
+                --plugin ./tests/fixtures/demo-plugin.mjs \
+                --tools demo_echo,demo_status \
+                --json ./.ci/verify-legacy.json --markdown
+            else
+              echo "非周日，跳过 legacy 全量验收"
+            fi
+# 页面手动触发（按钮定义见 .cnb/web_trigger.yml；事件名必须与此处一致）
+$:
+  web_trigger:
+    - name: manual-dual-channel
+      docker:
+        image: node:22
+      stages:
+        - name: dual-channel
+          script: |
+            # CHANNEL 由页面按钮传入：both(默认) / stable / dev / all
+            case "$CHANNEL" in
+              stable) CHANNELS="stable" ;;
+              dev) CHANNELS="dev" ;;
+              all) CHANNELS="stable dev legacy" ;;
+              *) CHANNELS="stable dev" ;;
+            esac
+            FAIL=0
+            for ch in $CHANNELS; do
+              echo "==== 通道 $ch ===="
+              node src/cli.mjs verify --channel "$ch" --plugin "$PLUGIN_PATH" --tools "$TOOLS" --markdown || FAIL=1
+            done
+            exit $FAIL
+  web_trigger_watch:
+    - name: manual-upstream-watch
+      docker:
+        image: node:22
+      stages:
+        - name: watch
+          script: |
+            node src/cli.mjs watch --json ./.ci/watch.json
+            cat ./.ci/watch.json

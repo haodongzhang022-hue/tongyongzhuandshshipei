@@ -1,0 +1,46 @@
+{
+  "name": "@dongdongxiaozu/dsh-adapt-hub",
+  "version": "0.1.0",
+  "description": "DSH 适配中台：把「插件适配 DSH 生态」的重复劳动固化为可复用能力——版本线探测 / 契约兼容层 / 双通道（稳定版+开发版）验收 / 上游变更侦测。",
+  "type": "module",
+  "bin": {
+    "dsh-adapt": "./src/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./compat": "./src/compat/index.mjs",
+    "./detect": "./src/detect/index.mjs",
+    "./harness": "./src/harness/index.mjs",
+    "./verify": "./src/verify/runner.mjs",
+    "./watch": "./src/watch/upstream.mjs"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "registry",
+    "docs",
+    "templates"
+  ],
+  "scripts": {
+    "detect": "node src/cli.mjs detect",
+    "matrix": "node src/cli.mjs matrix",
+    "watch": "node src/cli.mjs watch",
+    "verify:stable": "node src/cli.mjs verify --channel stable --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
+    "verify:dev": "node src/cli.mjs verify --channel dev --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
+    "verify:all": "npm run verify:stable && npm run verify:dev",
+    "test": "bash tests/test_hub.sh",
+    "test:offline": "bash tests/test_offline.sh"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cnb",
+    "adapter",
+    "compat",
+    "plugin"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

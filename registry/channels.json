@@ -1,0 +1,90 @@
+{
+  "$comment": "DSH 适配中台 · 双通道钉版（唯一事实源）。stable = 稳定版通道；dev = 开发版通道。pins 为验收时安装的宿主包精确版本；npmTag 为自动解析「最新」时使用的 dist-tag。",
+  "schemaVersion": 1,
+  "updatedAt": "2026-09-18",
+  "channels": {
+    "stable": {
+      "label": "稳定版通道",
+      "intent": "对齐 DSH 稳定线：插件先保证在稳定宿主上不回归。",
+      "npmTag": "next",
+      "line": "0.1.5",
+      "flavorExpected": "modern",
+      "pins": {
+        "@deepseek-ai/cordis": "4.0.2",
+        "@deepseek-ai/dsh-tools": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-agent": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-scope": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-session": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-brand": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-util-values": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-invariants": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-system-prompt": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-user-approval": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-code-runtime": "0.1.5-rc.2",
+        "@deepseek-ai/schemastery": "3.18.2"
+      },
+      "riskNote": "官方当前尚未发布非 rc 的正式稳定版（dist-tags.latest 停留在 0.0.1-rc.1，属历史残留）。本通道以 next（0.1.5-rc.2）作为「事实稳定线」。",
+      "verified": true
+    },
+    "dev": {
+      "label": "开发版通道",
+      "intent": "对齐 DSH 开发线：越不稳定越要自动化——在 alpha 线上提前暴露破坏性变更。",
+      "npmTag": "alpha",
+      "line": "0.1.6",
+      "flavorExpected": "modern",
+      "pins": {
+        "@deepseek-ai/cordis": "4.0.2",
+        "@deepseek-ai/dsh-tools": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-llm": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-agent": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-scope": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-session": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-brand": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-util-values": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-invariants": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-system-prompt": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-user-approval": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-sandbox": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-sandbox-policy": "0.1.6-alpha.2",
+        "@deepseek-ai/dsh-ptc-runtime": "0.1.6-alpha.2",
+        "@deepseek-ai/schemastery": "3.18.2"
+      },
+      "riskNote": "alpha 线随时可能引入破坏性变更；本通道验收失败属预期信号，不等于插件有 bug，需人工判定是「上游变更」还是「插件回归」。",
+      "verified": true
+    },
+    "legacy": {
+      "label": "旧版通道（历史线，仅兼容性守门）",
+      "intent": "防止为适配新版而把旧版装崩（历史线冻结，不追新）。",
+      "npmTag": null,
+      "line": "0.1.1",
+      "flavorExpected": "legacy",
+      "pins": {
+        "@deepseek-ai/cordis": "4.0.1",
+        "@deepseek-ai/dsh-tools": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-agent": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-attachment": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-brand": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-code-runtime": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-invariants": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-llm": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-scope": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-session": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-system-prompt": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-timeout": "0.1.1-rc.2",
+        "@deepseek-ai/dsh-user-approval": "0.1.1-rc.2",
+        "@deepseek-ai/schemastery": "3.18.1"
+      },
+      "riskNote": "官方已不再演进该线（mode 取值 native|code|both）；保留仅作回归守门。",
+      "verified": true
+    }
+  },
+  "trackedPackages": [
+    "@deepseek-ai/dsh-tools",
+    "@deepseek-ai/dsh",
+    "@deepseek-ai/cordis",
+    "@deepseek-ai/dsh-ptc-runtime",
+    "@deepseek-ai/dsh-system-prompt",
+    "@deepseek-ai/dsh-sandbox-policy"
+  ]
+}
