@@ -68,10 +68,15 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D 闸门：插件写错代码（未初始化类字段 / 抛错 getter）→ 必须判插件，
-            # 且 hostFatal[] 必须为空（插件侧错误**永远**不进判据字段）。
+            # 🔴-D 闸门：插件写错代码（未初始化类字段 / 抛错 getter / **后台任务异步抛错**）
+            # → 必须判插件，且 hostFatal[] 必须为空（插件侧错误**永远**不进判据字段）。
             # 只看 attribution 不够：AMBER 漂移窗口下也可能 fail，必须同时断言 hostFatal 为空。
-            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin; do
+            #
+            # 异步两例（plugin-async-throw / plugin-async-reject）是本轮补的**同族活口**：
+            # 异常不在 run() 调用栈上，顶层 catch 接不到——旧探针会在写出结构化结果前被杀，
+            # 装配器看到「探针未输出结构化结果」→ 无条件 pushHostFatal() → 判漂移且 checks 归零。
+            # 故这里额外断言 checks 非空（报告没丢）与失败项是插件侧异步 check。
+            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin plugin-async-throw-plugin plugin-async-reject-plugin; do
               if node src/cli.mjs verify --channel stable \
                    --plugin ./tests/fixtures/$fixture.mjs \
                    --tools demo_echo --json ./.ci/verify-$fixture.json; then
@@ -85,8 +90,15 @@ main:
                 if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因不是 PLUGIN_REGRESSION（实得 " + c.attribution + "）");
                 if ((c.hostFatal || []).length !== 0) bad.push("hostFatal 非空（插件侧错误写进了判据字段）：" + JSON.stringify(c.hostFatal));
                 if (r.summary.verdict === "AMBER") bad.push("判决为 AMBER（插件 bug 被甩给上游）");
+                // 报告完整性：旧缺陷下 checks 会归零（整份报告消失）——这里必须非空且含 pass
+                const checks = c.checks || [];
+                if (checks.length === 0) bad.push("checks 为空（报告整份消失——旧缺陷形态）");
+                if (!checks.some((x) => x.status === "pass")) bad.push("无 pass 项（已跑完的检查被丢弃）");
+                if (/async/.test(file) && !checks.some((x) => x.name === "plugin.async_uncaught_exception")) {
+                  bad.push("异步夹具未落插件侧异步 check（plugin.async_uncaught_exception）");
+                }
                 if (bad.length) { console.error("❌ 🔴-D 闸门失败：" + bad.join("；")); process.exit(1); }
-                console.log("✅ " + file + "：PLUGIN_REGRESSION / hostFatal 为空 / verdict=" + r.summary.verdict);
+                console.log("✅ " + file + "：PLUGIN_REGRESSION / hostFatal 为空 / checks=" + checks.length + " / verdict=" + r.summary.verdict);
               ' ./.ci/verify-$fixture.json
             done
     - name: upstream-watch
@@ -141,24 +153,27 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D 闸门（同 push）：插件侧异常不得进 hostFatal[]
-            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin; do
+            # 🔴-D 闸门（同 push）：插件侧异常不得进 hostFatal[]——含**异步**两例
+            # （后台任务抛错 / 预取 promise 拒绝：不在 run() 调用栈上，旧探针会整份报告消失）
+            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin plugin-async-throw-plugin plugin-async-reject-plugin; do
               node src/cli.mjs verify --channel stable \
                 --plugin ./tests/fixtures/$fixture.mjs \
                 --tools demo_echo --json ./.ci/verify-$fixture.json && { echo "❌ $fixture 被误判为通过"; exit 1; }
               node -e '
                 const r = require(process.argv[1]);
                 const c = r.channels[0];
-                if (c.attribution !== "PLUGIN_REGRESSION" || (c.hostFatal || []).length !== 0) {
-                  console.error("❌ 🔴-D 闸门失败：" + c.attribution + " / hostFatal=" + JSON.stringify(c.hostFatal));
+                const checks = c.checks || [];
+                const bad = [];
+                if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因 " + c.attribution);
+                if ((c.hostFatal || []).length !== 0) bad.push("hostFatal=" + JSON.stringify(c.hostFatal));
+                if (checks.length === 0) bad.push("checks 为空（报告整份消失）");
+                if (bad.length) {
+                  console.error("❌ 🔴-D 闸门失败：" + bad.join(" / "));
                   process.exit(1);
                 }
-                console.log("✅ " + process.argv[1] + "：PLUGIN_REGRESSION / hostFatal 为空");
+                console.log("✅ " + process.argv[1] + "：PLUGIN_REGRESSION / hostFatal 为空 / checks=" + checks.length);
               ' ./.ci/verify-$fixture.json
             done
-        - name: attribution-e2e
-          script: |
-            node tests/test_e2e_regression.mjs
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
     - name: upstream-drift-scan

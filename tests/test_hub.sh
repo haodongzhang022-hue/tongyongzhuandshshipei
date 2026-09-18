@@ -117,16 +117,25 @@ else
   bad "基线被验收过程改写（漂移侦测会被自己写坏）"; git -C "$ROOT" diff --stat -- registry/contract-snapshots/latest.json
 fi
 
-step "7. 文档计数防漂移（文档声明的项数必须等于实际跑出来的项数）"
+step "7. 文档计数防漂移（文档声明的项数必须等于实际跑出来的项数；声明缺失即红）"
 # P2-9 同族：文档/编排里的「N 项」最容易与实际脱节（59/48/34 就曾残留两轮）。
 # 这里把**实际**项数与文档声明**逐一对齐**：任一文档写错 → 本节红（不是靠人眼复核）。
+#
+# 🟡-2（评审实测逃逸）：上一版在取不到声明时只打 `⚠️ 跳过比对`，**不递增 DOC_COUNT_MISMATCH**
+# → 把 README 的计数声明行整行删掉，三条比对全部「跳过」、本节仍绿。
+# 防线对「改数」有效、对「删声明」无效——而删声明恰恰是「忘了同步」的最省事做法。
+# 修法：**声明缺失即 FAIL**（声明本身是必需项）。计数口径因此分两类，都必须为 0：
+#   - DOC_COUNT_MISMATCH：声明存在但数值 ≠ 实际；
+#   - DOC_COUNT_MISSING：声明行缺失（有人删了它）。
 DOC_COUNT_MISMATCH=0
+DOC_COUNT_MISSING=0
 check_doc_count() {
   local label="$1" actual="$2" pattern="$3" file="$4"
   local declared
   declared="$(grep -oE "$pattern" "$ROOT/$file" | head -1 | sed -E 's/.* ([0-9]+) 项$/\1/')"
   if [[ -z "$declared" ]]; then
-    echo "  ⚠️ $file 未找到「$label」的项数声明（跳过比对）"
+    bad "$file 的「$label」项数声明**缺失**（声明本身是必需项：删掉它 = 防漂移失效）"
+    DOC_COUNT_MISSING=$((DOC_COUNT_MISSING + 1))
     return
   fi
   if [[ "$declared" == "$actual" ]]; then
@@ -136,6 +145,23 @@ check_doc_count() {
     DOC_COUNT_MISMATCH=$((DOC_COUNT_MISMATCH + 1))
   fi
 }
+
+# 守卫自证（把「为什么必须判红」写成可执行断言，防后人改回「跳过」）：
+# ① 声明缺失时**必须**判红（bad 被调用、计数递增）；② 声明存在时不误报。
+# 自证在**子 shell** 里跑（`( ... )`），父 shell 的 PASS/FAIL/计数不受影响——
+# 测试自证不得污染被测口径（否则「自证」本身就是新的噪声源）。
+_selfcheck="$( (
+  PASS=0; FAIL=0; DOC_COUNT_MISMATCH=0; DOC_COUNT_MISSING=0
+  bad() { FAIL=$((FAIL + 1)); }
+  ok() { PASS=$((PASS + 1)); }
+  check_doc_count "自证-声明缺失" "1" '绝不存在的声明 [0-9]+ 项' 'tests/fixtures/__no_such_doc__.md'
+  echo "missing=$DOC_COUNT_MISSING fail=$FAIL"
+) 2>/dev/null )"
+if [[ "$_selfcheck" == "missing=1 fail=1" ]]; then
+  ok "守卫自证：声明缺失即判红并计入 DOC_COUNT_MISSING（不再静默跳过）"
+else
+  bad "守卫自证：声明缺失未判红（🟡-2 回归）：$_selfcheck"
+fi
 check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 [0-9]+ 项' 'README.md'
 check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 [0-9]+ 项' 'README.md'
 check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 [0-9]+ 项' 'README.md'
@@ -145,6 +171,13 @@ check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到
 check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 . .tests/test_offline.sh. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
 check_doc_count "归因离线回归" "$(count_of /tmp/attribution.log)" '归因离线回归 . .tests/test_attribution.mjs. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
 check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到端回归 . .tests/test_e2e_regression.mjs. . 测试 . [0-9]+ 项' 'docs/INDEX.md'
+
+# 计数口径收口：声明漂移与声明缺失都必须为 0（🟡-2）
+if [[ "$DOC_COUNT_MISMATCH" -eq 0 && "$DOC_COUNT_MISSING" -eq 0 ]]; then
+  ok "文档计数口径：声明漂移 0 / 声明缺失 0"
+else
+  bad "文档计数口径：漂移 $DOC_COUNT_MISMATCH / 缺失 $DOC_COUNT_MISSING"
+fi
 
 echo
 echo "▶ 双通道验收结果：PASS=$PASS FAIL=$FAIL"

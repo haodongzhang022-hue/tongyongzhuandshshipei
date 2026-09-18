@@ -201,9 +201,20 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
-**另有 1 项条件检查**（不计入上表 17 项，仅在异常路径出现）：`plugin.unexpected_exception`——
-探针在 `plugin-integration` 相位发生未预期异常（读插件侧数据时**插件代码**抛错）时写入，
-归因 `PLUGIN_REGRESSION`。它是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
+**另有 2 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
+
+| 条件检查 | 触发场景 | 归因 |
+|---|---|---|
+| `plugin.unexpected_exception` | **同步**异常：探针读插件侧数据（`tools.schemas()` / `definitions.map()`）时**插件代码**抛错，逃到顶层 `catch` | `PLUGIN_REGRESSION` |
+| `plugin.async_uncaught_exception` | **异步**异常：插件在 `apply()` 里排的后台任务（微任务 / 定时器 / 事件回调 / 预取 promise）抛错，**不在**探针 `run()` 的调用栈上 | `PLUGIN_REGRESSION` |
+
+两者都是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
+异步那条为何必须单独兜：不在调用栈上 ⇒ 顶层 `catch` 永远接不到 ⇒ 旧探针会在写出结构化结果前被杀，
+装配器只看到「探针未输出结构化结果」→ 判 `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**。
+现在探针挂了 `uncaughtException` / `unhandledRejection` 两个进程级兜底：按同一份相位路由归因，
+**照常输出结构化结果**（已跑完的检查全部保留），`probePhase` 仍为 `plugin-integration`。
+边界（不越权承诺）：探针是**有限时长验收**，只在收尾前给已排队的微任务/宏任务一个 50ms 排空窗口；
+更晚的延迟抛错发生在探针退出之后，不属本防线范围。
 
 **归因优先级**（`attributionReasons` 判据链按此顺序取第一条命中）：
 
@@ -222,10 +233,15 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 > 探针分两段跑：`host-assembly`（宿主包 import / Context 装配 / 契约采集）与
 > `plugin-integration`（插件 import / apply / definitions / dispatch / 生命周期）。
 > **只有 `host-assembly` 段的未预期异常**才写 `hostFatal[]`；插件集成段的异常一律落
-> **插件侧 check**（`plugin.unexpected_exception` / `registry.exact` / `guard.reserved_rejected`）。
+> **插件侧 check**（同步 `plugin.unexpected_exception` / 异步 `plugin.async_uncaught_exception` /
+> `registry.exact` / `guard.reserved_rejected`）。
 > 所以：`hostFatal[]` 非空 ⇒ 确实是宿主/环境侧问题；`hostFatal[]` 为空 + 插件侧 check 失败
 > ⇒ 是你的插件问题（哪怕 `errors[]` 里出现了宿主侧措辞的字面量——`errors` 不参与判据）。
 > 报告里的 `probePhase` 字段告诉你异常发生在哪一段，排障不必猜。
+>
+> **后台任务抛错也算你的问题**：插件在 `apply()` 里排的后台任务（微任务 / 定时器 / 事件回调 /
+> 预取 promise）抛错时，异常不在探针 `run()` 的调用栈上——中台用进程级兜底按同一份相位路由归因，
+> 落 `plugin.async_uncaught_exception`，**不会**被算成「上游变了」。已跑完的检查全部保留。
 
 > 第 3 条是「漂移窗口内的插件 bug」不被吞的关键：上游取消保留名 = 契约漂移（照实记录），
 > 但插件**仍不得**声明 `run_code`——两者互不抵消。

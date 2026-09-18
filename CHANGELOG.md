@@ -1,5 +1,51 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.1.8 — 🔴-D 同族活口收口：插件侧**异步**异常进程级兜底 + 🟡 两处守卫加固
+
+> 承接 v0.1.7（写入端分相位）。评审 @ `24362c7` 判 `disposition = fix_bug`：
+> 🔴-D 主体修复正确且可复现，但**同族仍有活口**——异常从「同步路径」搬到了「**异步路径**」。
+
+### 🔴 必修（同族活口）
+
+| # | 问题 | 修复 | 回归防线 |
+|---|---|---|---|
+| 🔴-D′ | **插件侧异步异常逃逸到 `hostFatal[]`**。相位路由挂在 `try { await run() } catch` 上，但**不在 `run()` 调用栈上的异常**（进程级 `uncaughtException` / `unhandledRejection`）根本不经过那个 catch → 探针在写出 `__DSH_PROBE__` 之前就被 Node 杀掉 → 装配器看到「探针未输出结构化结果」→ 无条件 `pushHostFatal()` → 判据 1 → `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**（整份报告消失，比「盖掉一条 check」更彻底）；`probePhase` 被误报为 `host-assembly`。触发形态极常见：插件在 `apply()` 里排后台任务 / 事件回调 / 预取 promise，回调抛错 | ① **进程级兜底**：探针挂 `uncaughtException` + `unhandledRejection` 两个处理器，按**同一份相位路由**归因（`probeAsyncFailureRoute()`）——`plugin-integration` → 插件侧 check `plugin.async_uncaught_exception`（已登记 `PLUGIN_SIDE_CHECKS`），**绝不**写 `hostFatal[]`；② **照常输出结构化结果**（已跑完的检查全部保留），结果用 `writeSync` 输出（兜底后紧接着 `process.exit()`，异步 stdout 会被截断）；③ 记录后**不立即退出**（抛错时机不确定 → 立即退出会让 `checks` 随时机变化），改为让 `run()` 跑完再统一收尾 + `ASYNC_WATCHDOG_MS` 看门狗兜住「run() 被拖住」；④ 兜底处理器**自身不得抛**（`recordProbeAsyncException` 全字段归一 + 吞自身异常）；⑤ `PROBE_CHECK_ORDER` 声明规范顺序，中断时把未验项按序标 `skip`（报告里看得见「哪些没验」） | **离线** [9.8]（相位路由 5 + 写入端不变量 5 + 反向护栏 2 + 崩溃路径不抛 3 + 顺序表 4 + 夹具自检 8）；**离线** `test_offline.sh` [9] +5 条；**真宿主** [8b] 28 条 ×2 夹具（`plugin-async-throw-plugin.mjs` / `plugin-async-reject-plugin.mjs` → `PLUGIN_REGRESSION`/RED、`hostFatal.length === 0`、**`checks` 非空且 pass 项全在**、失败项 `plugin.async_uncaught_exception`、`probePhase=plugin-integration`、**重跑结论与报告形态一致**）；**闸门** `.cnb.yml` push/PR 各扩到 4 份夹具（新增异步两例 + 断言 `checks` 非空） |
+
+### 🟡 建议（同批修）
+
+| # | 问题 | 处置 |
+|---|---|---|
+| 🟡-1 | **不变量源码守卫可绕过（P2-10 同族）**：`test_attribution.mjs` [9.4] 用 `stripComments` 后正则 `pushHostFatal\(` 判顶层 catch 体内无裸调用。两处盲区（评审实测逃逸）：① 同行含 `//` 的字符串（`stripComments` 是保守实现，不区分字符串内的 `//`）——`const u = "probe:///x"; pushHostFatal(...)` 的调用**被截断出视野**；② 别名 `const pf = pushHostFatal; pf(...)` 不命中字面量 | **已修**：改用 `codeOnly`（去注释 + 去字符串/模板**文本**、保留 `${...}` 插值代码——与 [10] 口径统一）并**按标识符**判（`\bpushHostFatal\b`）。附**守卫自证**：上一版实测逃逸的三种写法（同行含 `//` 的字符串 / 别名 / 模板插值）现在全部被抓到，注释与文案不误报；并把「旧守卫确实漏检」写成**反证断言**，防后人改回去。主防线仍是行为反证（真宿主 E2E 断言 `hostFatal` 为空） |
+| 🟡-2 | **第 7 步「文档计数防漂移」对「声明被删除」静默失效**：`check_doc_count` 取不到声明时只打 `⚠️ 跳过比对` 且**不递增** `DOC_COUNT_MISMATCH`。实测删掉 `README.md` 的计数声明行 → 三条比对全部跳过、本节仍绿（对「改数」有效，对「删声明」无效） | **已修**：声明缺失即 **FAIL**（新增 `DOC_COUNT_MISSING` 计数，与 `DOC_COUNT_MISMATCH` 一起必须为 0）；并补**守卫自证**（在子 shell 里用不存在的文件调用同一函数，必须判红且计数递增——自证不污染父 shell 口径） |
+| 🟡-3 | `.cnb.yml` PR 段 `attribution-e2e` **重复 stage**（新增行插在了两个同名 stage 之间） | **已修**：去重（PR 段现为 1 个 `attribution-e2e`）。重复本身是历史遗留，本轮顺手清理 |
+
+### 🟢 优化（同批顺手）
+
+- `probeFailureRoute()` 返回值去掉未使用的 `field`（宿主侧唯一落点由 `pushHostFatal()` 决定；回传字段名会让人以为存在「第二处落点」）。
+- `SKIP_AFTER_REGISTRY` 与 `SKIP_AFTER_DEFINITIONS` 的 4 项重复改为**派生**（`...SKIP_AFTER_DEFINITIONS`），防两处清单各自漂移。
+
+### 兼容性
+
+- 探针输出、验收报告**新增**：条件检查项 `plugin.async_uncaught_exception`（仅在插件侧异步异常路径出现，不计入 17 项）。
+- `contract.mjs` 新增导出：`PLUGIN_ASYNC_EXCEPTION_CHECK` / `probeAsyncFailureRoute()` / `recordProbeAsyncException()` / `PROBE_CHECK_ORDER` / `CONDITIONAL_PROBE_CHECKS`。
+- `probeFailureRoute()` 返回值**收窄**（去掉 `field`）——仅在测试内直接断言其形状，外部按 `side` 判分支不受影响。
+- **语义收窄（同 🔴-D 口径）**：插件集成相位的**异步**异常同样不再进 `hostFatal[]`。
+
+### 边界（不越权承诺）
+
+- 探针是**有限时长验收**，不是运行时守护：只在收尾前给已排队的微任务/宏任务一个 **50ms 排空窗口**（`ASYNC_DRAIN_MS`）。更晚的延迟抛错发生在探针退出之后，不属本防线范围。
+
+### 测试项数
+
+- `tests/test_offline.sh`：80 → **85 项**（🔴-D 异步路径 5 条）
+- `tests/test_attribution.mjs`：169 → **209 项**（[9.8] 异步活口 40 条：[9.4] 守卫加固与自证/反证并入其中）
+- `tests/test_e2e_regression.mjs`：64 → **92 项**（[8b] 异步夹具 28 条）
+- `tests/test_exports.mjs`：28 项（未变）
+- 新增夹具：`tests/fixtures/plugin-async-throw-plugin.mjs`、`tests/fixtures/plugin-async-reject-plugin.mjs`
+- `tests/test_hub.sh`：第 7 步补「声明缺失即红」+ 守卫自证
+- `.cnb.yml`：push / PR 的 `plugin-error-not-host-signal` 闸门扩到 4 份夹具（含异步两例），并断言 `checks` 非空（防「报告整份消失」）
+
+
 ## v0.1.7 — 🔴-D 收口：`hostFatal[]` 写入端分相位（插件侧异常永不进判据字段）+ P2-9 / P2-10
 
 > 承接 v0.1.5（复测清单闭环）/ v0.1.6（文档守卫加固）。

@@ -28,15 +28,20 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync as readText } from 'node:fs';
 import {
+  CONDITIONAL_PROBE_CHECKS,
   CONTRACT_SIDE_CHECKS,
   HOST_SIDE_CHECKS,
+  PLUGIN_ASYNC_EXCEPTION_CHECK,
   PLUGIN_HARD_EVIDENCE,
   PLUGIN_PROBE_EXCEPTION_CHECK,
   PLUGIN_SIDE_CHECKS,
+  PROBE_CHECK_ORDER,
   PROBE_PHASE,
   collectContract,
+  probeAsyncFailureRoute,
   probeFailureRoute,
   pushHostFatal,
+  recordProbeAsyncException,
   recordProbeException,
 } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
@@ -547,7 +552,7 @@ console.log('  [8] 装配器结构化宿主信号（runHostProbe 离线缺缓存
 console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
 {
   // 9.1 相位路由：唯一事实源 contract.mjs 的 probeFailureRoute()
-  eq('🔴-D：host-assembly 相位 → 宿主侧（写 hostFatal[]）', JSON.stringify({ side: 'host', field: 'hostFatal' }), JSON.stringify(probeFailureRoute(PROBE_PHASE.HOST_ASSEMBLY)));
+  eq('🔴-D：host-assembly 相位 → 宿主侧（唯一落点 hostFatal[]，不回传字段名——评审 🟢）', JSON.stringify({ side: 'host' }), JSON.stringify(probeFailureRoute(PROBE_PHASE.HOST_ASSEMBLY)));
   eq('🔴-D：plugin-integration 相位 → 插件侧 check（不写 hostFatal[]）', JSON.stringify({ side: 'plugin', check: 'plugin.unexpected_exception' }), JSON.stringify(probeFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION)));
   eq('🔴-D：未知相位保守判插件侧（绝不写判据字段）', 'plugin', probeFailureRoute('some-unknown-phase').side);
   eq('🔴-D：插件侧兜底 check 名已登记进 PLUGIN_SIDE_CHECKS', true, PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROBE_EXCEPTION_CHECK));
@@ -577,9 +582,49 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
   eq('🔴-D：探针声明了相位状态并随段落切换', true, /PROBE_PHASE\.HOST_ASSEMBLY/.test(probeSrc) && /PROBE_PHASE\.PLUGIN_INTEGRATION/.test(probeSrc));
   eq('🔴-D：读插件侧数据的两处（tools.schemas / definitions.map）均在 try 内', true,
     /try \{[\s\S]{0,300}tools\.schemas\(\)/.test(probeSrc) && /try \{[\s\S]{0,300}definitions\.map\(/.test(probeSrc));
-  // 顶层 catch 体内**代码**不得出现裸 pushHostFatal（注释里提到它不算——故先 stripComments）
-  const catchBody = stripComments(probeSrc.slice(probeSrc.lastIndexOf('try {\n  await run();')));
-  eq('🔴-D：顶层 catch 体内无裸 pushHostFatal（交由按相位路由）', false, /pushHostFatal\(/.test(catchBody));
+  // 顶层 catch 体内**代码**不得出现裸 pushHostFatal（注释里提到它不算）。
+  // 🟡-1（评审实测逃逸）：上一版用 `stripComments` + 字面 `pushHostFatal\(`，两处盲区：
+  //   (a) `stripComments` 是保守实现（不区分字符串内的 `//`）——`const u = "probe:///x"; pushHostFatal(...)`
+  //       里调用**被截断出视野**（`//` 之后整段当注释删掉）；
+  //   (b) 别名 `const pf = pushHostFatal; pf(out, ...)` 不命中 `pushHostFatal\(`。
+  // 修法：改用 `codeOnly`（去注释 + 去字符串/模板**文本**，保留 `${...}` 插值代码——与 [10] 口径统一）
+  // 并按**标识符**判（`\bpushHostFatal\b`）。主防线仍是行为反证（真宿主 E2E 断言 hostFatal 为空）。
+  const catchBody = codeOnly(probeSrc.slice(probeSrc.lastIndexOf('try {\n  await run();')));
+  eq('🔴-D：顶层 catch 体内无裸 pushHostFatal（按标识符判，交由按相位路由）', false, /\bpushHostFatal\b/.test(catchBody));
+  // 🟡-1 守卫自证：上一版实测逃逸的两种写法，现在必须被抓到
+  const guardSamples = {
+    '同行含 `//` 的字符串（stripComments 盲区）': 'const u = "probe:///x"; pushHostFatal(out, "x");',
+    '别名调用（const pf = pushHostFatal）': 'const pf = pushHostFatal; pf(out, "x");',
+    '模板插值内调用': 'reasons.push(`${pushHostFatal(out, "x")}`);',
+  };
+  for (const [label, sample] of Object.entries(guardSamples)) {
+    eq(`🟡-1 守卫自证：${label} 被抓到`, true, /\bpushHostFatal\b/.test(codeOnly(sample)));
+  }
+  eq('🟡-1 守卫自证：注释里的 pushHostFatal 不误报（codeOnly 去掉注释）', false,
+    /\bpushHostFatal\b/.test(codeOnly('// 顶层 catch 不得调 pushHostFatal(out, ...)\nconst a = 1;')));
+  eq('🟡-1 守卫自证：文案里的 pushHostFatal 不误报（字符串文本被剔除）', false,
+    /\bpushHostFatal\b/.test(codeOnly('reasons.push("不要调 pushHostFatal(out, x)")')));
+  // 旧守卫确实拦不住这两例（把「为什么必须换」写成断言，防后人改回去）
+  eq('🟡-1 反证：旧守卫（stripComments + 字面）对「同行含 // 的字符串」漏检', false,
+    /pushHostFatal\(/.test(stripComments('const u = "probe:///x"; pushHostFatal(out, "x");')));
+  eq('🟡-1 反证：旧守卫（stripComments + 字面）对别名漏检', false,
+    /pushHostFatal\(/.test(stripComments('const pf = pushHostFatal; pf(out, "x");')));
+
+  // 9.4c 进程级兜底（🔴-D 同族活口）源码守卫：探针必须挂两个进程级处理器，且走同一份相位路由
+  eq('🔴-D：探针挂 uncaughtException 处理器', true, /process\.on\('uncaughtException'/.test(probeSrc));
+  eq('🔴-D：探针挂 unhandledRejection 处理器（另一条代码路径，只兜一个 = 活口搬家）', true,
+    /process\.on\('unhandledRejection'/.test(probeSrc));
+  eq('🔴-D：两个处理器都走 recordProbeAsyncException（按相位归因，不直接 pushHostFatal）', true,
+    (probeSrc.match(/recordProbeAsyncException\(out, phase/g) ?? []).length >= 1
+    && /onProcessLevelException/.test(probeSrc));
+  // 结构化结果必须用 writeSync 落盘：兜底后立即 process.exit()，异步 stdout 会被截断
+  // （截断 = 装配器又看到「探针未输出结构化结果」= 等于没修）
+  eq('🔴-D：结构化结果用 writeSync 输出（防 exit 截断 stdout → 报告整份消失）', true,
+    /writeSync\(1, payload\)/.test(probeSrc));
+  eq('🔴-D：结果只输出一次（emit 幂等，正常收尾与兜底共用）', true,
+    /if \(emitted\) return;/.test(probeSrc));
+  eq('🔴-D：兜底中断时把未验项按规范顺序标 skip（报告里看得见「哪些没验」）', true,
+    /skipPendingChecks\(/.test(probeSrc) && /PROBE_CHECK_ORDER/.test(probeSrc));
 
   // 9.4b 夹具自检：夹具必须真的复现「读插件侧数据时抛错」——否则离线/E2E 的断言会空转
   for (const fixture of ['plugin-side-throw-plugin.mjs', 'plugin-registry-throw-plugin.mjs']) {
@@ -604,6 +649,85 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
   const mixed = attributionDetail({ errors: ['fatal(host): x'], checks: [failCheck('plugin.apply_ok')], hostFatal: ['宿主装配失败'], profile: { flavor: 'modern' }, contract: {} }, channel, 'dev');
   eq('🟢：同时存在插件侧失败时理由链补一句（不影响判决）', true,
     mixed.attribution === 'UPSTREAM_DRIFT' && mixed.reasons.some((r) => r.includes('同时') && r.includes('plugin.apply_ok')));
+}
+
+// ---- 9.8. 🔴-D 同族活口：插件侧**异步**异常（进程级 uncaughtException / unhandledRejection） ----
+// 为什么必须单列一段：同步异常在 run() 调用栈上、能被顶层 catch 接住；**异步**异常不在栈上，
+// 顶层 catch 永远接不到 → 探针在写出 __DSH_PROBE__ 之前被杀 → 装配器无条件 pushHostFatal()
+// → 插件 bug 判 UPSTREAM_DRIFT/AMBER，且 checks 从 17 掉到 0（整份报告消失）。
+// 这是本族第四次「活口搬家」（读取端 → 写入端 → 同步路径 → 异步路径），故防线必须**双路径**。
+console.log('  [9.8] 🔴-D 异步活口（进程级兜底 + 双路径不变量）');
+{
+  // 9.8a 相位路由：与同步路由**同语义**（宿主装配 → hostFatal；其余 → 插件侧），落点 check 名不同
+  eq('🔴-D 异步：host-assembly 相位 → 宿主侧（仍写 hostFatal[]）', 'host',
+    probeAsyncFailureRoute(PROBE_PHASE.HOST_ASSEMBLY).side);
+  eq('🔴-D 异步：plugin-integration 相位 → 插件侧 check（绝不写 hostFatal[]）',
+    JSON.stringify({ side: 'plugin', check: PLUGIN_ASYNC_EXCEPTION_CHECK }),
+    JSON.stringify(probeAsyncFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION)));
+  eq('🔴-D 异步：未知相位保守判插件侧（与同步路由同取向）', 'plugin',
+    probeAsyncFailureRoute('some-unknown-phase').side);
+  eq('🔴-D 异步：落点 check 名已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
+    PLUGIN_SIDE_CHECKS.includes(PLUGIN_ASYNC_EXCEPTION_CHECK));
+  eq('🔴-D 异步：落点与同步兜底的 check 名**不同**（排障动作不同，混用 = 报告撒谎）', true,
+    PLUGIN_ASYNC_EXCEPTION_CHECK !== PLUGIN_PROBE_EXCEPTION_CHECK);
+
+  // 9.8b 写入端不变量：插件侧异步异常（带插件 stack）→ 插件侧 check，hostFatal[] 必须为空
+  const asyncStack = "Error: plugin background task bug |     at queueMicrotask (file:///tmp/plugin-async/plugin.mjs:48:11)";
+  const asyncOut = { checks: [], errors: [], hostFatal: [] };
+  const asyncRouted = recordProbeAsyncException(asyncOut, PROBE_PHASE.PLUGIN_INTEGRATION, asyncStack);
+  eq('🔴-D 异步：插件集成相位的异步异常 → 落插件侧 check', PLUGIN_ASYNC_EXCEPTION_CHECK, asyncOut.checks[0]?.name);
+  eq('🔴-D 异步：hostFatal[] 为空（不变量：插件侧错误永不进判据字段）', 0, asyncOut.hostFatal.length);
+  eq('🔴-D 异步：归因 PLUGIN_REGRESSION（不甩锅上游）', 'PLUGIN_REGRESSION',
+    attributeFailure({ ...asyncOut, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+  eq('🔴-D 异步：相位写进结构化结果（排障依据）', PROBE_PHASE.PLUGIN_INTEGRATION, asyncOut.phase);
+  eq('🔴-D 异步：写入端回执 side=plugin（可审计）', 'plugin', asyncRouted.side);
+
+  // 9.8c 反向护栏：宿主装配相位的异步异常**仍须**判漂移（收窄不得丢掉真漂移）
+  const asyncHostOut = { checks: [], errors: [], hostFatal: [] };
+  recordProbeAsyncException(asyncHostOut, PROBE_PHASE.HOST_ASSEMBLY, 'Cannot find package @deepseek-ai/dsh-tools');
+  eq('🔴-D 异步反向：host-assembly 相位 → hostFatal[] 非空', true, asyncHostOut.hostFatal.length > 0);
+  eq('🔴-D 异步反向：host-assembly 相位 → 仍判 UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
+    attributeFailure({ ...asyncHostOut, profile: { flavor: 'modern' }, contract: {} }, channel, 'dev'));
+
+  // 9.8d 崩溃路径纪律：记录函数**自身不得抛**（它运行在 uncaughtException 处理器里，
+  //       抛出 = 第二次崩溃 = 报告整份消失）。用畸形 target 反证。
+  for (const [label, target] of [
+    ['缺 checks/errors 字段', { hostFatal: [] }],
+    ['字段类型全错', { checks: 'x', errors: 1, hostFatal: 'y' }],
+    ['errors 为抛错 getter', Object.defineProperty({ hostFatal: [] }, 'errors', { get() { throw new Error('boom'); }, set() { throw new Error('boom'); } })],
+  ]) {
+    let threw = 'no-throw';
+    try { recordProbeAsyncException(target, PROBE_PHASE.PLUGIN_INTEGRATION, 'x'); } catch { threw = 'threw'; }
+    eq(`🔴-D 异步：崩溃路径上记录函数不抛（${label}）`, 'no-throw', threw);
+  }
+
+  // 9.8e 顺序表（PROBE_CHECK_ORDER）：与探针 check() 调用顺序一致，且 ∪ 条件项 == 三张 check 表并集
+  // 为什么守：兜底中断时按本表补 skip；本表若与探针实际顺序漂移，报告里 skip 的顺序会骗人。
+  const orderProbeSrc = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+  const declaredOrder = [];
+  for (const m of orderProbeSrc.matchAll(/check\(\s*'([^']+)'/g)) {
+    if (!declaredOrder.includes(m[1])) declaredOrder.push(m[1]);
+  }
+  eq('🔴-D 异步：PROBE_CHECK_ORDER = 探针实际 check() 输出顺序（漂移即红）', JSON.stringify(declaredOrder), JSON.stringify(PROBE_CHECK_ORDER));
+  eq('🔴-D 异步：PROBE_CHECK_ORDER 为 17 项（文档口径）', 17, PROBE_CHECK_ORDER.length);
+  const tableUnion = [...new Set([...HOST_SIDE_CHECKS, ...CONTRACT_SIDE_CHECKS, ...PLUGIN_SIDE_CHECKS])].sort();
+  const declaredUnion = [...new Set([...PROBE_CHECK_ORDER, ...CONDITIONAL_PROBE_CHECKS])].sort();
+  eq('🔴-D 异步：17 项 ∪ 条件项 == 三张 check 表并集（新增 check 必须同时登记，否则红）', JSON.stringify(tableUnion), JSON.stringify(declaredUnion));
+  eq('🔴-D 异步：条件项不计入 17 项（口径：17 项 + N 条件项）', 0,
+    CONDITIONAL_PROBE_CHECKS.filter((name) => PROBE_CHECK_ORDER.includes(name)).length);
+
+  // 9.8f 夹具自检：异步夹具必须真的「在 apply 里排后台任务并抛错」——否则离线/E2E 断言空转
+  for (const [fixture, marker, pattern] of [
+    ['plugin-async-throw-plugin.mjs', 'queueMicrotask', /queueMicrotask\([\s\S]{0,120}throw /],
+    ['plugin-async-reject-plugin.mjs', 'Promise.reject', /Promise\.reject\(/],
+  ]) {
+    const src = readText(path.join(ROOT, 'tests/fixtures', fixture), 'utf8');
+    eq(`🔴-D 异步夹具 ${fixture}：含 ${marker}（真的会触发进程级异常）`, true, pattern.test(src));
+    eq(`🔴-D 异步夹具 ${fixture}：抛错在 apply() 内（不在 run() 调用栈上）`, true,
+      /export function apply\(ctx\)[\s\S]*$/.test(src.slice(0, src.indexOf(marker))) || src.indexOf(marker) > src.indexOf('export function apply'));
+    eq(`🔴-D 异步夹具 ${fixture}：自述期望 hostFatal 为空（不变量写在夹具里）`, true, src.includes('hostFatal[]'));
+    eq(`🔴-D 异步夹具 ${fixture}：健康工具先注册（失败点精确留在后台任务）`, true, /demo_echo/.test(src));
+  }
 }
 
 // ---- 10. P2-10：判据源码守卫加固（别名绕过也拦得住，且不误报注释/文案） ----

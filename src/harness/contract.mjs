@@ -112,8 +112,11 @@ export const PLUGIN_PROBE_EXCEPTION_CHECK = 'plugin.unexpected_exception';
 /**
  * 探针异常归属路由（**唯一事实源**，探针顶层 catch 与离线回归共用）。
  *
+ * 返回值**只给归属与落点**：宿主侧 → `hostFatal[]`（唯一落点由 {@link pushHostFatal} 决定，
+ * 此处不再回传字段名——回传会让人以为存在「第二处落点」，评审 🟢 已点名）；插件侧 → check 名。
+ *
  * @param {string} phase 见 {@link PROBE_PHASE}
- * @returns {{side: 'host'|'plugin', field?: string, check?: string}} 归属：宿主侧写字段 / 插件侧写 check
+ * @returns {{side: 'host'} | {side: 'plugin', check: string}} 归属：宿主侧写 hostFatal[] / 插件侧写 check
  *
  * 保守取向：**未知相位按插件侧处理**（绝不写 `hostFatal[]`）。
  * 宁可让人多看一眼插件侧失败，也不让一个未确认的信号去开「上游漂移」这道门
@@ -121,8 +124,81 @@ export const PLUGIN_PROBE_EXCEPTION_CHECK = 'plugin.unexpected_exception';
  */
 export function probeFailureRoute(phase) {
   return phase === PROBE_PHASE.HOST_ASSEMBLY
-    ? { side: 'host', field: HOST_FATAL_FIELD }
+    ? { side: 'host' }
     : { side: 'plugin', check: PLUGIN_PROBE_EXCEPTION_CHECK };
+}
+
+/**
+ * 探针「异步异常」的插件侧落点 check 名（已登记进 {@link PLUGIN_SIDE_CHECKS}）。
+ *
+ * 与 {@link PLUGIN_PROBE_EXCEPTION_CHECK} 的分工：那个收的是**同步**异常
+ * （`run()` 调用栈上，逃到顶层 `catch`）；本名收的是**进程级异步异常**
+ * （`uncaughtException` / `unhandledRejection`）——插件在 `apply()` 里排的后台任务
+ * / 事件回调 / 预取 promise 抛错，**根本不在** `run()` 的调用栈上，
+ * 顶层 `catch` 永远接不到（评审 🔴-D 同族活口）。
+ *
+ * 为什么要给独立名字而不是复用：两条路径的排障动作不同（一个查插件数据读取、
+ * 一个查插件后台任务），报告里必须能一眼分清。
+ */
+export const PLUGIN_ASYNC_EXCEPTION_CHECK = 'plugin.async_uncaught_exception';
+
+/**
+ * 进程级异常归属路由（**唯一事实源**，探针的进程级兜底与离线回归共用）。
+ *
+ * 语义与 {@link probeFailureRoute} **完全一致**（按相位、未知相位保守判插件侧），
+ * 唯一区别是落点 check 名不同（异步异常有独立名字，便于排障定位）。
+ *
+ * 为什么需要单独一层：`probeFailureRoute()` 的落点名描述的是「探针自身未预期异常」，
+ * 而进程级异步异常的主体是**插件的后台任务**——两者混用会让报告撒谎
+ * （人看到 `plugin.unexpected_exception` 会去查插件数据读取，实际要查后台任务）。
+ *
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @returns {{side: 'host'|'plugin', check?: string}} 归属：宿主侧 → hostFatal[]；插件侧 → check
+ */
+export function probeAsyncFailureRoute(phase) {
+  return probeFailureRoute(phase).side === 'host'
+    ? { side: 'host' }
+    : { side: 'plugin', check: PLUGIN_ASYNC_EXCEPTION_CHECK };
+}
+
+/**
+ * 记录「进程级异步异常」（`uncaughtException` / `unhandledRejection`）——**按相位**决定落点。
+ *
+ * 与 {@link recordProbeException} 同一纪律：`hostFatal[]` 是判据唯一事实字段，
+ * 插件侧的异步异常**绝不**进该字段。未知相位保守判插件侧。
+ *
+ * 额外保证（🔴-D 同族活口的要害）：本函数**不抛异常**——它运行在
+ * `uncaughtException` 处理器里，任何抛出都会让探针在写出 `__DSH_PROBE__` 之前再次崩掉，
+ * 于是整份报告消失、`checks` 从 17 掉到 0（比「盖掉一条 check」更彻底）。
+ * 故内部对 `target` 做全部归一，并吞掉自身异常（记一条日志行）。
+ *
+ * @param {{checks?: object[], errors?: string[], hostFatal?: string[]}} target 探针 `out`
+ * @param {string} phase 见 {@link PROBE_PHASE}
+ * @param {string} detail 异常摘要（含 stack）——仅进人读日志 / 插件侧 check 的 detail
+ * @returns {{side: 'host'|'plugin', line: string}} 归属与写入的日志行（供排障）
+ */
+export function recordProbeAsyncException(target, phase, detail) {
+  try {
+    const route = probeAsyncFailureRoute(phase);
+    target.phase = phase;
+    const text = String(detail).slice(0, 600);
+    if (!Array.isArray(target.checks)) target.checks = [];
+    if (!Array.isArray(target.errors)) target.errors = [];
+    if (route.side === 'host') {
+      return { side: 'host', line: pushHostFatal(target, `探针进程级异步异常：${text}`) };
+    }
+    target.checks.push({ name: route.check, status: 'fail', detail: text });
+    const line = `${route.check}: 插件后台任务未捕获异常（${phase} 相位，插件侧异步错误）：${text}`;
+    target.errors.push(line);
+    return { side: 'plugin', line };
+  } catch (error) {
+    // 兜底里的兜底：记录失败**不得**升级成第二次崩溃（否则报告整份消失）。
+    try {
+      if (!Array.isArray(target.errors)) target.errors = [];
+      target.errors.push(`recordProbeAsyncException 自身失败（已吞掉，不影响报告输出）：${String(error?.message ?? error)}`);
+    } catch { /* 连 errors 都写不进去时，静默——绝不能在这里抛 */ }
+    return { side: 'plugin', line: '' };
+  }
 }
 
 /**
@@ -215,6 +291,51 @@ export const PLUGIN_SIDE_CHECKS = [
   'guard.reserved_rejected',
   // 🔴-D：插件集成相位里逃到顶层 catch 的未预期异常（读插件侧数据时插件代码抛错）
   'plugin.unexpected_exception',
+  // 🔴-D 同族活口：插件后台任务（apply 里排的微任务/定时器/promise）的未捕获异常——
+  // 不在 run() 调用栈上，顶层 catch 接不到，由探针的进程级兜底按相位归到这里。
+  'plugin.async_uncaught_exception',
+];
+
+/**
+ * 探针的**条件触发检查项**：仅在异常路径出现，**不计入 17 项**（文档口径见
+ * `docs/ADAPTER_GUIDE.md`「另有 1 项条件检查」/ `docs/INDEX.md`）。
+ *
+ * 为什么单独成表：`PROBE_CHECK_ORDER` 与「条件项」必须能互相推出，
+ * 否则「17 项」的口径会随新增条件项悄悄变成 18 项而无人发现。
+ */
+export const CONDITIONAL_PROBE_CHECKS = [PLUGIN_PROBE_EXCEPTION_CHECK, PLUGIN_ASYNC_EXCEPTION_CHECK];
+
+/**
+ * 探针 17 项检查的**规范输出顺序**（= `docs/INDEX.md` 的 `#` 序号列口径）。
+ *
+ * 用途：进程级兜底（`uncaughtException` / `unhandledRejection`）中断验收时，
+ * 把「尚未跑到的检查」按**同一顺序**标 `skip`——报告里看得见「哪些没验」，
+ * 且顺序与正常报告一致（人比对两次运行不必重排）。
+ *
+ * 与探针源码的关系：探针 `check('...')` 的调用顺序是**行为上的**事实源，
+ * 本表是**声明上的**事实源；两者由 `tests/test_attribution.mjs` [9.8] 断言相等（不一致即红）。
+ * 与三张 check 表的关系：本表 ∪ {@link CONDITIONAL_PROBE_CHECKS} == 三表并集（同由 [9.8] 断言）。
+ *
+ * @type {readonly string[]}
+ */
+export const PROBE_CHECK_ORDER = [
+  'host.tools_ready',
+  'detect.flavor_known',
+  'contract.probe_disposed',
+  'guard.reserved_name',
+  'compat.schema_flatten',
+  'plugin.loaded',
+  'plugin.apply_ok',
+  'registry.exact',
+  'dispatch.execute_ok',
+  'dispatch.render_projected',
+  'dispatch.echo_payload',
+  'dispatch.abort_semantics',
+  'plugin.definitions_ok',
+  'lifecycle.disposer_count',
+  'lifecycle.registered',
+  'lifecycle.dispose',
+  'guard.reserved_rejected',
 ];
 
 /** 探测工具名（用于残留自检；这三个名字不得出现在被测插件可见的工具清单里）。 */

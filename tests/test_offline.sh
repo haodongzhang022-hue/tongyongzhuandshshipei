@@ -184,7 +184,7 @@ echo "  [9] 归因判定（结构化判据：宿主侧 hostFatal[] vs 插件侧 
 # 落插件侧 check（plugin.unexpected_exception），绝不进 hostFatal[]。
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure, attributionDetail } from '$ROOT/src/verify/runner.mjs';
-import { PROBE_PHASE, recordProbeException } from '$ROOT/src/harness/contract.mjs';
+import { PROBE_PHASE, recordProbeException, recordProbeAsyncException, PLUGIN_ASYNC_EXCEPTION_CHECK } from '$ROOT/src/harness/contract.mjs';
 const ch = { label: 'x', line: '0.1.6' };
 const p = (errors, checks = [], extra = {}) => ({ errors, checks, hostFatal: [], profile: { flavor: 'modern' }, contract: {}, ...extra });
 const hf = (detail) => p(['fatal(host): ' + detail], [], { hostFatal: [detail] });
@@ -215,6 +215,17 @@ console.log(attributeFailure({ ...pluginPhase, profile: { flavor: 'modern' }, co
 const hostPhase = { checks: [], errors: [], hostFatal: [] };
 recordProbeException(hostPhase, PROBE_PHASE.HOST_ASSEMBLY, 'Cannot find package @deepseek-ai/dsh-tools');
 console.log(attributeFailure({ ...hostPhase, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
+// 🔴-D 异步活口：插件后台任务（不在 run() 调用栈上）的未捕获异常 → 插件侧 check，绝不写 hostFatal[]
+const asyncOut = { checks: [], errors: [], hostFatal: [] };
+recordProbeAsyncException(asyncOut, PROBE_PHASE.PLUGIN_INTEGRATION, 'Error: plugin background task bug | at queueMicrotask (file:///tmp/plugin.mjs:48:11)');
+console.log(asyncOut.checks[0].name);
+console.log(asyncOut.hostFatal.length);
+console.log(attributeFailure({ ...asyncOut, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
+console.log(PLUGIN_ASYNC_EXCEPTION_CHECK === asyncOut.checks[0].name ? 'registered-check' : 'unregistered-check');
+// 🔴-D 异步反向：宿主装配相位的异步异常仍写 hostFatal[] 并判漂移
+const asyncHost = { checks: [], errors: [], hostFatal: [] };
+recordProbeAsyncException(asyncHost, PROBE_PHASE.HOST_ASSEMBLY, 'Cannot find package @deepseek-ai/dsh-tools');
+console.log(attributeFailure({ ...asyncHost, profile: { flavor: 'modern' }, contract: {} }, ch, 'dev'));
 ")"
 assert "宿主安装失败（结构化 hostFatal[]）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
 assert "宿主未就绪 → UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 2p)"
@@ -229,6 +240,11 @@ assert "🔴-D：插件集成相位异常落插件侧 check" "plugin.unexpected_
 assert "🔴-D：插件集成相位异常不写 hostFatal[]（不变量）" "0" "$(echo "$OUT" | sed -n 11p)"
 assert "🔴-D：插件侧异常 → PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 12p)"
 assert "🔴-D 反向：宿主装配相位异常 → 仍判 UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 13p)"
+assert "🔴-D 异步：插件后台任务异常落插件侧异步 check" "plugin.async_uncaught_exception" "$(echo "$OUT" | sed -n 14p)"
+assert "🔴-D 异步：不写 hostFatal[]（不变量，与同步路径同口径）" "0" "$(echo "$OUT" | sed -n 15p)"
+assert "🔴-D 异步：→ PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 16p)"
+assert "🔴-D 异步：落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）" "registered-check" "$(echo "$OUT" | sed -n 17p)"
+assert "🔴-D 异步反向：宿主装配相位异步异常 → 仍判 UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 18p)"
 
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure } from '$ROOT/src/verify/runner.mjs';

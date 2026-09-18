@@ -23,6 +23,12 @@
  *    探针读插件侧数据（`tools.schemas()` / `definitions.map()`）会抛错——该异常必须落**插件侧 check**，
  *    归因 `PLUGIN_REGRESSION`/RED，且 `hostFatal[]` **必须为空**（历史缺陷：落进 `hostFatal[]` →
  *    误判 `UPSTREAM_DRIFT`/AMBER，把插件 bug 甩给上游并盖掉插件侧已失败的 check）。
+ * 9b. **🔴-D 同族活口（插件侧*异步*异常）**：插件在 `apply()` 里排后台任务（`queueMicrotask` 抛错 /
+ *    `Promise.reject` 无人处理）——异常**不在** `run()` 调用栈上，顶层 `catch` 接不到。
+ *    历史缺陷：探针在写出 `__DSH_PROBE__` 前被 Node 杀掉 → 装配器看到「探针未输出结构化结果」
+ *    → 无条件 `pushHostFatal()` → `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**（整份报告消失）。
+ *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.async_uncaught_exception`、
+ *    `checks` 非空且已跑完的检查全在（报告不丢）、`probePhase = plugin-integration`。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
@@ -258,6 +264,44 @@ try {
     eq(`${label}（插件侧 stack 保留在 errors 日志中）`, true, (report.errors ?? []).some((e) => e.includes(fixture)));
     // 相位随报告透出（排障看得见异常归属依据）
     eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+  }
+
+  // ---- 11b. 🔴-D 同族活口：插件侧**异步**异常（后台任务抛错 / 预取 promise 拒绝） ----
+  console.log('  [8b] 🔴-D 异步活口：插件后台任务抛错 → 必须判插件、hostFatal 为空、报告不丢');
+  for (const [label, fixture] of [
+    ['后台微任务抛错（uncaughtException）', 'plugin-async-throw-plugin.mjs'],
+    ['预取 promise 拒绝（unhandledRejection）', 'plugin-async-reject-plugin.mjs'],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    // 核心不变量（🔴-D）：插件侧错误**永远**不进判据字段 hostFatal[]
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    // 报告完整性：旧缺陷下 checks 归零（整份报告消失）——这是本条活口比同步版更狠的地方
+    const checks = report.checks ?? [];
+    eq(`${label}（checks 非空——整份报告不得消失）`, true, checks.length > 0);
+    eq(`${label}（已跑完的 pass 项全部保留，不只是失败项）`, true, checks.filter((c) => c.status === 'pass').length >= 10);
+    eq(`${label}（失败项含 plugin.async_uncaught_exception）`, true,
+      checks.some((c) => c.name === 'plugin.async_uncaught_exception' && c.status === 'fail'));
+    // 失败项必须全在插件侧表内（不得出现宿主侧 check 失败 → 否则归因会被判据 1 抢走）
+    const pluginSide = new Set(PLUGIN_SIDE_CHECKS);
+    const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（失败项全在插件侧，名单取自 PLUGIN_SIDE_CHECKS）`, true, failed.every((name) => pluginSide.has(name)));
+    eq(`${label}（无宿主侧 check 失败）`, 0,
+      failed.filter((n) => ['host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed'].includes(n)).length);
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack（夹具路径 / at 帧）
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+    eq(`${label}（hostFatal 不含 stack 帧 'at '）`, false, /\n\s*at /.test(fatalText));
+    // 插件侧 stack 仍应保留在**日志**里（可排障，只是不参与判据）
+    eq(`${label}（插件侧 stack 保留在 errors 日志中）`, true, (report.errors ?? []).some((e) => e.includes(fixture)));
+    // 相位随报告透出（异常归属依据）
+    eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+    // 确定性：同一夹具连跑两次，checks 形态一致（防「报告随抛错时机变化」）
+    const again = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（重跑结论一致：同一归因）`, report.attribution, again.attribution);
+    eq(`${label}（重跑报告形态一致：pass 数相同）`,
+      checks.filter((c) => c.status === 'pass').length, (again.checks ?? []).filter((c) => c.status === 'pass').length);
   }
 
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----
