@@ -270,6 +270,39 @@ console.log('  [7] 判据表完备性');
     /ENV_ERROR/.test(runnerSource.split('@returns')[1]?.slice(0, 200) ?? '') ? 'env-error-declared' : 'no-env-error');
 }
 
+// ---- 7b. 文档判据表守卫：ARCHITECTURE §4.2 ③ 必须与唯一事实源口径一致 ----
+// 为什么单独守：ARCHITECTURE.md 是归因契约的权威文档；它若回退到已删除的旧口径
+// （「错误串含 fatal(host)」自由文本判据），后人照表改实现就是 🔴-C 原样复发。
+// 过去 tests/ 对 ARCHITECTURE.md 的引用数 = 0（无防线），本节补上。
+console.log('  [7b] ARCHITECTURE 归因判据表与唯一事实源一致（文档即防线）');
+{
+  const arch = readText(path.join(ROOT, 'docs/ARCHITECTURE.md'), 'utf8');
+  const start = arch.indexOf('③ 归因契约');
+  const end = start === -1 ? -1 : arch.indexOf('**④', start);
+  const section = start === -1 || end === -1 ? '' : arch.slice(start, end);
+  eq('ARCHITECTURE §4.2 ③ 归因契约段落存在', true, section.length > 0);
+  // 第 1 条判据：必须只认结构化字段，**不得**回退到「错误串含 fatal(host)」自由文本口径（P1）
+  eq('判据表不再写「错误串含 fatal(host)」（P1 旧口径已删）', 'no-free-text-criterion',
+    /错误串含\s*`?fatal\(host\)/.test(section) ? 'free-text-criterion-present' : 'no-free-text-criterion');
+  eq('判据表第 1 条显式引用结构化字段 hostFatal[] / HOST_FATAL_FIELD', true,
+    /hostFatal\[\]/.test(section) && /HOST_FATAL_FIELD/.test(section));
+  eq('判据表写明 errors[] 不参与任何判据', true, /任何判据不读/.test(section));
+  eq('判据表声明唯一事实源 = src/harness/contract.mjs', true, section.includes('src/harness/contract.mjs'));
+  // 「四条纪律」必须整块存在（v0.1.5 曾自述有、实际没有 —— P2-2 的落地验收）
+  const discStart = section.indexOf('四条纪律');
+  const disc = discStart === -1 ? '' : section.slice(discStart);
+  eq('判据表含「四条纪律」小节（P2-2 自述已落地）', true, disc.length > 0);
+  const discItems = [...disc.matchAll(/^>\s*([1-4])\.\s/gm)].map((m) => m[1]);
+  eq('四条纪律四条齐全（1/2/3/4）', ['1', '2', '3', '4'], discItems);
+  eq('纪律①明写 errors[] 不参与判据', true, /errors\[\]/.test(disc) && /任何判据不读/.test(disc));
+  eq('纪律②明写硬证据优先于漂移相关性', true, /硬证据/.test(disc) && /漂移相关性/.test(disc));
+  // 与唯一事实源导出的名单一致（表一改 / 名一改，这里就红）
+  const missingHard = PLUGIN_HARD_EVIDENCE.filter((name) => !section.includes(name));
+  eq('判据表 2b 行覆盖 PLUGIN_HARD_EVIDENCE 全部条目', [], missingHard);
+  const missingHost = HOST_SIDE_CHECKS.filter((name) => !section.includes(name));
+  eq('判据表第 1 条覆盖 HOST_SIDE_CHECKS 全部条目', [], missingHost);
+}
+
 // ---- 8. 装配器：宿主/环境侧失败必须落结构化字段（离线缺缓存路径，无网可跑） ----
 console.log('  [8] 装配器结构化宿主信号（runHostProbe 离线缺缓存）');
 {

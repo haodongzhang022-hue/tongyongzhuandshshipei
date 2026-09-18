@@ -120,6 +120,16 @@ console.log('  [2b] 文档检查清单顺序与探针一致');
   }
 }
 
+// ---- 2c. 文档自述版本 = package.json 版本（防「文档说 vX，实际是 vY」） ----
+console.log('  [2c] 文档头部版本与 package.json 一致');
+{
+  const arch = readFileSync(path.join(ROOT, 'docs/ARCHITECTURE.md'), 'utf8');
+  const m = /版本：`dsh-adapt-hub v([0-9.]+)`/.exec(arch);
+  if (!m) bad('docs/ARCHITECTURE.md 头部有版本声明', '未匹配到「版本：dsh-adapt-hub vX」');
+  else if (m[1] === pkg.version) ok('docs/ARCHITECTURE.md 版本 = package.json', 'v' + m[1]);
+  else bad('docs/ARCHITECTURE.md 版本', '文档 v' + m[1] + ' ≠ package.json v' + pkg.version);
+}
+
 // ---- 3. 模板拷贝可用（按模板 README 指引：拷贝 + 改 import 行） ----
 console.log('  [3] 模板拷贝可用（改 import 后）');
 const work = mkdtempSync(path.join(tmpdir(), 'dsh-template-'));

@@ -35,11 +35,11 @@
 | 二级信息汇报 | `src/report/secondary.mjs` | 代码 | JSON + Markdown 双视图 |
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 60 项，无网可跑 |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 69 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + 判据表完备性（无网可跑） |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 66 项，无网可跑（含 `summarize()` verdict 优先级） |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 80 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫（无网可跑） |
 | 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 43 项：真宿主复现 🔴-A / 🔴-B / 🔴-C（漂移吞硬违规 + 自由文本翻案）场景，含 attribution + verdict 双断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程 |
-| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序一致（19 项） |
+| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序一致 + 文档版本一致（20 项） |
 | 示例插件 | `tests/fixtures/demo-plugin.mjs` | 测试 | 同时是接入模板 |
 | 负例插件 | `tests/fixtures/broken-plugin.mjs` | 测试 | 验证护栏不静默失效 |
 | CI 流水线 | `.cnb.yml` | 配置 | push/PR/crontab/web_trigger |
@@ -55,26 +55,27 @@
 
 > `--channel all` = 三通道全跑（stable + dev + legacy），与页面按钮「三通道」同义。
 
-## 四、17 项验收检查索引
+## 四、17 项验收检查索引（按探针实际输出顺序）
 
-| 检查名 | 验的是什么 |
-|---|---|
-| `host.tools_ready` | 宿主 ToolRuntime 就绪 |
-| `detect.flavor_known` | 版本线可判定 |
-| `contract.probe_disposed` | 契约探测采集后**已全部卸载**（无残留；残留即宿主 register 语义变了） |
-| `guard.reserved_name` | 中台保留名护栏可用（run_code 被插件侧拒绝）**——中台自检，非插件违规** |
-| `compat.schema_flatten` | schema 压平后无违规 |
-| `plugin.loaded` | 插件导出 `apply(ctx)`（import 失败/未导出 → 插件侧失败，不是上游漂移） |
-| `plugin.apply_ok` | 插件 `apply(ctx)` 执行成功（抛错 → 插件侧失败） |
-| `registry.exact` | 注册工具清单精确匹配 |
-| `dispatch.execute_ok` | 真实 dispatch 成功 |
-| `dispatch.render_projected` | `output.render` 投影正确 |
-| `dispatch.echo_payload` | 业务返回值正确 |
-| `dispatch.abort_semantics` | `exec.signal` 取消语义生效 |
-| `plugin.definitions_ok` | 插件导出可用的 `definitions` 数组 |
-| `lifecycle.disposer_count` | disposer 数量正确 |
-| `lifecycle.registered` | 独立上下文注册成功 |
-| `lifecycle.dispose` | 卸载后无残留 |
-| `guard.reserved_rejected` | 插件声明的保留名被拒绝并上报（声明即判失败，不静默丢弃）**——插件侧硬证据，优先于漂移相关性** |
+| # | 检查名 | 验的是什么 |
+|---|---|---|
+| 1 | `host.tools_ready` | 宿主 ToolRuntime 就绪 |
+| 2 | `detect.flavor_known` | 版本线可判定 |
+| 3 | `contract.probe_disposed` | 契约探测采集后**已全部卸载**（无残留；残留即宿主 register 语义变了） |
+| 4 | `guard.reserved_name` | 中台保留名护栏可用（run_code 被插件侧拒绝）**——中台自检，非插件违规** |
+| 5 | `compat.schema_flatten` | schema 压平后无违规 |
+| 6 | `plugin.loaded` | 插件导出 `apply(ctx)`（import 失败/未导出 → 插件侧失败，不是上游漂移） |
+| 7 | `plugin.apply_ok` | 插件 `apply(ctx)` 执行成功（抛错 → 插件侧失败） |
+| 8 | `registry.exact` | 注册工具清单精确匹配 |
+| 9 | `dispatch.execute_ok` | 真实 dispatch 成功 |
+| 10 | `dispatch.render_projected` | `output.render` 投影正确 |
+| 11 | `dispatch.echo_payload` | 业务返回值正确 |
+| 12 | `dispatch.abort_semantics` | `exec.signal` 取消语义生效 |
+| 13 | `plugin.definitions_ok` | 插件导出可用的 `definitions` 数组 |
+| 14 | `lifecycle.disposer_count` | disposer 数量正确 |
+| 15 | `lifecycle.registered` | 独立上下文注册成功 |
+| 16 | `lifecycle.dispose` | 卸载后无残留 |
+| 17 | `guard.reserved_rejected` | 插件声明的保留名被拒绝并上报（声明即判失败，不静默丢弃）**——插件侧硬证据，优先于漂移相关性** |
 
-> 顺序即探针实际执行顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
+> 序号 = **探针实际输出顺序**（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
+> 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。

@@ -2,7 +2,7 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.1.1`（module `adapt-hub`，含评审 🔴 必修项修复）
+> 版本：`dsh-adapt-hub v0.1.5`（module `adapt-hub`，文档收口：归因判据表对齐唯一事实源 + 判据表守卫）
 
 ---
 
@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 60 项 + 归因离线回归 69 项 + 发布面自检 19 项 ✅   归因端到端回归 43 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
+离线单测 66 项 + 归因离线回归 80 项 + 发布面自检 20 项 ✅   归因端到端回归 43 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
 ```
 
 ---
@@ -191,8 +191,8 @@ tongyongzhuandshshipei/
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 60 项离线单测（无网可跑）
-│   ├── test_attribution.mjs           # 69 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏）
+│   ├── test_offline.sh                # 66 项离线单测（无网可跑）
+│   ├── test_attribution.mjs           # 80 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b]）
 │   ├── test_e2e_regression.mjs        # 43 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C 复现，含 verdict 断言）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
@@ -235,11 +235,11 @@ export function apply(ctx) {
 
 **③ 归因契约（`verify` 报告，机器可读）**
 
-判据按优先级（**结构化**，不用裸关键词）：
+判据按优先级（**只读结构化字段与 check 名**；`errors[]` 是纯人读日志，**任何判据不读**）：
 
 | 优先级 | 证据 | 归因 |
 |---|---|---|
-| 1 | 错误串含 `fatal(host)`，或失败项属 `HOST_SIDE_CHECKS`（`host.tools_ready` / `detect.flavor_known` / `contract.probe_disposed`） | `UPSTREAM_DRIFT` |
+| 1 | **结构化字段 `hostFatal[]` 非空**（`HOST_FATAL_FIELD`），或失败项属 `HOST_SIDE_CHECKS`（`host.tools_ready` / `detect.flavor_known` / `contract.probe_disposed`） | `UPSTREAM_DRIFT` |
 | 2 | 版本线探测为 `unknown` | `UPSTREAM_DRIFT` |
 | **2b** | 失败项属 **`PLUGIN_HARD_EVIDENCE`**（`guard.reserved_rejected`）—— 插件违反宿主硬约束，**优先于任何漂移相关性** | `PLUGIN_REGRESSION` |
 | 3 | 契约指纹漂移，且漂移字段与失败 check **一一对应**（`reservedName`↔`guard.reserved_name`、`schemaSubset`↔`compat.schema_flatten`、`configProjection`↔`detect.flavor_known`、`outputShape`↔`dispatch.*`） | `UPSTREAM_DRIFT` |
@@ -254,6 +254,15 @@ export function apply(ctx) {
 > 通配会过度修正（评审 🟡-1）。
 >
 > 判据表**唯一事实源**在 `src/harness/contract.mjs`（探针与执行器共用，防两侧漂移）。
+>
+> **四条纪律（判据只认结构化证据 —— 评审 🔴-C 活口二的收口口径，文档侧对齐）**：
+> 1. 宿主/环境侧信号**只认结构化字段 `hostFatal[]`**（`HOST_FATAL_FIELD`）与 `HOST_SIDE_CHECKS` 名单；
+>    `errors[]`（含 `fatal(host):` 前缀行）是**人读日志**，**任何判据不读** —— 插件侧 stack / 文件路径 /
+>    CI 工作目录里出现该字面量**不得**翻案（实现见 `src/verify/runner.mjs` 判据 1）。
+> 2. 插件侧硬证据 `PLUGIN_HARD_EVIDENCE` **优先于**任何漂移相关性。
+> 3. 漂移字段必须与失败 check **一一对应**才判上游漂移（不把插件 bug 甩给上游）。
+> 4. 判据表**唯一事实源**在 `src/harness/contract.mjs`；本表由 `tests/test_attribution.mjs` [7b] 守住，
+>    与唯一事实源口径不一致即红（**文档即防线**）。
 
 **④ 通道定义契约（`registry/channels.json`）**
 
@@ -300,7 +309,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 60 项 + 归因离线回归 69 项 + 发布面自检 19 项 + 归因端到端回归 43 项 + 负例拦下（含漂移窗口） | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 66 项 + 归因离线回归 80 项 + 发布面自检 20 项 + 归因端到端回归 43 项 + 负例拦下（含漂移窗口） | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |

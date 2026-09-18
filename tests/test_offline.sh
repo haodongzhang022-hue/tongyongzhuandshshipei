@@ -278,6 +278,30 @@ OUT="$(TMPDIR="$(mktemp -d)" "$NODE_BIN" "$ROOT/src/cli.mjs" cache 2>&1)"
 assert "cache 子命令可运行且输出 keep 指纹" "yes" "$(echo "$OUT" | grep -q '\"keep\"' && echo yes || echo no)"
 assert "cache 保留三通道指纹" "3" "$(echo "$OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);console.log(r.keep.length)})")"
 
+echo "  [13] summarize() 多通道 verdict 优先级（漂移+回归混合 → RED，不静默降级）"
+OUT="$("$NODE_BIN" --input-type=module -e "
+import { summarize } from '$ROOT/src/verify/runner.mjs';
+const rep = (attribution, ok) => ({ channel: attribution + '-ch', ok, attribution, contractDrift: { changed: false } });
+// 全绿 → GREEN
+console.log(summarize([rep('PASS', true), rep('PASS', true)]).verdict);
+// 只有上游漂移 → AMBER
+console.log(summarize([rep('UPSTREAM_DRIFT', false)]).verdict);
+// 只有插件回归 → RED
+console.log(summarize([rep('PLUGIN_REGRESSION', false)]).verdict);
+// 漂移 + 回归混合 → RED（回归优先，不得被漂移降级成 AMBER）
+console.log(summarize([rep('UPSTREAM_DRIFT', false), rep('PLUGIN_REGRESSION', false)]).verdict);
+// 回归在前 / 漂移在后（顺序无关，防「按首项取判决」的静默退化）
+console.log(summarize([rep('PLUGIN_REGRESSION', false), rep('UPSTREAM_DRIFT', false)]).verdict);
+// 全失败但无法归因 → UNKNOWN（不猜）
+console.log(summarize([rep('UNKNOWN', false)]).verdict);
+")"
+assert "全绿 → GREEN" "GREEN" "$(echo "$OUT" | sed -n 1p)"
+assert "仅上游漂移 → AMBER" "AMBER" "$(echo "$OUT" | sed -n 2p)"
+assert "仅插件回归 → RED" "RED" "$(echo "$OUT" | sed -n 3p)"
+assert "漂移+回归混合 → RED（回归优先，不被降级）" "RED" "$(echo "$OUT" | sed -n 4p)"
+assert "混合判决与通道顺序无关（回归在后也 RED）" "RED" "$(echo "$OUT" | sed -n 5p)"
+assert "失败但无法归因 → UNKNOWN（不猜）" "UNKNOWN" "$(echo "$OUT" | sed -n 6p)"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]
