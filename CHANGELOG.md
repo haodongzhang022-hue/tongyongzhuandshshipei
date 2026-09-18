@@ -1,5 +1,46 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.2.0 · **复评 🔴 收口** —— 🔴-1 CI 级回归 + 🆕 nonce 带外通道（侧信道）+ 命名口径/闸门防线
+
+> 承接 PR #3 复评（评审对交付 SHA `0b06398` 的裁定：7 🔴 / 4 🟡）。本轮按总师裁定执行：
+> 先修 🔴-1（会挂死 CI），再落 🆕 nonce 必修，并把 🔴-5 / 🟡-3 的**防线**补回。
+
+### 🔴-1【CI 级回归，最先修】`execFileSync(timeout)` 对「同步占死事件循环」插件失效
+
+| 项 | 内容 |
+|---|---|
+| 机理 | `execFileSync` 的 `timeout` 默认只发一次 **SIGTERM**；而探针为出口③装了 `SIGTERM`/`SIGINT` 处理器 ⇒ ① 监听器存在即**替换** Node 默认终止行为；② 插件同步占死事件循环时信号处理器**不可达**（回调排不上）⇒ 探针杀不死 ⇒ `execFileSync` 无限等待 |
+| 后果 | **CI 挂到流水线上限**（`CNB_PIPELINE_MAX_RUN_TIME`）。实测 `while(true)` + `timeoutMs=5000` → 45s+ 未返回；base `main@d2cd96c` 同场景 5.0s 有界返回 |
+| 修法 | 宿主侧**探针**与 **npm 安装**两处 `execFileSync` 均加 `killSignal: 'SIGKILL'`——SIGKILL **不可捕获**，探针的信号处理器拦不住它 ⇒ `timeoutMs` 重新成为**有界**承诺（实测 5.01–5.07s 有界返回） |
+| 回归 | 离线 `test_offline.sh` **[17]**：新夹具 `plugin-event-loop-hog-plugin`（**永久**占死事件循环）+ `timeoutMs=5000` → 断言「< 20s 有界返回 + signal=SIGKILL + 归因 PLUGIN_REGRESSION」。短 timeout，**不进闸门**、不吃满 CI 额度 |
+
+### 🆕 nonce 带外通道（🔴-4 必修 + 🟡-4 信任边界显式化）
+
+| 项 | 内容 |
+|---|---|
+| 缺口 | 探针与插件**共用 stdout + 同进程**：插件 `process.stdout.write('__DSH_PROBE__{绿卡}')` 即可自我发绿卡（实测：真实缺陷插件 → **GREEN**）；写 `hostFatal:[...]` 可把责任甩给上游（实测 AMBER / `UPSTREAM_DRIFT`）。**base 同样可复现**（既有缺口，见 `docs/RISKS.md` R26） |
+| 协议 | 宿主每次运行生成**随机** nonce 与**随机环境变量名**（`DSH_NONCE_<12 hex>`）：名字经 argv（`--probe-nonce-env=NAME`）、值经 env 传入；探针读到后**立刻**从 `process.env` 删除；输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行** |
+| 判定 | 出现裸 `__DSH_PROBE__`（无 nonce / 不匹配）⇒ 判**伪造**：落插件侧 check **`plugin.probe_result_forged`**（登记 `PLUGIN_SIDE_CHECKS` + `CONDITIONAL_PROBE_CHECKS`，条件项 6 → 7），`result.ok` 必为 false |
+| 显式前提 | 「**插件为可信代码**」由 R26 写成**显式前提**（此前是隐式）。nonce 挡的是「无意的自我发绿卡」与「共用 stdout 的误命中」，**不是**「恶意插件」（恶意插件读自己的 argv/env 即可拿到 nonce）——根治需**进程隔离 / 独立 fd**（结构性重做，待人拍板） |
+| 回归 | 离线 `test_offline.sh` **[13]**（伪造即判 / 不放行 / 真报告不误伤 / 无 nonce 退化路径 / 名字与值都随机）+ 新夹具 `plugin-forged-result-plugin` → **进闸门**（真宿主失败项集合含 `plugin.probe_result_forged` 且真缺陷 `registry.exact` 仍被抓）+ 真宿主 E2E `[8d]` |
+
+### 🔴-5 命名口径守卫（合并不得再丢防线）
+
+- 事实澄清：`PROBE_CHECK_ORDER` / `CONDITIONAL_PROBE_CHECKS` / `plugin.async_uncaught_exception` 在**分支 HEAD `16714ca`** 上**均存在**（`0b06398` 上确实缺失，那是并行尝试的中间态）。本轮把它们变成**跨产物守卫**：
+  - 新增离线 **[12]**：三张 check 表并集 == 顺序表 ∪ 条件项；**扫描夹具 / 闸门 / 文档**里出现的 check 名，未登记即红；并自证「旧实现遗留名 `plugin.probe_aborted` 会被判未登记」。
+  - 修掉夹具里两处**遗留的错名**（`plugin.probe_aborted` → `plugin.early_exit`，与实现逐字一致）。
+
+### 🟡-3 闸门失败项集合断言
+
+- 此前闸门只断「失败项**含**期望项」⇒ 夹具多出的**噪音失败**（如 `render: () => []` 造成的 `dispatch.render_projected`）被**静默放行**。
+- 现在 `tests/gate_plugin_side.sh` 的 `NEGATIVE_CASES` 增加第 5 列「**完整失败项集合**」，逐夹具**排序后逐字比对**：多一条少一条都红（取值来自真宿主实测）。
+
+### 🟡-4 / R24b / R26 登记（风险显式暴露）
+
+- `docs/RISKS.md` 新增 **R24b**（🔴-1 的 CI 级回归，标「已收口」）、**R26**（信任边界：共用 stdout + 同进程，**HIGH**，含残留边界与显式前提）。
+
+
+
 ## v0.1.9c · **H1 放行级假绿收口** —— 探针收尾自检进程内防线 + 夹具进闸门
 
 > 承接 v0.1.9b（口径收窄）。v0.1.9b 把 H1 记为**已知活口**（`docs/RISKS.md` R22，夹具不进闸门）。

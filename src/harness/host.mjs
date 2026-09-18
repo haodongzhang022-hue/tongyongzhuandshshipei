@@ -13,8 +13,8 @@
 
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { PLUGIN_ABNORMAL_TERMINATION_CHECK, PROBE_PHASE, PROBE_PHASE_BEACON_PREFIX, pushHostFatal } from './contract.mjs';
+import { createHash, randomBytes } from 'node:crypto';
+import { PLUGIN_ABNORMAL_TERMINATION_CHECK, PLUGIN_PROBE_FORGED_RESULT_CHECK, PROBE_NONCE_ENV_ARG_PREFIX, PROBE_PHASE, PROBE_PHASE_BEACON_PREFIX, createProbeNonce, probeResultPrefix, pushHostFatal } from './contract.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -157,6 +157,9 @@ export function runHostProbe(options) {
           cwd: workDir,
           stdio: ['ignore', 'ignore', 'inherit'],
           timeout: timeoutMs,
+          // 同 🔴-1：npm 也可能挂住（网络半死 / 子进程不响应 SIGTERM）⇒ 超时后 SIGKILL 兜底，
+          // 让 `timeoutMs` 对**安装段**同样是有界承诺（不是只对探针段）。
+          killSignal: 'SIGKILL',
         });
       } catch (error) {
         // 安装失败 = 宿主/环境侧（网络不可达 或 上游钉版消失）→ 显式措辞，供归因按**结构**判定
@@ -184,12 +187,30 @@ export function runHostProbe(options) {
     cpSync(path.join(hubRoot, 'src', 'harness', 'probe-template.mjs'), path.join(workDir, 'probe.mjs'));
     cpSync(path.join(hubRoot, 'src', 'harness', 'contract.mjs'), path.join(workDir, 'contract.mjs'));
 
+    // 🆕 nonce 带外通道（侧信道收口，见 docs/RISKS.md R26）：
+    // 宿主生成**随机** nonce 与**随机环境变量名**，名字经 argv 传、值经 env 传；
+    // 探针输出的报告前缀带该 nonce，宿主只认带 nonce 的行 ⇒ 插件伪造裸 marker 会被判伪造。
+    // 为什么名字也要随机：固定名等于没设防（插件照抄名字即可读出 nonce）。
+    const nonce = createProbeNonce(randomBytes);
+    result.probeNonceEnvName = nonce.envName; // 排障用（值本身**不**落盘，避免泄漏进报告）
+
     let stdout = '';
     try {
-      stdout = execFileSync('node', ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools)], {
+      stdout = execFileSync('node', ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools), `${PROBE_NONCE_ENV_ARG_PREFIX}${nonce.envName}`], {
         cwd: workDir,
         encoding: 'utf8',
         timeout: timeoutMs,
+        env: { ...process.env, [nonce.envName]: nonce.value },
+        // 🔴-1（本 PR 新引入的 CI 级回归）：`execFileSync` 的 `timeout` 默认只发一次 **SIGTERM**，
+        // 而探针为出口③（进程 exit / 自杀式信号）装了 `SIGTERM` / `SIGINT` 处理器——
+        // ① 监听器存在即**替换** Node 的默认终止行为（默认行为不再发生）；
+        // ② 插件同步占死事件循环时，信号处理器**根本不可达**（事件循环不空出，回调排不上）。
+        // 两条叠加 ⇒ 探针杀不死 ⇒ `execFileSync` 无限等待 ⇒ CI 挂到流水线上限
+        // （实测：`while(true)` 插件 + `timeoutMs=5000` → 45s+ 仍未返回）。
+        // 修法：`killSignal: 'SIGKILL'`——SIGKILL **不可捕获**，探针的信号处理器拦不住它，
+        // 于是 `timeoutMs` 重新变成**有界**承诺（实测 5.07s 有界返回）。
+        // 回归：`tests/test_offline.sh` [17]「占死事件循环 → 有界返回」（短 timeout，不进闸门吃额度）。
+        killSignal: 'SIGKILL',
       });
     } catch (error) {
       stdout = `${error.stdout ?? ''}`;
@@ -199,7 +220,7 @@ export function runHostProbe(options) {
       result.errors.push(`探针非零退出（status=${error.status ?? 'null'}${error.signal ? `, signal=${error.signal}` : ''}）`);
     }
 
-    interpretProbeStdout(result, stdout);
+    interpretProbeStdout(result, stdout, { nonce: nonce.value });
     return result;
   } catch (error) {
     // 装配阶段兜底：一律宿主/环境侧（探针脚本未产出结构化结果前的失败不可能是插件造成）
@@ -225,13 +246,41 @@ export function runHostProbe(options) {
  *    → 落插件侧 check `plugin.abnormal_termination`，`hostFatal[]` 保持为空（不甩锅上游）。
  * 3. 无结构化结果 + 无信标 → 终止在宿主装配段 → `hostFatal[]`（真上游信号，不丢）。
  *
+ * ## 🆕 nonce 带外通道（侧信道 / 信任边界收口）
+ * 传入 `options.nonce` 时，**只有**带该 nonce 前缀的行才算探针报告；
+ * 出现裸 `__DSH_PROBE__`（无 nonce / nonce 不匹配）行 ⇒ 判定**伪造**：
+ * 落插件侧 check {@link PLUGIN_PROBE_FORGED_RESULT_CHECK}，且**不得**把它当作报告
+ * （否则插件 `process.stdout.write('__DSH_PROBE__{绿卡}')` 就能自我发绿卡）。
+ * 不传 `nonce`（离线单测 / 手工调用）时退化为「认裸 marker」的历史行为。
+ *
  * @param {object} result 装配器结果对象（就地写入）
  * @param {string} stdout 探针 stdout
+ * @param {{nonce?: string|null}} [options] 选项：本次运行的 nonce（宿主生成、随机）
  * @returns {object} 同一个 result（便于链式使用）
  */
-export function interpretProbeStdout(result, stdout) {
+export function interpretProbeStdout(result, stdout, options = {}) {
   const text = String(stdout ?? '');
-  const marker = text.split('\n').find((line) => line.startsWith('__DSH_PROBE__'));
+  const nonce = options.nonce ?? null;
+  const lines = text.split('\n');
+  // 带 nonce 时：报告行 = 带 nonce 前缀的那一行；其余以裸 marker 开头的行 = 伪造。
+  const expectedPrefix = nonce ? probeResultPrefix(nonce) : '__DSH_PROBE__';
+  const marker = lines.find((line) => line.startsWith(expectedPrefix));
+  const forged = nonce
+    ? lines.filter((line) => line.startsWith('__DSH_PROBE__') && !line.startsWith(expectedPrefix))
+    : [];
+  // 伪造证据（先收集，**解析出报告后再落 check**——否则会被 `result.checks = payload.checks` 覆盖）。
+  const forgedEvidence = forged.length > 0
+    ? {
+      name: PLUGIN_PROBE_FORGED_RESULT_CHECK,
+      status: 'fail',
+      detail: `stdout 出现 ${forged.length} 行无 nonce / nonce 不匹配的结构化结果（伪造探针报告）：${forged[0].slice(0, 200)}`,
+    }
+    : null;
+  if (forgedEvidence) {
+    // 探针与插件**共用 stdout**，插件可自造绿卡或甩锅上游（见 docs/RISKS.md R26）。
+    // 只落 errors（人读日志）与下面的 check：**绝不**据此把 result.ok 判真。
+    result.errors.push(`${PLUGIN_PROBE_FORGED_RESULT_CHECK}: 检测到伪造的结构化结果行（共 ${forged.length} 行，本轮报告不可信）`);
+  }
   if (!marker) {
     // 探针没写出结构化结果 = 它被**不可捕获**地终止了（SIGKILL / OOM / 原生 abort）
     // ——可捕获的四条出口（同步 / 异步 / 进程 exit / run() 被拖住）都由探针自己闭合，
@@ -261,7 +310,7 @@ export function interpretProbeStdout(result, stdout) {
   }
   let payload;
   try {
-    payload = JSON.parse(marker.slice('__DSH_PROBE__'.length));
+    payload = JSON.parse(marker.slice(expectedPrefix.length));
   } catch (error) {
     // 探针输出不可解析 = 探针自身（本仓文件）出问题 → 宿主侧，不甩锅插件
     pushHostFatal(result, `探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
@@ -281,6 +330,9 @@ export function interpretProbeStdout(result, stdout) {
   if (Array.isArray(payload.hostFatal)) result.hostFatal.push(...payload.hostFatal);
   // 完成位**原样透传**（探针未给出时保持 false）：`ok` 必须同时要求「跑完」与「无失败」。
   result.runCompleted = payload.runCompleted === true;
+  // 🆕 伪造证据**在报告解析之后**落 check（payload.checks 已就位）：
+  // 本轮报告不可信 ⇒ `result.ok` 必为 false（errors 非空），且报告里看得见伪造项。
+  if (forgedEvidence) result.checks.push(forgedEvidence);
   result.ok = result.runCompleted && payload.ok === true && result.errors.length === 0;
   return result;
 }

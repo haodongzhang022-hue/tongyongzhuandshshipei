@@ -15,7 +15,7 @@
  * 期望行为（修复后，靠**带外**侧信道相位归因）：
  * - 归因 `PLUGIN_REGRESSION`、`verdict = RED`；
  * - `hostFatal[]` **必须为空**；
- * - 失败项是装配器侧插件 check `plugin.probe_aborted`（已登记 `PLUGIN_SIDE_CHECKS`）；
+ * - 失败项是装配器侧插件 check `plugin.early_exit`（已登记 `PLUGIN_SIDE_CHECKS`）；
  * - `checks` 非空（17 项按规范顺序标 `skip` + 1 条 fail）——报告形态与「探针正常跑完但全挂」一致；
  * - `probePhase = plugin-integration`（侧信道相位，探针死后依然可读）。
  */

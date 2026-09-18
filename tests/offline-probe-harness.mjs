@@ -26,7 +26,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { interpretProbeStdout } from '../src/harness/host.mjs';
-import { PROBE_PHASE } from '../src/harness/contract.mjs';
+import { PROBE_NONCE_ENV_ARG_PREFIX, PROBE_PHASE, createProbeNonce } from '../src/harness/contract.mjs';
+import { randomBytes } from 'node:crypto';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { loadChannels } from '../src/harness/host.mjs';
 
@@ -106,14 +107,21 @@ export function runOfflineProbe(options) {
     cpSync(path.join(ROOT, 'src', 'harness', 'contract.mjs'), path.join(work, 'contract.mjs'));
 
     // 3. 跑探针（子进程；非零退出是预期路径之一，stdout 仍要拿回来）
+    // 与装配器同口径的 nonce 带外通道（🆕 侧信道）：离线回归也走真协议，
+    // 否则「宿主认 nonce」这条防线只在真宿主 E2E 里被覆盖（慢、要网）。
+    const nonce = createProbeNonce(randomBytes);
+
     let stdout = '';
     let exit = { status: 0, signal: null };
     try {
-      stdout = execFileSync('node', ['probe.mjs', ROOT, pluginPath, JSON.stringify(expectedTools)], {
+      stdout = execFileSync('node', ['probe.mjs', ROOT, pluginPath, JSON.stringify(expectedTools), `${PROBE_NONCE_ENV_ARG_PREFIX}${nonce.envName}`], {
         cwd: work,
         encoding: 'utf8',
         timeout: timeoutMs,
-        env: { ...process.env, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
+        // 与装配器（src/harness/host.mjs）同口径：超时后用 SIGKILL 收尾（🔴-1）。
+        // 探针装了 SIGTERM/SIGINT 处理器 ⇒ 只发 SIGTERM 杀不死（事件循环被占死时更不可达）。
+        killSignal: 'SIGKILL',
+        env: { ...process.env, [nonce.envName]: nonce.value, ...(watchdogMs ? { DSH_PROBE_RUN_WATCHDOG_MS: String(watchdogMs) } : {}) },
       });
     } catch (error) {
       stdout = `${error.stdout ?? ''}`;
@@ -127,7 +135,7 @@ export function runOfflineProbe(options) {
       install: 'fake-host', cacheHit: false, durationMs: 0,
     };
     result.probeExit = exit;
-    interpretProbeStdout(result, stdout);
+    interpretProbeStdout(result, stdout, { nonce: nonce.value });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');
     return { result, attribution: detail.attribution, reasons: detail.reasons, exit, stdout };

@@ -358,6 +358,22 @@ try {
       exitChecks.some((c) => c.status === 'skip'));
   }
 
+  // ---- 11d. 🆕 nonce 带外通道（侧信道，真宿主）：伪造绿卡不得掩盖真缺陷 ----
+  // 为什么必须真宿主也跑：nonce 协议贯穿「宿主生成 → argv/env 传递 → 探针带 nonce 输出 →
+  // 宿主只认带 nonce 行」四段，其中 argv/env 传递**只有真宿主路径**会走到
+  // （离线回归台的假宿主自己拼 spawn 参数，可能掩盖协议拼装错误）。
+  console.log('  [8d] 🆕 侧信道：插件伪造 __DSH_PROBE__ 绿卡 → 判 plugin.probe_result_forged + 真缺陷仍被抓');
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('伪造夹具（真宿主）：归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION', report.attribution);
+    eq('伪造夹具（真宿主）：verdict=RED（不放行）', 'RED', report.summary?.verdict);
+    eq('伪造夹具（真宿主）：hostFatal 为空（伪造者不得把责任甩给上游）', 0, (report.hostFatal ?? []).length);
+    eq('伪造夹具（真宿主）：失败项含 plugin.probe_result_forged（伪造被识别）', true, failed.includes('plugin.probe_result_forged'));
+    eq('伪造夹具（真宿主）：真实缺陷 registry.exact 仍被抓住（绿卡没掩盖它）', true, failed.includes('registry.exact'));
+    eq('伪造夹具（真宿主）：**不得**判 PASS/GREEN', true, report.attribution !== 'PASS' && report.summary?.verdict !== 'GREEN');
+  }
+
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----
   console.log('  [9] 🔴-D 反向：宿主侧异常仍判漂移（收窄写入端不丢真漂移）');
   {

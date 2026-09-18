@@ -201,7 +201,7 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
-**另有 6 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
+**另有 7 项条件检查**（不计入上表 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`）：
 
 | 条件检查 | 出口 | 触发场景 | 归因 |
 |---|---|---|---|
@@ -211,6 +211,7 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 | `plugin.run_incomplete` | ④ `run()` 被拖住 | 插件挂住事件循环，或 `apply()` 返回一个**永不 resolve** 的 Promise（无异常、无退出） | `PLUGIN_REGRESSION` |
 | `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort`）——探针来不及写报告，装配器按**相位信标**归因 | `PLUGIN_REGRESSION` |
 | `plugin.process_defense_tampered` | ⑤ 防线被静音 | 插件抢占 `setUncaughtExceptionCaptureCallback`（真实形态：Sentry / APM / 错误上报库）或摘掉 `uncaughtException` 监听器 ⇒ 探针兜底被**静音**、后台抛错不可见、完成位仍真 → **假绿放行**。探针收尾自检（capture callback 为空 + 两监听器仍在）判本项 | `PLUGIN_REGRESSION` |
+| `plugin.probe_result_forged` | 🆕 侧信道 | 探针 stdout 里出现**无 nonce / nonce 不匹配**的结构化结果行（插件自造绿卡 / 甩锅上游）；由**装配器**判定 | `PLUGIN_REGRESSION` |
 
 **为什么四条出口都要兜**（本中台被返工最多的一条线）：插件侧错误逃出探针 `run()` 的调用栈有
 **四条**出口，每条都会让旧探针在写出结构化结果前消失 → 装配器只看到「探针未输出结构化结果」
@@ -286,6 +287,21 @@ captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收�
 > 漂移信号消失（这是「仅 ok 更新基线」的必要设计，见 `docs/RISKS.md` R18）。
 
 ---
+
+## 四之二、探针报告的**信任边界**与 nonce 带外通道（🆕 v0.2.0）
+
+探针在**同一个进程**里跑、与插件**共用 stdout**——这带来一个必须显式声明的边界：
+
+| 项 | 说明 |
+|---|---|
+| 缺口 | 插件若往 stdout 写一行 `__DSH_PROBE__{...}`，就能**自造一张绿卡**（真实缺陷被掩盖）；写 `hostFatal:[...]` 可把责任甩给上游（判 `UPSTREAM_DRIFT`） |
+| 显式前提 | 本中台的归因防线以「**插件为可信代码**（非恶意）」为**显式前提**（`docs/RISKS.md` R26）。越出该前提时，防线退化为**尽力而为** |
+| nonce 带外通道 | 宿主每次运行生成**随机** nonce 与**随机环境变量名**：名字经 argv（`--probe-nonce-env=NAME`）、值经 env 传入；探针输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行** |
+| 判定 | 出现裸 `__DSH_PROBE__`（无 nonce / 不匹配）⇒ 判**伪造**：落插件侧 check `plugin.probe_result_forged`，`ok` 必为 false（**不放行**） |
+| 残留边界 | **恶意**插件仍可读自己的 argv/env 拿到 nonce 后伪造。根治需**进程隔离 / 独立 fd 作真·带外通道**（结构性重做，待人拍板）——本项**不越权承诺** |
+
+> 结论（给接入方）：**不要**在 `apply()` 里往 stdout 写探针协议行（`__DSH_PROBE__` / `__DSH_PROBE_PHASE__`）。
+> 正常插件不需要关心 nonce——它是宿主与探针之间的带外协议，对插件透明。
 
 ## 五、常见坑（都已被中台处理，列此备查）
 

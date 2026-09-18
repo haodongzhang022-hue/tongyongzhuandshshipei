@@ -79,6 +79,8 @@ import {
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
+  probeNonceEnvNameFromArgv,
+  probeResultPrefix,
   collectContract,
   pushHostFatal,
   recordProbeAsyncException,
@@ -89,6 +91,21 @@ import {
 
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
+
+// ---- 🆕 nonce 带外通道（侧信道收口） ----
+// 宿主每次运行生成随机 nonce 与**随机环境变量名**，经 argv 把「名字」传进来、
+// 经 env 把「值」传进来。探针只认这个值：输出的结构化结果前缀带 nonce，
+// 宿主也只认带 nonce 的行。这样「谁是探针」由宿主掌握的随机量判定，
+// 而不是靠公开字面量 `__DSH_PROBE__`——插件伪造裸 marker 会被宿主识别为伪造。
+//
+// 纪律：读到后**立刻**从 `process.env` 删除（缩小插件侧的可见窗口）；
+// 缺失时 `nonce` 为 null → 输出仍用裸 marker（保持离线/手工调用可用），
+// 但宿主侧会按「无 nonce ⇒ 不可信」处理（见 host.mjs 的 interpretProbeStdout）。
+const nonceEnvName = probeNonceEnvNameFromArgv(process.argv.slice(2));
+const nonceValue = nonceEnvName ? (process.env[nonceEnvName] ?? null) : null;
+if (nonceEnvName) { try { delete process.env[nonceEnvName]; } catch { /* 删除失败不阻断（见 RISKS R26 残留边界） */ } }
+/** 本进程结构化结果的前缀：有 nonce 用带 nonce 形式，无则退化为裸 marker。 */
+const resultPrefix = nonceValue ? probeResultPrefix(nonceValue) : PROBE_RESULT_MARKER;
 
 // hostFatal：**结构化**的宿主/环境侧致命信号（归因判据唯一依据，见 🔴-C）。
 // errors：人类可读日志（可含插件侧 stack/路径）——**不参与判据**。
@@ -193,7 +210,7 @@ function emit() {
   // 🔴 必修-1：`ok` 必须**同时**要求「跑完」与「无失败」——否则出口 ③ 的中途报告会假绿
   // （`apply()` 里 process.exit(0) → 剩余检查是 skip 不是 fail → 只看 errors 就 GREEN）。
   out.ok = runCompleted && out.errors.length === 0;
-  const payload = `__DSH_PROBE__${JSON.stringify(out)}\n`;
+  const payload = `${resultPrefix}${JSON.stringify(out)}\n`;
   try {
     writeSync(1, payload);
   } catch {

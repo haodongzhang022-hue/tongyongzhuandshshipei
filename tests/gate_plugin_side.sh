@@ -44,34 +44,45 @@ mkdir -p "$WORK"
 echo "▶ 插件侧错误不得进 hostFatal[]（闸门：四条出口 + 不可捕获边界 + 防过度修正）"
 
 # ---- 负例：必须被拦下、必须判插件侧、hostFatal 必须为空 ----
-# 每行：夹具名|期望失败项|期望完成位（true/false）|是否期望「已跑完的 pass 项保留」
+# 每行：夹具名|期望失败项|期望完成位（true/false）|是否期望「已跑完的 pass 项保留」|**完整失败项集合**（逗号分隔）
+#
+# 🟡-3（评审复测）：末列是本轮补的**失败项集合**断言。此前闸门只断
+# 「失败项**含**期望项」——夹具多出来的**噪音失败**（如 `render: () => []` 造成的
+# `dispatch.render_projected` / `dispatch.echo_payload` 失败）会被**静默放行**，
+# 于是「注释说精确、实际多条失败」没人发现。现在逐夹具断言**完整集合**，
+# 多一条少一条都红（夹具一旦回归成噪音源，闸门立刻看得见）。
+# 末列取值来自**真宿主实测**（stable 通道，本仓 node:22），非手写推断。
 # 最后一列为什么对 SIGKILL 是 false：**不可捕获终止**的定义就是「探针来不及写结构化结果」，
 # 故报告里只有装配器按相位信标补的那一条 fail（没有 pass 可保留）。其余四条出口都由探针自己
 # 闭合，必须保留已跑完的检查——「报告整份消失」正是本族历史缺陷最狠的地方。
 NEGATIVE_CASES=(
-  "plugin-side-throw-plugin|guard.reserved_rejected|true|true"
-  "plugin-registry-throw-plugin|registry.exact|true|true"
-  "plugin-async-throw-plugin|plugin.async_uncaught_exception|true|true"
-  "plugin-async-reject-plugin|plugin.async_uncaught_exception|true|true"
-  "plugin-exit-plugin|plugin.early_exit|false|true"
-  "plugin-hang-plugin|plugin.run_incomplete|false|true"
-  "plugin-sigkill-plugin|plugin.abnormal_termination|false|false"
+  "plugin-side-throw-plugin|guard.reserved_rejected|true|true|lifecycle.registered,guard.reserved_rejected"
+  "plugin-registry-throw-plugin|registry.exact|true|true|registry.exact"
+  "plugin-async-throw-plugin|plugin.async_uncaught_exception|true|true|plugin.async_uncaught_exception"
+  "plugin-async-reject-plugin|plugin.async_uncaught_exception|true|true|plugin.async_uncaught_exception"
+  "plugin-exit-plugin|plugin.early_exit|false|true|plugin.early_exit"
+  "plugin-hang-plugin|plugin.run_incomplete|false|true|plugin.run_incomplete"
+  "plugin-sigkill-plugin|plugin.abnormal_termination|false|false|plugin.abnormal_termination"
   # 本分支补的**对抗形态**（评审 🔴-D′ 原始复现的变体；每份都实测过，见 CHANGELOG v0.1.9）：
   # - detach-handlers：插件先摘掉 `process` 上的**全部**相关监听器再抛错
   #   （「探针内任何兜底都不是安全网」——归因只能靠出口钩子/相位信标）；
   # - busy-loop：后台任务**同步占死**事件循环（看门狗排不上 → 占死结束后收尾）；
   # - process-exit：与 plugin-exit 同族但走**后台定时器**（不是 apply 内直接调）。
-  "plugin-detach-handlers-plugin|plugin.early_exit|false|true"
-  "plugin-busy-loop-plugin|plugin.async_uncaught_exception|true|true"
-  "plugin-process-exit-plugin|plugin.early_exit|false|true"
+  "plugin-detach-handlers-plugin|plugin.early_exit|false|true|plugin.early_exit,plugin.process_defense_tampered"
+  "plugin-busy-loop-plugin|plugin.async_uncaught_exception|true|true|plugin.async_uncaught_exception"
+  "plugin-process-exit-plugin|plugin.early_exit|false|true|plugin.early_exit"
   # H1（复评）：插件抢占 `setUncaughtExceptionCaptureCallback` → 探针兜底被**静音**，
   # 旧行为判 **GREEN 放行**（比 AMBER 更危险）。收口后必须判插件侧、完成位仍为 true
   # （探针确实跑完了——它只是**不知道**自己被静音了）。
-  "plugin-capture-callback-plugin|plugin.process_defense_tampered|true|true"
+  "plugin-capture-callback-plugin|plugin.process_defense_tampered|true|true|plugin.process_defense_tampered"
+  # 🆕 侧信道（评审 🟡-4 / RISKS R26）：插件往 stdout 写裸 `__DSH_PROBE__` 伪造绿卡。
+  # nonce 带外通道收口后：伪造行被判 `plugin.probe_result_forged`，**且**真实缺陷
+  # （`registry.exact`：注册了多余工具）仍被抓住——绿卡不得掩盖真缺陷。
+  "plugin-forged-result-plugin|plugin.probe_result_forged|true|true|registry.exact,plugin.probe_result_forged"
 )
 
 for entry in "${NEGATIVE_CASES[@]}"; do
-  IFS='|' read -r fixture expectedCheck expectedCompleted expectsPass <<< "$entry"
+  IFS='|' read -r fixture expectedCheck expectedCompleted expectsPass expectedFails <<< "$entry"
   out="$WORK/verify-$fixture.json"
   if "$NODE_BIN" "$ROOT/src/cli.mjs" verify --channel "$CHANNEL" \
       --plugin "$ROOT/tests/fixtures/$fixture.mjs" --tools demo_echo \
@@ -80,7 +91,7 @@ for entry in "${NEGATIVE_CASES[@]}"; do
     continue
   fi
   "$NODE_BIN" -e '
-    const [file, fixture, expectedCheck, expectedCompleted, expectsPass] = process.argv.slice(1);
+    const [file, fixture, expectedCheck, expectedCompleted, expectsPass, expectedFails] = process.argv.slice(1);
     const r = require(file);
     const c = r.channels[0] ?? {};
     const checks = c.checks ?? [];
@@ -95,13 +106,20 @@ for entry in "${NEGATIVE_CASES[@]}"; do
     // 反向：可捕获出口若**没有** pass 项，说明报告形态退化成「整份消失」，必须红
     if (expectsPass === "false" && checks.some((x) => x.status === "pass")) bad.push("不可捕获终止却出现 pass 项（形态异常）");
     if (!failed.includes(expectedCheck)) bad.push("失败项不含 " + expectedCheck + "（实得：" + failed.join(",") + "）");
+    // 🟡-3：**完整失败项集合**断言（不再只断"含"）。多一条（噪音失败）或少一条（防线丢了）都红。
+    // 排序后逐字比对：夹具自述「失败点精确」就必须真的精确，否则闸门看得见。
+    const want = (expectedFails || "").split(",").map((x) => x.trim()).filter(Boolean).sort();
+    const got = [...failed].sort();
+    if (JSON.stringify(want) !== JSON.stringify(got)) {
+      bad.push("失败项集合不符：期望 [" + want.join(",") + "] 实得 [" + got.join(",") + "]");
+    }
     // 完成位：未跑完的运行**不得**判通过（假绿比 AMBER 更危险，🔴 必修-1）
     const completed = c.runCompleted === true;
     if (String(completed) !== expectedCompleted) bad.push("完成位 runCompleted=" + completed + "（期望 " + expectedCompleted + "）");
     if (completed === false && r.summary.verdict === "GREEN") bad.push("未跑完却判 GREEN（假绿）");
     if (bad.length) { console.error("❌ 闸门失败：" + bad.join("；")); process.exit(1); }
-    console.log("✅ " + fixture + "：PLUGIN_REGRESSION / hostFatal 为空 / checks=" + checks.length + " / 完成位=" + completed + " / verdict=" + r.summary.verdict);
-  ' "$out" "$fixture" "$expectedCheck" "$expectedCompleted" "$expectsPass"
+    console.log("✅ " + fixture + "：PLUGIN_REGRESSION / hostFatal 为空 / checks=" + checks.length + " / 完成位=" + completed + " / 失败项集合=[" + got.join(",") + "] / verdict=" + r.summary.verdict);
+  ' "$out" "$fixture" "$expectedCheck" "$expectedCompleted" "$expectsPass" "$expectedFails"
   if [[ $? -eq 0 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 done
 

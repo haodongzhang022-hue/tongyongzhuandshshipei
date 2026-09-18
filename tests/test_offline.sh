@@ -447,6 +447,72 @@ console.log(r.hostFatal.length + '|' + r.checks.length);
 ")"
 assert "反向护栏：无相位信标（宿主装配段被终止）→ 仍写 hostFatal[]（真上游信号不丢）" "1|0" "$NOBEACON_OUT"
 
+echo "  [17] 🔴-1 占死事件循环 → 探针**有界**返回（timeoutMs 不再失效）"
+# 为什么必须有：探针为出口③装了 SIGTERM/SIGINT 处理器 ⇒ Node 默认终止行为被**替换**；
+# 插件同步占死事件循环时信号处理器**不可达** ⇒ 只发 SIGTERM 的 execFileSync 无限等待
+# ⇒ CI 挂到流水线上限（实测 while(true) → 45s+ 未返回）。修法：宿主侧 killSignal:'SIGKILL'。
+# 用 plugin-event-loop-hog-plugin（**永久**占死事件循环）：这是「只发 SIGTERM 就杀不死」的
+# **唯一**形态；plugin-hang-plugin（永不 resolve 的 Promise）事件循环是空的，SIGTERM 杀得死，
+# 测不出本回归。本断言用**短 timeout**（5s）直接测「有界性」，不进闸门、不吃满 CI 额度。
+BOUNDED_OUT="$("$NODE_BIN" --input-type=module -e '
+import path from "node:path";
+import { runOfflineProbe } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+const t0 = Date.now();
+const r = runOfflineProbe({ pluginPath: path.join("'"$ROOT"'", "tests/fixtures/plugin-event-loop-hog-plugin.mjs"), expectedTools: ["demo_echo"], timeoutMs: 5000 });
+console.log((Date.now() - t0) + "|" + (r.exit.signal ?? "none") + "|" + r.attribution);
+')"
+BOUNDED_MS="$(echo "$BOUNDED_OUT" | cut -d'|' -f1)"
+assert "占死事件循环：5s timeout 内**有界**返回（< 20s，实测约 5s）" "yes" "$([[ "$BOUNDED_MS" -lt 20000 ]] && echo yes || echo no)"
+assert "占死事件循环：由 SIGKILL 收尾（signal=SIGKILL，非无限等待）" "SIGKILL" "$(echo "$BOUNDED_OUT" | cut -d'|' -f2)"
+assert "占死事件循环：归因 PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$BOUNDED_OUT" | cut -d'|' -f3)"
+
+echo "  [13] 🆕 nonce 带外通道（侧信道：只认带 nonce 的报告 + 伪造即判）"
+NONCE_OUT="$("$NODE_BIN" --input-type=module -e '
+import { interpretProbeStdout } from "'"$ROOT"'/src/harness/host.mjs";
+import { createProbeNonce, probeResultPrefix, PLUGIN_PROBE_FORGED_RESULT_CHECK } from "'"$ROOT"'/src/harness/contract.mjs";
+import { randomBytes } from "node:crypto";
+const { envName, value } = createProbeNonce(randomBytes);
+const good = { checks: [{ name: "host.tools_ready", status: "pass" }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: "plugin-integration" };
+const forgedLine = "__DSH_PROBE__" + JSON.stringify({ checks: [{ name: "plugin.loaded", status: "pass" }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: "plugin-integration" }) + "\n";
+const realLine = probeResultPrefix(value) + JSON.stringify(good) + "\n";
+// ① 真报告（带 nonce）→ 认；伪造裸 marker → 判伪造
+const a = { checks: [], errors: [], hostFatal: [], phase: "host-assembly" };
+interpretProbeStdout(a, forgedLine + realLine, { nonce: value });
+// ② 只有裸 marker（无 nonce 传入）→ 退化为历史行为（认裸 marker）
+const b = { checks: [], errors: [], hostFatal: [], phase: "host-assembly" };
+interpretProbeStdout(b, realLine.replace(probeResultPrefix(value), "__DSH_PROBE__"), {});
+// ③ nonce 随机性：两次生成必须不同
+const n2 = createProbeNonce(randomBytes);
+console.log([
+  a.checks.some((c) => c.name === PLUGIN_PROBE_FORGED_RESULT_CHECK && c.status === "fail"),
+  a.ok === false,
+  a.checks.some((c) => c.name === "host.tools_ready" && c.status === "pass"),
+  b.checks.length === 1 && b.ok === true,
+  envName !== n2.envName && value !== n2.value,
+  /^DSH_NONCE_[0-9a-f]{12}$/.test(envName),
+].join("|"));
+')"
+assert "伪造裸 marker 被判 plugin.probe_result_forged（真缺陷不再被绿卡掩盖）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f1)"
+assert "伪造 ⇒ ok=false（不放行，绝不当成通过）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f2)"
+assert "带 nonce 的真报告仍被正确读取（通道不误伤正常路径）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f3)"
+assert "无 nonce（离线/手工调用）→ 退化为历史行为（认裸 marker）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f4)"
+assert "nonce 值与承载它的环境变量名**都随机**（固定名 = 没设防）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f5)"
+assert "随机环境变量名形状 = DSH_NONCE_<12 hex>" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f6)"
+
+# 端到端：伪造夹具经**真协议**跑（宿主生成 nonce + 探针带 nonce 输出 + 宿主只认带 nonce 行）
+FORGED_OUT="$("$NODE_BIN" --input-type=module -e '
+import path from "node:path";
+import { runOfflineProbe } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+const r = runOfflineProbe({ pluginPath: path.join("'"$ROOT"'", "tests/fixtures/plugin-forged-result-plugin.mjs"), expectedTools: ["demo_echo"] });
+const fails = r.result.checks.filter((c) => c.status === "fail").map((c) => c.name);
+console.log([r.attribution, r.result.hostFatal.length, fails.includes("plugin.probe_result_forged"), fails.includes("registry.exact"), r.result.ok === true].join("|"));
+')"
+assert "伪造夹具（真协议）：归因 PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$FORGED_OUT" | cut -d'|' -f1)"
+assert "伪造夹具（真协议）：hostFatal 为空（不甩锅上游）" "0" "$(echo "$FORGED_OUT" | cut -d'|' -f2)"
+assert "伪造夹具（真协议）：失败项含 plugin.probe_result_forged" "true" "$(echo "$FORGED_OUT" | cut -d'|' -f3)"
+assert "伪造夹具（真协议）：真实缺陷 registry.exact 仍被抓住（绿卡没掩盖它）" "true" "$(echo "$FORGED_OUT" | cut -d'|' -f4)"
+assert "伪造夹具（真协议）：**不得**判通过" "false" "$(echo "$FORGED_OUT" | cut -d'|' -f5)"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

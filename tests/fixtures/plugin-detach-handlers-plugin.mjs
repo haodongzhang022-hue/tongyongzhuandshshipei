@@ -12,7 +12,7 @@
  * 无条件 `pushHostFatal()` → `UPSTREAM_DRIFT`/AMBER 且 `checks = 0`。
  *
  * 期望行为（修复后，靠**带外**侧信道相位归因）：`PLUGIN_REGRESSION` / RED /
- * `hostFatal[]` 为空 / 失败项 `plugin.probe_aborted` / `checks` 非空 /
+ * `hostFatal[]` 为空 / 失败项 `plugin.early_exit` / `checks` 非空 /
  * `probePhase = plugin-integration`。
  */
 import { createAdapter } from '../../src/adapter.mjs';

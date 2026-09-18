@@ -79,6 +79,71 @@ export const CONTRACT_PROBES = [
 export const PROBE_PHASE_BEACON_PREFIX = '__DSH_PROBE_PHASE__';
 
 /**
+ * 探针**结构化结果标记**（人读/日志用；判据实际走 {@link probeResultPrefix} 带 nonce 的形式）。
+ *
+ * ⚠️ 纪律（🆕 侧信道 / 信任边界）：本字面量**不再**是「谁是探针」的唯一凭据——
+ * 插件与探针**共用同一个 stdout**，插件只要 `process.stdout.write('__DSH_PROBE__{...}')`
+ * 就能伪造一张绿卡（或反过来把责任甩给上游）。故真正的判据是**带 nonce 的前缀**
+ * （{@link probeResultPrefix}）：宿主每次运行生成**随机** nonce，只认带该 nonce 的行。
+ *
+ * 为什么「随机」而不是固定名：固定名（如 `__DSH_PROBE__`）等于没设防——插件照抄即可。
+ * nonce 的**环境变量名**也是随机的（见 {@link PROBE_NONCE_ENV_ARG_PREFIX}），
+ * 故插件不能靠猜名字拿到它。
+ */
+export const PROBE_RESULT_MARKER = '__DSH_PROBE__';
+
+/**
+ * 宿主 → 探针传递 nonce 的 **argv 参数前缀**（值为**随机生成的环境变量名**）。
+ *
+ * 协议（🆕 侧信道收口）：
+ * 1. 宿主生成两个随机量：环境变量名 `NAME`（如 `DSH_NONCE_9f3c…`）与 nonce 值 `VALUE`；
+ * 2. 宿主以 `--probe-nonce-env=NAME` 传给探针，并把 `NAME=VALUE` 放进探针的**环境变量**；
+ * 3. 探针启动时按 argv 取 `NAME`、读 `process.env[NAME]` 得 `VALUE`，之后**立刻**从环境里删除；
+ * 4. 探针输出 `__DSH_PROBE__<VALUE>:{json}`；宿主只认带 `VALUE` 的那一行。
+ *
+ * 这样「谁是探针」由**宿主掌握的随机量**判定，而不是靠公开的字面量——
+ * 插件伪造一个裸 `__DSH_PROBE__{...}` 会被宿主识别为**伪造**（落插件侧 check），
+ * 而不是被当成探针的绿卡。残留边界（插件读取自己的 argv 即可拿到 nonce）见
+ * `docs/RISKS.md` R26：**插件是可信代码**是显式前提，nonce 挡的是「无意的自我发绿卡」
+ * 与「共用 stdout 的误命中」，不是「恶意插件」。
+ */
+export const PROBE_NONCE_ENV_ARG_PREFIX = '--probe-nonce-env=';
+
+/**
+ * 生成一次运行的随机 nonce 与承载它的**随机环境变量名**。
+ *
+ * @param {() => Buffer} randomBytes `node:crypto` 的 `randomBytes`（注入以便离线单测）
+ * @returns {{envName: string, value: string}} 环境变量名（随机）与 nonce 值（随机）
+ */
+export function createProbeNonce(randomBytes) {
+  const hex = (n) => randomBytes(n).toString('hex');
+  return { envName: `DSH_NONCE_${hex(6)}`, value: hex(16) };
+}
+
+/**
+ * 探针结构化结果的**带 nonce 前缀**（宿主只认它）。
+ *
+ * @param {string} nonce nonce 值
+ * @returns {string} `__DSH_PROBE__<nonce>:` 前缀
+ */
+export function probeResultPrefix(nonce) {
+  return `${PROBE_RESULT_MARKER}${nonce}:`;
+}
+
+/**
+ * 从探针 argv 中解析出承载 nonce 的**环境变量名**（无则返回 null）。
+ *
+ * @param {string[]} argv 探针进程 argv（`process.argv.slice(2)` 亦可）
+ * @returns {string|null}
+ */
+export function probeNonceEnvNameFromArgv(argv) {
+  const hit = (argv ?? []).find((arg) => typeof arg === 'string' && arg.startsWith(PROBE_NONCE_ENV_ARG_PREFIX));
+  if (!hit) return null;
+  const name = hit.slice(PROBE_NONCE_ENV_ARG_PREFIX.length).trim();
+  return name === '' ? null : name;
+}
+
+/**
  * 宿主/环境侧致命信号的**日志前缀**（探针与装配器拼人类可读 `errors[]` 时使用）。
  *
  * ⚠️ 纪律（评审 🔴-C）：此前缀**只许用于人读日志，绝不可作为归因判据的文本扫描目标**。
@@ -235,6 +300,19 @@ export const PLUGIN_ABNORMAL_TERMINATION_CHECK = 'plugin.abnormal_termination';
  * 由出口③④ 或装配器按相位信标归因。
  */
 export const PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK = 'plugin.process_defense_tampered';
+
+/**
+ * 「探针 stdout 里出现**伪造的结构化结果**（无 nonce / nonce 不匹配）」在插件侧的落点 check 名。
+ *
+ * 为什么需要（🆕 侧信道 / 信任边界，见 `docs/RISKS.md` R26）：探针与插件**共用 stdout**，
+ * 插件可以 `process.stdout.write('__DSH_PROBE__{...绿卡...}')` 自造一张绿卡；
+ * 或写 `hostFatal:[...]` 把责任甩给上游。宿主按**带 nonce 的前缀**认报告后，
+ * 「无 nonce 的 marker 行」就成了**伪造证据**——本 check 即该证据的落点（判插件侧、不放行）。
+ *
+ * 与 {@link PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK} 的分工：那个判「探针自己的兜底被静音」，
+ * 本项判「有人冒用探针的输出协议」。两者都可能在同一轮出现（伪造 + 静音），各自独立记录。
+ */
+export const PLUGIN_PROBE_FORGED_RESULT_CHECK = 'plugin.probe_result_forged';
 
 /**
  * 进程级异常归属路由（**唯一事实源**，探针的进程级兜底与离线回归共用）。
@@ -467,6 +545,9 @@ export const PLUGIN_SIDE_CHECKS = [
   // 进程级兜底被**静音** ⇒ 插件后台抛错不可见、完成位仍真 ⇒ **GREEN 放行**（比 AMBER 更危险）。
   // 由探针收尾自检 `process.hasUncaughtExceptionCaptureCallback()` + 监听器计数判本项。
   'plugin.process_defense_tampered',
+  // 🆕 侧信道（信任边界）：探针 stdout 里出现无 nonce / nonce 不匹配的伪造结构化结果。
+  // 由**装配器**在解释 stdout 时判定（探针自己看不到别人写了什么），落插件侧 check。
+  'plugin.probe_result_forged',
 ];
 
 /**
@@ -489,6 +570,7 @@ export const CONDITIONAL_PROBE_CHECKS = [
   PLUGIN_RUN_INCOMPLETE_CHECK,
   PLUGIN_ABNORMAL_TERMINATION_CHECK,
   PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK,
+  PLUGIN_PROBE_FORGED_RESULT_CHECK,
 ];
 
 /**
