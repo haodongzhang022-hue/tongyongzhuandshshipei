@@ -2,7 +2,7 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.2.1`（module `adapt-hub`；v0.1.9d/v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；**v0.2.1：信任边界写成显式前提（R26）+ R24 反向反证 + 结构性重做一页方案（批 2 待拍板）**）
+> 版本：`dsh-adapt-hub v0.2.2`（module `adapt-hub`；v0.1.9d/v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；**v0.2.1：信任边界写成显式前提（R26）+ R24 反向反证 + 结构性重做一页方案（批 2 待拍板）**）
 
 ---
 

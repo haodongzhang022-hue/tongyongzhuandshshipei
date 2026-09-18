@@ -1,5 +1,40 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.2.2 · nonce 带外通道改走 **stdin**（env/argv 通道可被同进程插件反读，实测放行级假绿）
+
+> 承接 v0.2.1（fd3 结果通道 + R28 判据 + R24 反向反证 + 结构性重做一页方案）。
+> 本版**只补一处实测活口**，不重复已完成部分。
+
+### 🔴 活口：env / argv 通道的 nonce 可被同进程插件反读
+
+| 项 | 内容 |
+|---|---|
+| 机理 | v0.2.0 的 nonce 经 **env 通道**下发（随机环境变量名经 argv `--probe-nonce-env=NAME`、值经 env 传入；探针读到后 `delete process.env[NAME]`）。`delete` 只改 **Node 的环境视图**，**不**改内核里的**进程环境块** ⇒ 插件仍可从 **`/proc/self/environ`** 读回 nonce |
+| 我方实测（夹具 `plugin-nonce-reverse-read-plugin`，env 通道下） | **`verdict=GREEN / attribution=PASS / checks=17 / hostFatal=[]`** —— 即「反读 nonce 后伪造带 nonce 的结果行」**被采信**（放行级假绿）。argv 通道同理：nonce 会出现在 `ps` / `/proc/self/cmdline` |
+| 修复 | nonce 改经 **stdin** 下发（`stdio[0] = 'pipe'` + `input`）；探针 `readFileSync(0, 'utf8')` 读完**立刻** `process.stdin.destroy()`。stdin 的字节流**不在**进程环境块、也**不在** argv 里 ⇒ 上述两条读取面都不成立 |
+| 修复后实测 | 同一夹具判 **`plugin.probe_result_forged` / RED / `hostFatal=[]`**（不再放行） |
+| 防线 | 新夹具 **进闸门**（14 → 15 负例）+ 离线源码守卫（`probeSpawnOptions` 断言 stdin 为 pipe / `input` 带 nonce / env **无** `DSH_NONCE*` / argv **无** nonce 参数；探针侧断言从 fd 0 读 + 读完 destroy；**反向**断言 `contract.mjs` 不再有 env 通道 API ⇒ 回退即红）+ 夹具自检（断言两条读取面都真的尝试了） |
+
+> **口径（不越权承诺，与 R26 一致）**：本项收窄的是「从环境块 / argv 反读」这条**具体通道**；
+> 探针与插件**同进程、同 uid** 这一结构性事实下，插件仍可篡改**其它**全局
+> （猴子补丁 `JSON.stringify` / 直接读探针内存）。彻底隔离需**进程级**方案
+> （见 `docs/REDO-PROPOSAL.md` 批 2，待总师裁定）。故**不得**宣称「报告不可伪造」。
+
+### 兼容性（行为变更，预期）
+
+- `contract.mjs`：**移除** `PROBE_NONCE_ENV_ARG_PREFIX` / `probeNonceEnvNameFromArgv`；
+  `createProbeNonce()` 返回值由 `{envName, value}` 收窄为 `{value}`；**新增**
+  `PROBE_NONCE_STDIN_CHANNEL`（通道形态的唯一事实源）。
+- 生产路径与离线回归台**同构**（都经 `probeSpawnOptions()`），故「通道拼装」这一层在离线侧也被覆盖。
+
+### 测试项数（本版）
+
+- `tests/test_offline.sh`：129 → **128 项**（通道形态断言由「env 名随机」改为「stdin 通道」）
+- `tests/test_attribution.mjs`：430 → **441 项**（[9.11e] 通道形态守卫 11 条 + 夹具自检）
+- `tests/test_e2e_regression.mjs`：**146 项**（不变）
+- `tests/gate_plugin_side.sh`：20 → **21 项**（负例 14 → **15 份**：新增反读形态）
+- `tests/test_exports.mjs`：**40 项**（不变）
+
 ## v0.2.1 · 信任边界**显式前提** + 🔴-1 **反向反证** + 结构性重做一页方案
 
 > 承接 v0.1.9d / v0.2.0（🔴-1 killSignal + R26 协议注入 + R28 防线自检 + nonce/fd3 两条防线）。
