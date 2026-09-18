@@ -13,18 +13,24 @@
  * 3. **插件语法错误** → 期望 `PLUGIN_REGRESSION`。
  * 4. **插件未导出 `apply`** → 期望 `PLUGIN_REGRESSION`。
  * 5. **插件多注册工具** → 期望 `PLUGIN_REGRESSION`（且路径含 `npm` 也照样判插件）。
- * 6. **漂移窗口 + 插件声明保留名**（评审 🔴-C 原始复现）→ 仍须 `PLUGIN_REGRESSION`，
- *    且同窗口内的健康插件仍须 `PASS`（反向护栏不被打穿）。
+ * 6. **漂移窗口 + 插件声明保留名**（🔴-C 之一：漂移相关性吞掉插件侧硬违规）→ 仍须
+ *    `PLUGIN_REGRESSION`，且同窗口内的健康插件仍须 `PASS`（反向护栏不被打穿）。
+ * 7. **🔴-C 之二（判据扫自由文本）**：插件文件所在**目录名含 `fatal(host)`** → 期望
+ *    `PLUGIN_REGRESSION`（判据只读结构化 `hostFatal[]`，不扫插件侧 stack/路径文本）。
+ * 8. **真宿主侧致命信号**（离线缺缓存）→ 期望 `UPSTREAM_DRIFT` 且 `hostFatal` 非空
+ *    （收窄判据不得丢掉真漂移）。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
  */
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { channelFingerprint, loadChannels } from '../src/harness/host.mjs';
+// P2-8：插件侧 check 名单**从唯一事实源 import**（此前硬编码 12 项，表一改测试就不设防）
+import { PLUGIN_SIDE_CHECKS } from '../src/harness/contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -112,10 +118,10 @@ function patchOutReservedNameRejection() {
 }
 
 /** 跑一次真宿主验收，返回报告里的第一个通道。 */
-function verify(pluginPath, tools, { tmp = SOURCE_CACHE, channelName = CHANNEL, scratch = makeScratch() } = {}) {
+function verify(pluginPath, tools, { tmp = SOURCE_CACHE, channelName = CHANNEL, offline = false, scratch = makeScratch() } = {}) {
   const out = path.join(work, `out-${Math.random().toString(36).slice(2)}.json`);
   try {
-    execFileSync('node', [path.join(scratch, 'src', 'cli.mjs'), 'verify', '--channel', channelName, '--plugin', pluginPath, '--tools', tools, '--json', out], {
+    execFileSync('node', [path.join(scratch, 'src', 'cli.mjs'), 'verify', '--channel', channelName, '--plugin', pluginPath, '--tools', tools, '--json', out, ...(offline ? ['--offline'] : [])], {
       cwd: scratch,
       env: { ...process.env, TMPDIR: tmp },
       encoding: 'utf8',
@@ -156,9 +162,9 @@ try {
     eq(label, 'PLUGIN_REGRESSION', report.attribution);
     eq(`${label}（失败项含 ${failedCheck}）`, true, (report.checks ?? []).some((c) => c.name === failedCheck && c.status === 'fail'));
     // 失败项必须**全部**在插件侧表内（前置失败只把后续检查标 skip，不制造噪音失败）
-    const pluginSide = new Set(['plugin.loaded', 'plugin.apply_ok', 'plugin.definitions_ok', 'registry.exact', 'dispatch.execute_ok', 'dispatch.render_projected', 'dispatch.echo_payload', 'dispatch.abort_semantics', 'lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected']);
+    const pluginSide = new Set(PLUGIN_SIDE_CHECKS);
     const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
-    eq(`${label}（失败项全在插件侧）`, true, failed.every((name) => pluginSide.has(name)));
+    eq(`${label}（失败项全在插件侧，名单取自 PLUGIN_SIDE_CHECKS）`, true, failed.every((name) => pluginSide.has(name)));
     // 前置失败（import / apply）必须把后续检查标 skip（报告里看得见「哪些没验」）；
     // 「多注册工具」这类后置失败则全部检查都真的跑完了，不应有 skip。
     const preconditionFailed = failedCheck === 'plugin.loaded' || failedCheck === 'plugin.apply_ok';
@@ -180,7 +186,6 @@ try {
   const broken = verify(path.join(ROOT, 'tests/fixtures/broken-plugin.mjs'), 'broken_ok');
   eq('声明保留名 → PLUGIN_REGRESSION（基线一致时）', 'PLUGIN_REGRESSION', broken.attribution);
   eq('失败项为 guard.reserved_rejected', true, (broken.checks ?? []).some((c) => c.name === 'guard.reserved_rejected' && c.status === 'fail'));
-
   // ---- 8. 🔴-C 原始复现：漂移窗口内插件侧硬违规不得被吞成上游漂移 ----
   // 上游放宽保留名校验（= reservedName 漂移）时，插件声明保留名仍必须判 PLUGIN_REGRESSION；
   // 历史缺陷：漂移相关性判据把 guard.reserved_rejected 一起算作「相关」→ 误判 UPSTREAM_DRIFT/AMBER。
@@ -198,6 +203,26 @@ try {
     const driftHealthy = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status', { tmp: patchedTmp });
     eq('反向护栏：漂移窗口 + 健康插件 → 仍 PASS', 'PASS', driftHealthy.attribution);
   }
+  // ---- 9. 🔴-C 之二：插件所在目录名含 fatal(host) 不得翻案（真宿主；判据不扫自由文本） ----
+  console.log('  [6] 🔴-C：路径含 fatal(host) 的插件失败 → 必须判插件');
+  const fatalDir = path.join(work, 'fatal(host)-dir');
+  mkdirSync(fatalDir, { recursive: true });
+  const fatalPlugin = path.join(fatalDir, 'apply-throws.mjs');
+  cpSync(path.join(ROOT, 'tests/fixtures/apply-throws-plugin.mjs'), fatalPlugin);
+  const fatalReport = verify(fatalPlugin, 'demo_echo');
+  eq('🔴-C：插件目录含 fatal(host) + apply 抛错 → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION', fatalReport.attribution);
+  eq('🔴-C：插件侧 stack 里确实带 fatal(host) 字面量（证明用例有效）', true,
+    (fatalReport.errors ?? []).some((e) => e.includes('fatal(host)-dir')));
+  eq('🔴-C：结构化 hostFatal 为空（插件侧失败不落宿主字段）', 0, (fatalReport.hostFatal ?? []).length);
+
+  // ---- 10. 真宿主侧致命信号仍判漂移（收窄判据不得丢掉真漂移） ----
+  console.log('  [7] 真宿主侧致命信号（离线缺缓存）→ UPSTREAM_DRIFT');
+  const emptyTmp = path.join(work, 'empty-tmp');
+  mkdirSync(emptyTmp, { recursive: true });
+  const offlineReport = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status', { tmp: emptyTmp, offline: true });
+  eq('离线缺缓存（真宿主）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT', offlineReport.attribution);
+  eq('离线缺缓存：结构化 hostFatal 非空（判据只读该字段）', true, (offlineReport.hostFatal ?? []).length > 0);
+  eq('离线缺缓存：理由链指向 hostFatal 字段', true, (offlineReport.attributionReasons ?? []).some((r) => r.includes('hostFatal')));
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

@@ -31,7 +31,7 @@ export {
 } from './compat/tool.mjs';
 export { loadChannels, pinsToSpecs, channelFingerprint, runHostProbe, pruneHostCache, HUB_ROOT } from './harness/host.mjs';
 export { verifyChannel, verifyAll, summarize, attributeFailure, attributionDetail, resolvePlugin } from './verify/runner.mjs';
-export { collectContract, CONTRACT_PROBES, CONTRACT_PROBE_NAMES } from './harness/contract.mjs';
+export { collectContract, pushHostFatal, CONTRACT_PROBES, CONTRACT_PROBE_NAMES, HOST_FATAL_PREFIX, HOST_FATAL_FIELD } from './harness/contract.mjs';
 export { watchUpstream, fetchDistTags, contractSnapshot, diffContracts } from './watch/upstream.mjs';
 export { buildSecondary, toMarkdown } from './report/secondary.mjs';
 export { createAdapter } from './adapter.mjs';

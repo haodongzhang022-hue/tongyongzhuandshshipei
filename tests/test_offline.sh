@@ -175,17 +175,19 @@ assert "--key value 仍可用" "stable" "$(echo "$OUT" | sed -n 2p)"
 assert "布尔开关可用" "true" "$(echo "$OUT" | sed -n 3p)"
 assert "未知 token 显式报错" "yes" "$(echo "$OUT" | sed -n 4p)"
 
-echo "  [9] 归因判定（结构化判据：宿主侧 fatal(host) vs 插件侧 check）"
-# 说明：判据自 v0.1.2 起**结构化**——宿主侧只认 fatal(host) 前缀与宿主侧 check 名，
-# 插件侧只认插件侧 check 名（历史缺陷：裸 /npm|fatal:/ 会把含 npm 的路径与插件侧
-# fatal 措辞误判成上游漂移）。更完整的回归见 tests/test_attribution.mjs。
+echo "  [9] 归因判定（结构化判据：宿主侧 hostFatal[] vs 插件侧 check）"
+# 说明：判据自 v0.1.3 起**只读结构化字段**——宿主侧认 probe.hostFatal[]（结构化）与宿主侧 check 名，
+# 插件侧只认插件侧 check 名；errors[] 仅作日志、不参与判据。
+# 历史缺陷：v0.1.1 裸 /npm|fatal:/；v0.1.2 改为扫 fatal(host) 前缀（仍是自由文本子串扫描，
+# 插件路径/文本含该字面量即翻案）。更完整的回归见 tests/test_attribution.mjs。
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure, attributionDetail } from '$ROOT/src/verify/runner.mjs';
 const ch = { label: 'x', line: '0.1.6' };
-const p = (errors, checks = []) => ({ errors, checks, profile: { flavor: 'modern' }, contract: {} });
+const p = (errors, checks = [], extra = {}) => ({ errors, checks, hostFatal: [], profile: { flavor: 'modern' }, contract: {}, ...extra });
+const hf = (detail) => p(['fatal(host): ' + detail], [], { hostFatal: [detail] });
 const fc = (name) => ({ name, status: 'fail', detail: 'x' });
-// 宿主/环境侧
-console.log(attributeFailure(p(['fatal(host): 宿主依赖安装失败（npm）：npm ERR! code ETARGET']), ch, 'dev'));
+// 宿主/环境侧：**结构化字段** hostFatal[]（判据只读它）
+console.log(attributeFailure(hf('宿主依赖安装失败（npm）：npm ERR! code ETARGET'), ch, 'dev'));
 console.log(attributeFailure(p(['host.tools_ready: ctx.tools 未就绪'], [fc('host.tools_ready')]), ch, 'dev'));
 // 插件侧
 console.log(attributeFailure(p(['registry.exact: 期望 a / 实得 b'], [fc('registry.exact')]), ch, 'dev'));
@@ -194,19 +196,22 @@ console.log(attributeFailure(p(['dispatch.execute_ok: Error'], [fc('dispatch.exe
 console.log(attributeFailure(p(['plugin.apply_ok: 插件 apply 抛错 | at file:///home/runner/.npm/_npx/x/probe.mjs:1:1'], [fc('plugin.apply_ok')]), ch, 'dev'));
 // 🔴-B 回归：插件侧旧措辞裸 fatal: 不得翻案
 console.log(attributeFailure(p(['plugin.loaded: 插件 import 失败：SyntaxError | fatal: 旧措辞'], [fc('plugin.loaded')]), ch, 'dev'));
+// 🔴-C 回归：自由文本含 fatal(host) 字面量（插件路径/文本）不得翻案
+console.log(attributeFailure(p(['plugin.apply_ok: 插件 apply 抛错 | at file:///tmp/fatal(host)-dir/apply-throws.mjs:3:33'], [fc('plugin.apply_ok')]), ch, 'dev'));
 // 无失败 check（探针被外力打断）→ 不猜
 console.log(attributeFailure(p(['探针非零退出（status=null）']), ch, 'dev'));
 // 理由链可审计
 console.log(attributionDetail(p(['registry.exact: x'], [fc('registry.exact')]), ch, 'dev').reasons.length > 0 ? 'has-reasons' : 'no-reasons');
 ")"
-assert "宿主安装失败（fatal(host)）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
+assert "宿主安装失败（结构化 hostFatal[]）→ UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 1p)"
 assert "宿主未就绪 → UPSTREAM_DRIFT" "UPSTREAM_DRIFT" "$(echo "$OUT" | sed -n 2p)"
 assert "工具清单不符 → PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 3p)"
 assert "dispatch 失败 → PLUGIN_REGRESSION" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 4p)"
 assert "🔴-B：路径含 npm 不误判为上游漂移" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 5p)"
 assert "🔴-B：插件侧裸 fatal: 措辞不误判为上游漂移" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 6p)"
-assert "无失败 check → UNKNOWN（不猜归因）" "UNKNOWN" "$(echo "$OUT" | sed -n 7p)"
-assert "归因带可审计理由链" "has-reasons" "$(echo "$OUT" | sed -n 8p)"
+assert "🔴-C：路径含 fatal(host) 不误判为上游漂移" "PLUGIN_REGRESSION" "$(echo "$OUT" | sed -n 7p)"
+assert "无失败 check → UNKNOWN（不猜归因）" "UNKNOWN" "$(echo "$OUT" | sed -n 8p)"
+assert "归因带可审计理由链" "has-reasons" "$(echo "$OUT" | sed -n 9p)"
 
 OUT="$("$NODE_BIN" --input-type=module -e "
 import { attributeFailure } from '$ROOT/src/verify/runner.mjs';

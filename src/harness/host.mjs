@@ -14,6 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { pushHostFatal } from './contract.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,7 +93,7 @@ export function pruneHostCache(options = {}) {
  * @param {string} [options.cacheDir] 宿主依赖缓存根（默认 $TMPDIR/dsh-adapt-host-cache）
  * @param {boolean} [options.offline] 仅用缓存，缺失即失败
  * @param {number} [options.timeoutMs] 安装 / 探针超时
- * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], contract:object, probes:object[], probeExit:object|null, install:string, cacheHit:boolean, durationMs:number}}
+ * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], hostFatal:string[], contract:object, probes:object[], probeExit:object|null, install:string, cacheHit:boolean, durationMs:number}}
  *
  * 缓存策略：命中时以**软链**挂载缓存 `node_modules`（不再全量复制）；
  * 历史残留用 {@link pruneHostCache} 清理（保留当前钉版指纹）。
@@ -118,7 +119,9 @@ export function runHostProbe(options) {
     ok: false,
     profile: null,
     checks: [],
+    // errors：人类可读日志；hostFatal：**结构化**宿主/环境侧致命信号（归因判据只读它，见 🔴-C）
     errors: [],
+    hostFatal: [],
     contract: {},
     probes: [],
     probeExit: null,
@@ -138,7 +141,7 @@ export function runHostProbe(options) {
       result.install = `cache:${cachePath}`;
     } else if (offline) {
       result.install = 'offline-miss';
-      result.errors.push(`fatal(host): 离线模式下缺少宿主依赖缓存（先联网跑一次或去掉 --offline）`);
+      pushHostFatal(result, '离线模式下缺少宿主依赖缓存（先联网跑一次或去掉 --offline）');
       return result;
     } else {
       try {
@@ -150,7 +153,7 @@ export function runHostProbe(options) {
       } catch (error) {
         // 安装失败 = 宿主/环境侧（网络不可达 或 上游钉版消失）→ 显式措辞，供归因按**结构**判定
         result.install = 'npm-failed';
-        result.errors.push(`fatal(host): 宿主依赖安装失败（npm）：${String(error?.message ?? error).slice(0, 300)}`);
+        pushHostFatal(result, `宿主依赖安装失败（npm）：${String(error?.message ?? error).slice(0, 300)}`);
         return result;
       }
       cpSync(path.join(workDir, 'node_modules'), path.join(cachePath, 'node_modules'), { recursive: true });
@@ -190,7 +193,7 @@ export function runHostProbe(options) {
 
     const marker = stdout.split('\n').find((line) => line.startsWith('__DSH_PROBE__'));
     if (!marker) {
-      result.errors.push(`fatal(host): 探针未输出结构化结果（探针自身崩溃 / 被宿主中断）：${stdout.slice(-600)}`);
+      pushHostFatal(result, `探针未输出结构化结果（探针自身崩溃 / 被宿主中断）：${stdout.slice(-600)}`);
       return result;
     }
     let payload;
@@ -198,7 +201,7 @@ export function runHostProbe(options) {
       payload = JSON.parse(marker.slice('__DSH_PROBE__'.length));
     } catch (error) {
       // 探针输出不可解析 = 探针自身（本仓文件）出问题 → 宿主侧，不甩锅插件
-      result.errors.push(`fatal(host): 探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
+      pushHostFatal(result, `探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
       return result;
     }
     result.profile = payload.profile;
@@ -206,11 +209,13 @@ export function runHostProbe(options) {
     result.contract = payload.contract ?? {};
     result.probes = payload.probes ?? [];
     result.errors.push(...(payload.errors ?? []));
+    // 探针侧的结构化宿主致命信号**原样透传**（执行器判据只读这一处，不再扫 errors 文本）
+    result.hostFatal.push(...(payload.hostFatal ?? []));
     result.ok = payload.ok === true && result.errors.length === 0;
     return result;
   } catch (error) {
     // 装配阶段兜底：一律宿主/环境侧（探针脚本未产出结构化结果前的失败不可能是插件造成）
-    result.errors.push(`fatal(host): 宿主装配失败：${String(error?.message ?? error).slice(0, 500)}`);
+    pushHostFatal(result, `宿主装配失败：${String(error?.message ?? error).slice(0, 500)}`);
     return result;
   } finally {
     result.durationMs = Date.now() - started;

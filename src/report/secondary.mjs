@@ -41,6 +41,7 @@ export function buildSecondary(report) {
         : isUnknown
           ? '看原始 errors 与探针退出实况（probeExit），人工判定后再跑；禁止改验收标准来「过」'
           : '定位失败 check（见 checks[].name）并修复插件；禁止改验收标准来「过」',
+      hostFatal: channel.hostFatal ?? [],
       errors: channel.errors ?? [],
     });
   }
@@ -64,6 +65,8 @@ export function buildSecondary(report) {
       attributionReasons: channel.attributionReasons ?? [],
       durationMs: channel.durationMs,
       failedChecks: (channel.checks ?? []).filter((c) => c.status === 'fail').map((c) => ({ name: c.name, detail: c.detail })),
+      // 宿主/环境侧致命信号（**结构化**；归因判据只读它，errors 仅作日志——见 docs/RISKS.md R7/R13）
+      hostFatal: channel.hostFatal ?? [],
       errors: channel.errors ?? [],
     })),
     summary: {

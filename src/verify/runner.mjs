@@ -16,7 +16,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { HUB_ROOT, loadChannels, runHostProbe } from '../harness/host.mjs';
-import { CONTRACT_SIDE_CHECKS, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS } from '../harness/contract.mjs';
+import { CONTRACT_SIDE_CHECKS, HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS } from '../harness/contract.mjs';
 import { channelContractDrift, contractSnapshot } from '../watch/upstream.mjs';
 
 /**
@@ -68,6 +68,7 @@ export function verifyChannel(options) {
     contractDrift,
     checks: probe.checks,
     errors: probe.errors,
+    hostFatal: probe.hostFatal ?? [],
     probeExit: probe.probeExit ?? null,
     install: probe.install,
     cacheHit: probe.cacheHit,
@@ -81,21 +82,26 @@ export function verifyChannel(options) {
  *
  * 历史缺陷（评审 🔴-B）：判据曾是裸正则 `/npm|fatal:/`，而探针把插件侧错误也写成
  * `fatal: ...`、把命令行/路径写进错误串 → 路径里含 `npm` 就命中，插件 bug 被报成
- * 上游漂移。现在改为**按信号来源**判定：宿主侧只认 `fatal(host)` 前缀与宿主侧 check 名，
- * 插件侧只认插件侧 check 名，二者不共享关键词。
+ * 上游漂移。第一轮修复改为「宿主侧只认 `fatal(host)` 前缀」——**仍是扫自由文本**。
+ *
+ * 历史缺陷（评审 🔴-C）：插件文件路径 / 错误文本里出现 `fatal(host)` 字面量即再次翻案。
+ * 现在判据**只读结构化字段**：宿主侧 = `probe.hostFatal[]`（探针/装配器显式落字段）+ 宿主侧
+ * check 名；插件侧 = 插件侧 check 名。`errors[]` 仅作日志，**任何判据都不读它**。
  *
  * @module dsh-adapt-hub/verify/runner
  */
 
 // 判据表由 `harness/contract.mjs` 提供（探针与执行器共用同一份，防两侧漂移）。
-export { HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS };
+// HOST_FATAL_PREFIX 仅作日志前缀导出，**判据不得读它**（见下）。
+export { HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS };
 
 /**
  * 失败归因（详细版）：区分「上游漂移」与「插件回归」，并给出可审计的理由链。
  *
  * 判据（按优先级）：
- * 1. **宿主/环境侧**：错误串含 `fatal(host)`，或失败项属 {@link HOST_SIDE_CHECKS}
- *    （宿主未就绪 / 版本线不可判定 / 契约探测未卸载）→ `UPSTREAM_DRIFT`；
+ * 1. **宿主/环境侧**：结构化字段 `probe.hostFatal[]` 非空，或失败项属 {@link HOST_SIDE_CHECKS}
+ *    （宿主未就绪 / 版本线不可判定 / 契约探测未卸载）→ `UPSTREAM_DRIFT`。
+ *    `errors[]` 是**人类可读日志**（含插件侧 stack / 文件路径），**不参与任何判据**；
  * 2. **版本线 unknown** → `UPSTREAM_DRIFT`；
  * 2b. **插件侧硬证据**（{@link PLUGIN_HARD_EVIDENCE}，如 `guard.reserved_rejected`）
  *    → `PLUGIN_REGRESSION`，**优先于任何漂移相关性**：插件违反宿主硬约束与上游契约是否
@@ -106,7 +112,8 @@ export { HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CHECKS, PLUGIN_HARD_
  * 6. 有失败但无任何可识别 check（探针被外力打断等）→ `UNKNOWN`（不猜、不甩锅）。
  *
  * 注意：**没有** `ENV_ERROR` 返回点（历史 JSDoc 死声明，v0.1.2 移除）；环境/网络问题
- * 统一由宿主侧信号（`fatal(host)`）表达，归因为 `UPSTREAM_DRIFT`，人按报告原因处理。
+ * 统一由宿主侧结构化信号（`hostFatal[]`，日志前缀 `fatal(host)`）表达，归因为
+ * `UPSTREAM_DRIFT`，人按报告原因处理。
  *
  * @param {object} probe 探针结果
  * @param {object} channel 通道定义
@@ -115,14 +122,18 @@ export { HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CHECKS, PLUGIN_HARD_
  * @returns {{attribution:'UPSTREAM_DRIFT'|'PLUGIN_REGRESSION'|'UNKNOWN', channel:string, reasons:string[]}}
  */
 export function attributionDetail(probe, channel, channelName, evidence = {}) {
-  const errors = (probe?.errors ?? []).join('\n');
+  // 注意：**不读 probe.errors**——它是人类可读日志（含插件侧 stack / 路径），读它就会重蹈 🔴-B / 🔴-C。
   const failedChecks = (probe?.checks ?? []).filter((check) => check.status === 'fail');
   const failedNames = new Set(failedChecks.map((check) => check.name));
   const label = channel?.label ?? channelName;
   const reasons = [];
 
-  // 1. 宿主/环境侧（前缀 + check 名，双通道，互不串味）
-  if (errors.includes(HOST_FATAL_PREFIX)) reasons.push(`[${channelName}] 探针报告宿主/环境侧致命错误（${HOST_FATAL_PREFIX}）`);
+  // 1. 宿主/环境侧：**只读结构化字段** hostFatal[]（绝不扫 errors 自由文本——插件侧 stack/路径
+  //    里出现 `fatal(host)` 字面量就会翻案，评审 🔴-C），或失败项属宿主侧 check 名。
+  const hostFatal = probe?.[HOST_FATAL_FIELD] ?? [];
+  if (hostFatal.length > 0) {
+    reasons.push(`[${channelName}] 探针报告宿主/环境侧致命错误（${hostFatal.length} 条，字段 ${HOST_FATAL_FIELD}）：${String(hostFatal[0]).slice(0, 200)}`);
+  }
   for (const name of HOST_SIDE_CHECKS) {
     if (failedNames.has(name)) reasons.push(`[${channelName}] 宿主侧检查失败：${name}`);
   }
@@ -147,6 +158,9 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
   if (drift?.changed && drift.items?.length > 0) {
     const fields = new Set(drift.items.map((item) => item.field));
     const related =
+      // P2-6：`guard.reserved_rejected` **不入表**（已由 2b 硬证据优先拦下）；`reservedName` 漂移
+      // 只对应中台自检 `guard.reserved_name`——上游取消保留名 + 插件自己声明保留名时，
+      // 判漂移等于把插件违规甩给上游。
       (fields.has('reservedName') && failedNames.has('guard.reserved_name'))
       || (fields.has('schemaSubset') && failedNames.has('compat.schema_flatten'))
       || (fields.has('configProjection') && failedNames.has('detect.flavor_known'))

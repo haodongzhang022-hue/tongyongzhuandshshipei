@@ -12,23 +12,27 @@
  * ## 错误分级（归因的前提，见评审 🔴-A / 🔴-B）
  * 探针的错误分两侧，措辞**必须可区分**，否则归因会被带跑：
  * - **宿主/环境侧**（装不上、宿主包 import 失败、ToolRuntime 未就绪、探针自身契约采集炸）
- *   → 写成 `fatal(host): ...`，归因判 `UPSTREAM_DRIFT`；
+ *   → `pushHostFatal()`：结构化落 `hostFatal[]`（**归因判据只读它**）+ 人读日志 `fatal(host): ...`；
  * - **插件侧**（import 失败、未导出 `apply`、`apply` 抛错、`definitions` 抛错、
  *   工具清单不符、dispatch 失败、卸载残留、声明保留名）
  *   → 一律落成 **check 失败**（`plugin.*` / `registry.*` / `dispatch.*` / `lifecycle.*` /
  *   `guard.reserved_rejected`），归因判 `PLUGIN_REGRESSION`。
- * 历史缺陷：插件侧错误曾被统一写成 `fatal: ...`，而 `runner` 用裸 `fatal:` 判上游漂移
+ * 历史缺陷（🔴-B）：插件侧错误曾被统一写成 `fatal: ...`，而 `runner` 用裸 `fatal:` 判上游漂移
  * → 插件写坏了却被告知「上游变了，不是你的问题」。
+ * 历史缺陷（🔴-C）：改用 `fatal(host)` 前缀后判据仍在**扫自由文本**——插件文件路径/错误文本里
+ * 恰好含该字面量即再次翻案。故判据改为只读 `hostFatal[]` 结构化字段，`errors` 退化为纯日志。
  *
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
 import { pathToFileURL } from 'node:url';
-import { collectContract, PLUGIN_SIDE_CHECKS } from './contract.mjs';
+import { collectContract, PLUGIN_SIDE_CHECKS, pushHostFatal } from './contract.mjs';
 
 const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
 
-const out = { checks: [], errors: [], profile: null, contract: {}, probes: [], ok: false };
+// hostFatal：**结构化**的宿主/环境侧致命信号（归因判据唯一依据，见 🔴-C）。
+// errors：人类可读日志（可含插件侧 stack/路径）——**不参与判据**。
+const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}, probes: [], ok: false };
 const check = (name, ok, detail) => {
   out.checks.push({ name, status: ok ? 'pass' : 'fail', detail: detail === undefined ? '' : String(detail).slice(0, 600) });
   if (!ok) out.errors.push(`${name}: ${detail ?? ''}`);
@@ -50,6 +54,27 @@ const skipAll = (names, reason) => {
   for (const name of names) if (!recorded.has(name)) skip(name, reason);
 };
 const brief = (error, limit = 600) => String(error?.stack ?? error).split('\n').slice(0, 3).join(' | ').slice(0, limit);
+/** definitions 不可用时无法验证的检查项（第 9/10/11 段共用，避免两处清单各自漂移）。 */
+const SKIP_AFTER_DEFINITIONS = ['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected'];
+/**
+ * 装配一个隔离宿主（新 Context + SystemPrompt + ToolRuntime），返回其 `ctx.tools`。
+ *
+ * 🟢：探针共 3 处需要「另起一个干净宿主」（生命周期路径 / 保留名冲突路径），
+ * 样板曾逐处复制（含 `sleep(200)` 等宿主就绪等待）；抽成一个函数后只有一处可写错。
+ *
+ * @param {Function} Context cordis Context 构造器
+ * @param {Function} SystemPrompt 系统提示插件
+ * @param {Function} ToolRuntime 工具运行时插件
+ * @returns {Promise<{ctx: object, tools: object}>} 新宿主与其 `ctx.tools`
+ */
+async function mountTools(Context, SystemPrompt, ToolRuntime) {
+  const ctx = new Context();
+  ctx.plugin(SystemPrompt, {});
+  ctx.plugin(ToolRuntime, {});
+  // 宿主插件是异步装配的，等一拍再取 ctx.tools（实测 200ms 足够；取不到即 check 失败，不静默）
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  return { ctx, tools: ctx.get('tools') };
+}
 
 async function run() {
   let ctx;
@@ -60,7 +85,7 @@ async function run() {
   let ToolRuntime;
   let SystemPrompt;
 
-  // ---- 1. 宿主装配：此段任何失败都是**宿主/环境侧** → fatal(host) ----
+  // ---- 1. 宿主装配：此段任何失败都是**宿主/环境侧** → hostFatal[]（结构化）+ fatal(host) 日志 ----
   try {
     ({ Context } = await import('@deepseek-ai/cordis'));
     ({ default: ToolRuntime } = await import('@deepseek-ai/dsh-tools'));
@@ -73,7 +98,7 @@ async function run() {
     await new Promise((resolve) => setTimeout(resolve, 200));
     tools = ctx.get('tools');
   } catch (error) {
-    out.errors.push(`fatal(host): ${brief(error, 1200)}`);
+    pushHostFatal(out, brief(error, 1200));
     return;
   }
 
@@ -103,7 +128,7 @@ async function run() {
         : `契约探测残留 ${collected.residue.join(',')}（宿主未返回可用 disposer → 上游 register 语义变了；残留会污染插件工具清单）`,
     );
   } catch (error) {
-    out.errors.push(`fatal(host): 契约指纹采集失败：${brief(error, 1000)}`);
+    pushHostFatal(out, `契约指纹采集失败：${brief(error, 1000)}`);
     return;
   }
 
@@ -198,7 +223,7 @@ async function run() {
     definitions = typeof plugin.definitions === 'function' ? plugin.definitions({ profile: profile.toJSON() }) : plugin.definitions;
   } catch (error) {
     check('plugin.definitions_ok', false, `插件 definitions() 抛错（插件侧错误）：${brief(error)}`);
-    skipAll(['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected'], 'definitions 不可用');
+    skipAll(SKIP_AFTER_DEFINITIONS, 'definitions 不可用');
     return;
   }
   const definitionsUsable = Array.isArray(definitions) && definitions.length > 0;
@@ -208,17 +233,13 @@ async function run() {
     definitionsUsable ? `插件导出 ${definitions.length} 个工具定义` : `插件未导出可用的 definitions 数组（typeof=${typeof definitions}）`,
   );
   if (!definitionsUsable) {
-    skipAll(['lifecycle.disposer_count', 'lifecycle.registered', 'lifecycle.dispose', 'guard.reserved_rejected'], '插件无可注册定义');
+    skipAll(SKIP_AFTER_DEFINITIONS, '插件无可注册定义');
     return;
   }
 
   // ---- 10. 生命周期：disposer 语义（独立 Context，宿主拒绝同层重名注册） ----
   try {
-    const ctx2 = new Context();
-    ctx2.plugin(SystemPrompt, {});
-    ctx2.plugin(ToolRuntime, {});
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const tools2 = ctx2.get('tools');
+    const { ctx: ctx2, tools: tools2 } = await mountTools(Context, SystemPrompt, ToolRuntime);
     const lifecycle = hub.registerTools({ tools: tools2, effect: (fn, label) => ctx2.effect(fn, label) }, definitions, { profile });
     // 被拒绝的保留名不产生 disposer；按「可注册定义数」计数（避免把冲突误算成漏注册）
     const expectedDisposers = definitions.length - lifecycle.reservedRejected.length;
@@ -241,11 +262,7 @@ async function run() {
   } else {
     let reported = false;
     try {
-      const ctx3 = new Context();
-      ctx3.plugin(SystemPrompt, {});
-      ctx3.plugin(ToolRuntime, {});
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      const tools3 = ctx3.get('tools');
+      const { tools: tools3 } = await mountTools(Context, SystemPrompt, ToolRuntime);
       const guardResult = hub.registerTools({ tools: tools3 }, definitions, { profile });
       reported = guardResult.reservedRejected.length === reservedInDefs.length
         && guardResult.issues.some((issue) => issue.includes('reserved_name_conflict'));
@@ -266,7 +283,7 @@ try {
   await run();
 } catch (error) {
   // 兜底：探针自身未预期的异常。**不猜归因**：按宿主侧记录（插件侧错误在 run() 内已落成 check）。
-  out.errors.push(`fatal(host): 探针未预期异常：${brief(error, 1200)}`);
+  pushHostFatal(out, `探针未预期异常：${brief(error, 1200)}`);
 }
 
 out.ok = out.errors.length === 0;

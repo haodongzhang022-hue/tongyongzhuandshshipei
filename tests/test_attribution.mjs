@@ -7,11 +7,14 @@
  *
  * 覆盖：
  * 1. `collectContract()`：接受型宿主（上游取消保留名）采集后**必须立即卸载**，无残留；
- * 2. `attributeFailure()` / `attributionDetail()`：宿主侧 `fatal(host)` 与插件侧 check 互不串味；
+ * 2. `attributeFailure()` / `attributionDetail()`：宿主侧**结构化** `hostFatal[]` 与插件侧 check 互不串味；
  * 3. 🔴-B 回归：错误串里含 `npm` 路径（探针命令行回显）**不得**把插件 bug 判成上游漂移；
  * 4. 旧版 `fatal:` 措辞（插件侧）**不得**再判漂移；
- * 5. CLI 参数契约：带值参数缺值显式报错（不静默改语义）、`resolveChannels` 默认值可指定；
- * 6. 缓存维护：`pruneHostCache()` 有真实调用点（`keepFingerprintsFor` + `cache` 子命令）。
+ * 5. **🔴-C 回归**：错误串（自由文本）里含 `fatal(host)` 字面量——插件 stack / 路径 / 工作目录——
+ *    **不得**翻案；真宿主侧致命信号走 `hostFatal[]` 仍须判漂移；
+ * 6. CLI 参数契约：带值参数缺值显式报错（不静默改语义）、`resolveChannels` 默认值可指定；
+ * 7. 缓存维护：`pruneHostCache()` 有真实调用点（`keepFingerprintsFor` + `cache` 子命令）；
+ * 8. 装配器 `runHostProbe()`：宿主/环境侧失败落**结构化** `hostFatal[]`（离线缺缓存，无网可跑）。
  *
  * 退出码：0 = 全绿；1 = 有失败。
  */
@@ -23,7 +26,7 @@ import { readFileSync as readText } from 'node:fs';
 import { CONTRACT_SIDE_CHECKS, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS, collectContract } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
-import { channelFingerprint, loadChannels, pruneHostCache } from '../src/harness/host.mjs';
+import { channelFingerprint, loadChannels, pruneHostCache, runHostProbe } from '../src/harness/host.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -41,7 +44,9 @@ const eq = (name, expected, actual) => {
 
 const channel = { label: '开发版通道', line: '0.1.6' };
 const failCheck = (name) => ({ name, status: 'fail', detail: 'x' });
-const probeOf = (errors, checks = []) => ({ errors, checks, profile: { flavor: 'modern' }, contract: {} });
+const probeOf = (errors, checks = [], extra = {}) => ({ errors, checks, hostFatal: [], profile: { flavor: 'modern' }, contract: {}, ...extra });
+/** 宿主/环境侧信号：**结构化字段 + 人读日志**同时给（判据只许读前者）。 */
+const probeHostFatal = (detail, checks = []) => probeOf([`fatal(host): ${detail}`], checks, { hostFatal: [detail] });
 
 console.log('▶ 归因与契约采集离线回归（tests/test_attribution.mjs）');
 
@@ -78,15 +83,17 @@ console.log('  [1] collectContract 采集后立即卸载（🔴-A 根因）');
 }
 
 // ---- 2. 归因：宿主侧 / 插件侧互不串味 ----
-console.log('  [2] 归因判据（宿主侧 fatal(host) vs 插件侧 check）');
-eq('宿主安装失败（npm ETARGET）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
-  attributeFailure(probeOf(['fatal(host): 宿主依赖安装失败（npm）：npm ERR! code ETARGET']), channel, 'dev'));
-eq('离线缺缓存 → UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
-  attributeFailure(probeOf(['fatal(host): 离线模式下缺少宿主依赖缓存（先联网跑一次或去掉 --offline）']), channel, 'dev'));
+console.log('  [2] 归因判据（宿主侧结构化 hostFatal[] vs 插件侧 check）');
+eq('宿主安装失败（npm ETARGET，hostFatal[]）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
+  attributeFailure(probeHostFatal('宿主依赖安装失败（npm）：npm ERR! code ETARGET'), channel, 'dev'));
+eq('离线缺缓存（hostFatal[]）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
+  attributeFailure(probeHostFatal('离线模式下缺少宿主依赖缓存（先联网跑一次或去掉 --offline）'), channel, 'dev'));
 eq('宿主未就绪 → UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
   attributeFailure({ errors: ['host.tools_ready: ctx.tools 未就绪'], checks: [failCheck('host.tools_ready')], profile: { flavor: 'unknown' } }, channel, 'dev'));
 eq('契约探测未卸载（宿主 register 语义变了）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
   attributeFailure(probeOf(['contract.probe_disposed: 契约探测残留 run_code'], [failCheck('contract.probe_disposed')]), channel, 'dev'));
+eq('宿主侧致命错误**只认结构化字段**：仅有日志文本、无 hostFatal[] → 不判漂移', 'PLUGIN_REGRESSION',
+  attributeFailure(probeOf(['fatal(host): 只是日志里出现过这个词'], [failCheck('registry.exact')]), channel, 'dev'));
 eq('工具清单不符 → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
   attributeFailure(probeOf(['registry.exact: 期望 a / 实得 b'], [failCheck('registry.exact')]), channel, 'dev'));
 eq('dispatch 失败 → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
@@ -107,8 +114,28 @@ eq('🔴-B：插件 apply 抛错 → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
   attributeFailure(probeOf(['plugin.apply_ok: 插件 apply(ctx) 抛错'], [failCheck('plugin.apply_ok')]), channel, 'dev'));
 eq('🔴-B：插件未导出 apply → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
   attributeFailure(probeOf(['plugin.loaded: 插件未导出 apply(ctx)'], [failCheck('plugin.loaded')]), channel, 'dev'));
-eq('🔴-B：宿主侧 fatal(host) 前缀仍判漂移（不能因收窄判据丢掉真漂移）', 'UPSTREAM_DRIFT',
-  attributeFailure(probeOf(['fatal(host): 宿主装配失败：Cannot find package @deepseek-ai/dsh-tools']), channel, 'dev'));
+eq('🔴-B：真宿主侧信号（hostFatal[]）仍判漂移（收窄判据不得丢掉真漂移）', 'UPSTREAM_DRIFT',
+  attributeFailure(probeHostFatal('宿主装配失败：Cannot find package @deepseek-ai/dsh-tools'), channel, 'dev'));
+
+// ---- 3.1 🔴-C：判据不得扫自由文本（fatal(host) 字面量出现在插件侧文本/路径） ----
+console.log('  [3.1] 🔴-C 回归（自由文本含 fatal(host) 不得翻案）');
+eq('🔴-C：插件 stack 路径含 /tmp/fatal(host)-dir/ → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
+  attributeFailure(probeOf(
+    ['plugin.apply_ok: 插件 apply(ctx) 抛错（插件侧初始化失败）：Error: 缺少必需配置 | at Module.apply (file:///tmp/fatal(host)-dir/apply-throws.mjs:3:33)'],
+    [failCheck('plugin.apply_ok')],
+  ), channel, 'dev'));
+eq('🔴-C：插件错误文本含 fatal(host) 字面量 → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
+  attributeFailure(probeOf(
+    ['plugin.loaded: 插件 import 失败（语法/依赖错误）：SyntaxError | 插件自述：fatal(host) is my favourite string'],
+    [failCheck('plugin.loaded')],
+  ), channel, 'dev'));
+eq('🔴-C：CI 工作目录含 fatal(host)（hub 路径）→ PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
+  attributeFailure(probeOf(
+    ['registry.exact: 期望 a / 实得 b | 探针工作目录 /home/runner/fatal(host)-hub'],
+    [failCheck('registry.exact')],
+  ), channel, 'dev'));
+eq('🔴-C：宿主侧日志行同时存在时，仍以结构化字段为准（有 hostFatal[] → 漂移）', 'UPSTREAM_DRIFT',
+  attributeFailure(probeHostFatal('宿主依赖安装失败（npm）', [failCheck('plugin.apply_ok')]), channel, 'dev'));
 
 // ---- 4. 契约漂移相关性 ----
 console.log('  [4] 契约漂移与失败点相关性');
@@ -124,6 +151,13 @@ eq('契约 check 失败且无可用基线 → 保守判 UPSTREAM_DRIFT', 'UPSTRE
 eq('契约 check 失败但基线一致 → PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
   attributeFailure(probeOf(['guard.reserved_name: 插件声明了保留名'], [failCheck('guard.reserved_name')]), channel, 'dev',
     { contractDrift: { changed: false, newBaseline: false, items: [] } }));
+// P2-6：上游取消保留名 + 插件自己声明保留名 → **不得**甩给上游（guard.reserved_rejected 不入相关性表）
+eq('P2-6：reservedName 漂移 + 插件声明保留名 → PLUGIN_REGRESSION（不甩锅上游）', 'PLUGIN_REGRESSION',
+  attributeFailure(probeOf(['guard.reserved_rejected: 插件声明了 DSH 保留名 run_code'], [failCheck('guard.reserved_rejected')]), channel, 'dev',
+    { contractDrift: { changed: true, items: [{ field: 'reservedName' }] } }));
+eq('P2-6：reservedName 漂移 + 中台护栏自身失效（guard.reserved_name）→ 仍判 UPSTREAM_DRIFT', 'UPSTREAM_DRIFT',
+  attributeFailure(probeOf(['guard.reserved_name: 插件侧未拒绝 run_code'], [failCheck('guard.reserved_name')]), channel, 'dev',
+    { contractDrift: { changed: true, items: [{ field: 'reservedName' }] } }));
 {
   const detail = attributionDetail(probeOf(['registry.exact: x'], [failCheck('registry.exact')]), channel, 'dev');
   eq('归因带可审计理由链', true, detail.reasons.length > 0 && detail.reasons[0].includes('registry.exact'));
@@ -199,10 +233,43 @@ console.log('  [7] 判据表完备性');
   eq('宿主侧与插件侧 check 名不重叠', 0,
     HOST_SIDE_CHECKS.filter((name) => PLUGIN_SIDE_CHECKS.includes(name)).length);
   const runnerSource = readText(path.join(ROOT, 'src/verify/runner.mjs'), 'utf8');
+  const runnerCode = runnerSource.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((line) => !line.trim().startsWith('//') && !line.trim().startsWith('*')).join('\n');
   eq('归因不再使用裸 npm / 裸 fatal: 判据', 'no-bare-keywords',
-    /\/npm\||\|npm\||fatal:/.test(runnerSource.replace(/\/\*[\s\S]*?\*\//g, '')) ? 'bare-keywords-present' : 'no-bare-keywords');
+    /\/npm\||\|npm\||fatal:/.test(runnerCode) ? 'bare-keywords-present' : 'no-bare-keywords');
+  // 🔴-C 守卫：判据代码里**不得**出现对 errors 自由文本的读取（含 HOST_FATAL_PREFIX 文本扫描）
+  eq('🔴-C：归因代码不读 errors 自由文本', 'no-free-text-criteria',
+    /errors\.(includes|match|test)|errors\.join|HOST_FATAL_PREFIX\)/.test(runnerCode) ? 'free-text-criteria-present' : 'no-free-text-criteria');
+  eq('🔴-C：判据只读结构化字段 hostFatal', 'reads-structured-field',
+    runnerCode.includes('HOST_FATAL_FIELD') ? 'reads-structured-field' : 'field-not-read');
   eq('归因返回值不再声明 ENV_ERROR', 'no-env-error',
     /ENV_ERROR/.test(runnerSource.split('@returns')[1]?.slice(0, 200) ?? '') ? 'env-error-declared' : 'no-env-error');
+}
+
+// ---- 8. 装配器：宿主/环境侧失败必须落结构化字段（离线缺缓存路径，无网可跑） ----
+console.log('  [8] 装配器结构化宿主信号（runHostProbe 离线缺缓存）');
+{
+  const registry = loadChannels(ROOT);
+  const emptyCache = mkdtempSync(path.join(tmpdir(), 'dsh-empty-cache-'));
+  try {
+    const probe = runHostProbe({
+      channelName: 'stable',
+      channel: registry.channels.stable,
+      pluginPath: path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'),
+      expectedTools: [],
+      hubRoot: ROOT,
+      cacheDir: emptyCache,
+      offline: true,
+    });
+    eq('离线缺缓存：结构化 hostFatal[] 非空（判据依据）', true, Array.isArray(probe.hostFatal) && probe.hostFatal.length > 0);
+    eq('离线缺缓存：errors[] 仍带人读日志前缀 fatal(host)', true, (probe.errors ?? []).some((e) => e.startsWith('fatal(host):')));
+    eq('离线缺缓存：归因 = UPSTREAM_DRIFT（只读结构化字段即可判定）', 'UPSTREAM_DRIFT',
+      attributeFailure(probe, registry.channels.stable, 'stable'));
+    // 反向证明：把结构化字段清空（只留日志文本）→ 不再判漂移，说明判据**没有**偷偷读 errors
+    eq('离线缺缓存：清空 hostFatal 后判据不再命中（证明未读 errors 文本）', 'UNKNOWN',
+      attributeFailure({ ...probe, hostFatal: [] }, registry.channels.stable, 'stable'));
+  } finally {
+    rmSync(emptyCache, { recursive: true, force: true });
+  }
 }
 
 console.log();

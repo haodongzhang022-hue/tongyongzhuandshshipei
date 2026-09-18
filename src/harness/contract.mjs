@@ -64,8 +64,41 @@ export const CONTRACT_PROBES = [
  * 放在被拷进临时目录的 `contract.mjs` 里，两侧 import 同一份。
  */
 
-/** 宿主/环境侧致命前缀（由探针与装配器显式标注；插件侧错误**永远不会**带此前缀）。 */
+/**
+ * 宿主/环境侧致命信号的**日志前缀**（探针与装配器拼人类可读 `errors[]` 时使用）。
+ *
+ * ⚠️ 纪律（评审 🔴-C）：此前缀**只许用于人读日志，绝不可作为归因判据的文本扫描目标**。
+ * 判据只读结构化字段 {@link HOST_FATAL_FIELD}——否则插件侧错误文本或文件路径里恰好出现
+ * `fatal(host)` 字面量，插件 bug 又会被翻案成「上游漂移」（与原 🔴-B 同族）。
+ */
 export const HOST_FATAL_PREFIX = 'fatal(host)';
+
+/**
+ * 宿主/环境侧致命信号的**结构化字段名**（探针 → 装配器 → 执行器 三段同名传递）。
+ *
+ * 归因判据 1 只读这个字段：`(probe.hostFatal ?? []).length > 0` → `UPSTREAM_DRIFT`。
+ * 插件侧错误**永远**不进该字段（插件侧一律落 check）。
+ */
+export const HOST_FATAL_FIELD = 'hostFatal';
+
+/**
+ * 记录一条宿主/环境侧致命信号：**同时**写结构化字段（判据唯一依据）与人读日志行。
+ *
+ * 存在的意义：把「谁写信号、谁读信号」收敛成一个函数，避免有人再往
+ * `errors` 里塞关键词、再由判据去扫文本（那正是 🔴-B / 🔴-C 的失效机制）。
+ *
+ * @param {{errors: string[], hostFatal?: string[]}} target 探针 `out` 或装配器 `result`
+ * @param {string} detail 宿主/环境侧失败原因（**不得**拼入插件侧 stack）
+ * @returns {string} 写入 `errors` 的日志行
+ */
+export function pushHostFatal(target, detail) {
+  const text = String(detail);
+  if (!Array.isArray(target.hostFatal)) target.hostFatal = [];
+  target.hostFatal.push(text);
+  const line = `${HOST_FATAL_PREFIX}: ${text}`;
+  target.errors.push(line);
+  return line;
+}
 
 /** 宿主/环境侧检查项（失败即判上游漂移：宿主未就绪 / 版本线不可判定 / 契约探测未卸载）。 */
 export const HOST_SIDE_CHECKS = ['host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed'];
