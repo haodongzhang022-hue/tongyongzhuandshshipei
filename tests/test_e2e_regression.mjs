@@ -23,6 +23,13 @@
  *    探针读插件侧数据（`tools.schemas()` / `definitions.map()`）会抛错——该异常必须落**插件侧 check**，
  *    归因 `PLUGIN_REGRESSION`/RED，且 `hostFatal[]` **必须为空**（历史缺陷：落进 `hostFatal[]` →
  *    误判 `UPSTREAM_DRIFT`/AMBER，把插件 bug 甩给上游并盖掉插件侧已失败的 check）。
+ * 10. **🔴-D 异步活口 + 进程 exit 出口（本 PR 收口）**：插件在 `apply()` **返回之后**抛异步错误
+ *    （`queueMicrotask` / 未处理 Promise 拒绝）或直接 `process.exit(0)` 时，探针必须**照常输出**
+ *    结构化结果并判 `PLUGIN_REGRESSION`/RED、`hostFatal[]` 为空；`probeCompleted=false`（防假绿）。
+ * 11. **第 4 个出口：挂住超时（本 PR 实测补充）**：插件 `apply()` 永不 resolve 且持有活动句柄时，
+ *    探针自持看门狗必须在**宿主 timeout 之前**写出结果（SIGTERM 不触发 `exit` 钩子、且 timeout
+ *    路径丢弃被杀后 stdout —— 两条实测事实）→ `PLUGIN_REGRESSION`/RED、`hostFatal[]` 为空、
+ *    `escapedBy=timeout`、`probeCompleted=false`。用**短 timeout** 直接调 `runHostProbe()`（不吃满 CI 额度）。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
@@ -32,9 +39,9 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, write
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { channelFingerprint, loadChannels } from '../src/harness/host.mjs';
+import { channelFingerprint, loadChannels, runHostProbe } from '../src/harness/host.mjs';
 // P2-8：插件侧 check 名单**从唯一事实源 import**（此前硬编码 12 项，表一改测试就不设防）
-import { PLUGIN_SIDE_CHECKS } from '../src/harness/contract.mjs';
+import { PLUGIN_SIDE_CHECKS, PROCESS_ESCAPE } from '../src/harness/contract.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -258,6 +265,72 @@ try {
     eq(`${label}（插件侧 stack 保留在 errors 日志中）`, true, (report.errors ?? []).some((e) => e.includes(fixture)));
     // 相位随报告透出（排障看得见异常归属依据）
     eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+  }
+
+  // ---- 11.5 异步活口 + 进程 exit 出口（本 PR 收口：探针进程边界穷举完毕） ----
+  console.log('  [10] 异步活口 / process.exit 出口 → 必须判插件且 hostFatal 为空');
+  for (const [label, fixture, escapedBy, failedCheck] of [
+    ['插件 apply 返回后微任务抛错 → PLUGIN_REGRESSION', 'async-throw-plugin.mjs', PROCESS_ESCAPE.UNCAUGHT_EXCEPTION, 'plugin.unexpected_exception'],
+    ['插件 apply 返回后未处理拒绝 → PLUGIN_REGRESSION', 'async-reject-plugin.mjs', PROCESS_ESCAPE.UNHANDLED_REJECTION, 'plugin.unexpected_exception'],
+    ['插件 apply 里 process.exit(0) → PLUGIN_REGRESSION', 'exit-in-apply-plugin.mjs', PROCESS_ESCAPE.PROCESS_EXIT, 'plugin.early_exit'],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    // 核心不变量：插件侧逃逸**永远**不进判据字段 hostFatal[]
+    eq(`${label}（hostFatal 为空——插件侧逃逸不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    // 探针**照常输出**结构化结果（不再「悄悄死掉」被装配器记成宿主侧致命）
+    eq(`${label}（探针完成位=false：逃逸路径不可能判通过）`, false, report.probeCompleted);
+    eq(`${label}（逃逸实况进报告）`, escapedBy, report.probeEscapedBy);
+    eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+    // 失败项必须是插件侧 check（不得是宿主侧）
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（失败项含 ${failedCheck}）`, true, failed.includes(failedCheck));
+    const hostSide = new Set(['host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed']);
+    eq(`${label}（失败项无宿主侧 check）`, 0, failed.filter((n) => hostSide.has(n)).length);
+    // checks 不丢：逃逸时已跑完的检查仍在报告里（证明「照常输出」而非半成品）
+    eq(`${label}（已跑完的检查仍在报告里，checks 不丢）`, true, (report.checks ?? []).length >= 5);
+    // hostFatal 里不得出现插件侧 stack（夹具路径 / at 帧）
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+  }
+  // 反向护栏：逃逸收口不得把健康插件打穿（防过度修正）
+  {
+    const healthy = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('反向护栏：收口后健康插件仍 GREEN 17/17', 'PASS', healthy.attribution);
+    eq('反向护栏：健康插件 probeCompleted=true（正常路径完成位置真）', true, healthy.probeCompleted);
+    eq('反向护栏：健康插件 escapedBy 为空', null, healthy.probeEscapedBy);
+    eq('反向护栏：健康插件 checks=17 项全跑完', 17, (healthy.checks ?? []).length);
+  }
+
+  // ---- 11.5 第 4 个出口：插件把探针挂住 → 看门狗收口（本 PR 实测补充，评审 §二 ①②③ 之外） ----
+  console.log('  [11] 挂住超时出口 → 探针看门狗收口，必须判插件且 hostFatal 为空');
+  {
+    // 用短 timeout（6s）直接调 runHostProbe：看门狗阈值 = 80% ≈ 4.8s，早于宿主 kill。
+    const hang = runHostProbe({
+      channelName: CHANNEL,
+      channel,
+      pluginPath: path.join(ROOT, 'tests/fixtures/hang-in-apply-plugin.mjs'),
+      expectedTools: ['demo_echo'],
+      hubRoot: ROOT,
+      timeoutMs: 6000,
+    });
+    eq('挂住超时 → 归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
+      (await import('../src/verify/runner.mjs')).attributeFailure(hang, channel, CHANNEL));
+    eq('挂住超时 → hostFatal 为空（插件挂住不得甩给上游）', 0, (hang.hostFatal ?? []).length);
+    eq('挂住超时 → 探针完成位=false（没跑完不得判通过）', false, hang.runCompleted);
+    eq('挂住超时 → 逃逸实况=timeout', PROCESS_ESCAPE.TIMEOUT, hang.escapedBy);
+    eq('挂住超时 → 看门狗阈值进报告（= 宿主 timeout 的 80%）', 4800, hang.escapeCode);
+    eq('挂住超时 → probePhase=plugin-integration', 'plugin-integration', hang.phase);
+    eq('挂住超时 → 失败项为 plugin.early_exit', true,
+      (hang.checks ?? []).some((c) => c.name === 'plugin.early_exit' && c.status === 'fail'));
+    eq('挂住超时 → 失败项无宿主侧 check', 0,
+      (hang.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name)
+        .filter((n) => ['host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed'].includes(n)).length);
+    eq('挂住超时 → 已跑完的检查仍在报告里（看门狗经同一 emit 单点写出，checks 不丢）', true, (hang.checks ?? []).length >= 5);
+    // 反向护栏：同一次调用里健康插件不受看门狗影响（不误伤）
+    const healthy = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('反向护栏：看门狗不误伤健康插件（仍 PASS）', 'PASS', healthy.attribution);
   }
 
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----

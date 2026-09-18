@@ -14,7 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { PROBE_PHASE, pushHostFatal } from './contract.mjs';
+import { PROBE_COMPLETION_FIELD, PROBE_ESCAPE_CODE_FIELD, PROBE_ESCAPE_FIELD, PROBE_MARKER, PROBE_PHASE, pushHostFatal } from './contract.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,7 +93,7 @@ export function pruneHostCache(options = {}) {
  * @param {string} [options.cacheDir] 宿主依赖缓存根（默认 $TMPDIR/dsh-adapt-host-cache）
  * @param {boolean} [options.offline] 仅用缓存，缺失即失败
  * @param {number} [options.timeoutMs] 安装 / 探针超时
- * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], hostFatal:string[], contract:object, probes:object[], phase:string|null, probeExit:object|null, install:string, cacheHit:boolean, durationMs:number}}
+ * @returns {{channel:string, ok:boolean, profile:object|null, checks:object[], errors:string[], hostFatal:string[], contract:object, probes:object[], phase:string|null, runCompleted:boolean, escapedBy:string|null, escapeCode:number|null, probeExit:object|null, install:string, cacheHit:boolean, durationMs:number}}
  *
  * 缓存策略：命中时以**软链**挂载缓存 `node_modules`（不再全量复制）；
  * 历史残留用 {@link pruneHostCache} 清理（保留当前钉版指纹）。
@@ -129,6 +129,12 @@ export function runHostProbe(options) {
     // 装配器自身的失败（离线缺缓存 / npm 失败 / 装配异常）**都是宿主装配相位**——
     // 探针跑通后由探针回报的相位覆盖（那时才可能进入插件集成相位）。
     phase: PROBE_PHASE.HOST_ASSEMBLY,
+    // 探针完成位（透传自探针）：false = 探针没跑完（异步逃逸 / 被 process.exit 打断）。
+    // 装配器**不据此改判**（ok 由探针的 ok 字段决定），只把它透出给报告与断言（排障看得见）。
+    runCompleted: false,
+    // 进程边界逃逸实况（uncaught-exception / unhandled-rejection / process-exit）
+    escapedBy: null,
+    escapeCode: null,
     install: 'skipped',
     cacheHit: false,
     durationMs: 0,
@@ -180,9 +186,13 @@ export function runHostProbe(options) {
     cpSync(path.join(hubRoot, 'src', 'harness', 'probe-template.mjs'), path.join(workDir, 'probe.mjs'));
     cpSync(path.join(hubRoot, 'src', 'harness', 'contract.mjs'), path.join(workDir, 'contract.mjs'));
 
+    // 探针看门狗阈值 = 宿主 timeout 的 80%（**必须早于**宿主 kill：timeout 路径下被杀子进程的
+    // stdout 会被丢弃，实测）。插件把探针挂住时，看门狗在探针仍活着时经 emit 单点写出结果 →
+    // 归因落插件侧（不再「探针无归属地死掉 → 判宿主侧致命」）。
+    const watchdogMs = Math.max(1000, Math.floor(timeoutMs * 0.8));
     let stdout = '';
     try {
-      stdout = execFileSync('node', ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools)], {
+      stdout = execFileSync('node', ['probe.mjs', hubRoot, pluginPath, JSON.stringify(expectedTools), String(watchdogMs)], {
         cwd: workDir,
         encoding: 'utf8',
         timeout: timeoutMs,
@@ -195,14 +205,17 @@ export function runHostProbe(options) {
       result.errors.push(`探针非零退出（status=${error.status ?? 'null'}${error.signal ? `, signal=${error.signal}` : ''}）`);
     }
 
-    const marker = stdout.split('\n').find((line) => line.startsWith('__DSH_PROBE__'));
+    const marker = stdout.split('\n').find((line) => line.startsWith(PROBE_MARKER));
     if (!marker) {
+      // 探针未输出结构化结果 = 探针进程在**任何写出之前**就没了（被 SIGKILL / OOM / 宿主侧
+      // 装配阶段崩溃）。注意：插件侧异步异常与 process.exit **不再**落进这里——
+      // 它们由探针的进程边界守卫照常输出结构化结果（见 contract.mjs 的 createProbeBoundary）。
       pushHostFatal(result, `探针未输出结构化结果（探针自身崩溃 / 被宿主中断）：${stdout.slice(-600)}`);
       return result;
     }
     let payload;
     try {
-      payload = JSON.parse(marker.slice('__DSH_PROBE__'.length));
+      payload = JSON.parse(marker.slice(PROBE_MARKER.length));
     } catch (error) {
       // 探针输出不可解析 = 探针自身（本仓文件）出问题 → 宿主侧，不甩锅插件
       pushHostFatal(result, `探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
@@ -215,6 +228,10 @@ export function runHostProbe(options) {
     // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，透传给报告供排障。
     // 探针未回报时保留装配器判定（host-assembly），不退化成 null（否则排障看不到归属依据）。
     result.phase = payload.phase ?? result.phase;
+    // 完成位与逃逸实况原样透传（探针是唯一写入端；装配器不改判、不重算）。
+    result.runCompleted = payload[PROBE_COMPLETION_FIELD] === true;
+    result.escapedBy = payload[PROBE_ESCAPE_FIELD] ?? null;
+    result.escapeCode = payload[PROBE_ESCAPE_CODE_FIELD] ?? null;
     // 🟢 同样归一：errors 是日志（不参与判据），但非数组也不该被 spread 成逐字符噪声。
     if (Array.isArray(payload.errors)) result.errors.push(...payload.errors);
     // 探针侧的结构化宿主致命信号**原样透传**（执行器判据只读这一处，不再扫 errors 文本）。

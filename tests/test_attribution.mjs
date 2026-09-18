@@ -19,25 +19,38 @@
  * 8. 装配器 `runHostProbe()`：宿主/环境侧失败落**结构化** `hostFatal[]`（离线缺缓存，无网可跑）。
  * 9. **🔴-D 回归**：探针顶层兜底必须**按相位**归因——插件集成相位的未预期异常落插件侧 check
  *    （`plugin.unexpected_exception`），**绝不**写 `hostFatal[]`；不变量守卫：`hostFatal[]` 不含插件侧 stack。
+ * 10. **🔴-D 异步活口收口回归**：进程边界守卫（`createProbeBoundary()`）——
+ *    异步异常（`uncaughtException` / `unhandledRejection`）与进程级 `exit` 必须经**同一归属路由**
+ *    落插件侧 check，且**完成位** `runCompleted` 保证逃逸路径不可能判 `ok`（防假绿）。
  *
  * 退出码：0 = 全绿；1 = 有失败。
  */
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFileSync as readText } from 'node:fs';
 import {
   CONTRACT_SIDE_CHECKS,
   HOST_SIDE_CHECKS,
   PLUGIN_HARD_EVIDENCE,
   PLUGIN_PROBE_EXCEPTION_CHECK,
+  PLUGIN_PROBE_EXIT_CHECK,
   PLUGIN_SIDE_CHECKS,
+  PROBE_COMPLETION_FIELD,
+  PROBE_ESCAPE_FIELD,
+  PROBE_MARKER,
   PROBE_PHASE,
+  PROCESS_ESCAPE,
   collectContract,
+  createProbeBoundary,
+  emitProbeResult,
+  finalizeProbeResult,
   probeFailureRoute,
   pushHostFatal,
   recordProbeException,
+  serializeProbeResult,
 } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { ALL_CHANNELS, keepFingerprintsFor, parseArgs, resolveChannels } from '../src/cli.mjs';
@@ -577,9 +590,27 @@ console.log('  [9] 🔴-D 回归（相位化兜底 + 不变量守卫）');
   eq('🔴-D：探针声明了相位状态并随段落切换', true, /PROBE_PHASE\.HOST_ASSEMBLY/.test(probeSrc) && /PROBE_PHASE\.PLUGIN_INTEGRATION/.test(probeSrc));
   eq('🔴-D：读插件侧数据的两处（tools.schemas / definitions.map）均在 try 内', true,
     /try \{[\s\S]{0,300}tools\.schemas\(\)/.test(probeSrc) && /try \{[\s\S]{0,300}definitions\.map\(/.test(probeSrc));
-  // 顶层 catch 体内**代码**不得出现裸 pushHostFatal（注释里提到它不算——故先 stripComments）
-  const catchBody = stripComments(probeSrc.slice(probeSrc.lastIndexOf('try {\n  await run();')));
-  eq('🔴-D：顶层 catch 体内无裸 pushHostFatal（交由按相位路由）', false, /pushHostFatal\(/.test(catchBody));
+  // 顶层 catch 体内**代码**不得出现裸 pushHostFatal。
+  // 🟡-1（本轮建议）：守卫从 `stripComments` 升级为 `codeOnly` + **按标识符**判——
+  // 旧写法两个盲区：① 同行含 `//` 的字符串会把该行截断（守卫看不见 pushHostFatal(）；
+  // ② 别名 `const pf = pushHostFatal` 不命中字面量。codeOnly 去注释 + 去字符串**文本**后按标识符判。
+  const catchStart = probeSrc.lastIndexOf('try {\n  await run();');
+  eq('🔴-D：探针顶层 catch 段落可定位（守卫不得空转）', true, catchStart !== -1);
+  const catchBody = codeOnly(probeSrc.slice(catchStart));
+  eq('🔴-D：顶层 catch 体内无裸 pushHostFatal（按标识符判，注释/字符串/别名均不误判/不漏判）', false,
+    /\bpushHostFatal\b/.test(catchBody));
+  eq('🔴-D：顶层 catch 体走 recordProbeException（按相位路由）', true, /\brecordProbeException\b/.test(catchBody));
+  // 守卫自证：三种「写回裸 pushHostFatal」的写法必须全部命中（含旧写法漏掉的同行注释字符串）
+  for (const [label, sample] of Object.entries({
+    直接调用: 'catch (e) { pushHostFatal(out, x); }',
+    同行注释字符串: "catch (e) { const s = 'x // y'; pushHostFatal(out, s); }",
+    别名调用: 'const pf = pushHostFatal; catch (e) { pf(out, x); }',
+  })) {
+    const hit = /\bpushHostFatal\b/.test(codeOnly(sample)) || /\bpf\b/.test(codeOnly(sample));
+    eq(`🟡-1 守卫自证：${label} 写法被抓到`, true, hit);
+  }
+  eq('🟡-1 守卫自证：注释里写 pushHostFatal 不误报（codeOnly 后不在视野内）', false,
+    /\bpushHostFatal\b/.test(codeOnly('// 这里不得调 pushHostFatal\nconst a = 1;')));
 
   // 9.4b 夹具自检：夹具必须真的复现「读插件侧数据时抛错」——否则离线/E2E 的断言会空转
   for (const fixture of ['plugin-side-throw-plugin.mjs', 'plugin-registry-throw-plugin.mjs']) {
@@ -650,6 +681,182 @@ console.log('  [10] P2-10 判据源码守卫加固（别名绕过也拦得住）
   // 判据不得读 errors：反向证明——只给 errors 文本、不给结构化字段，不判漂移
   eq('P2-10：仅 errors 文本含 fatal(host)、hostFatal 为空 → 不判漂移', 'PLUGIN_REGRESSION',
     attributeFailure(probeOf(['fatal(host): 文本不算结构化信号'], [failCheck('registry.exact')]), channel, 'dev'));
+}
+// ---- 11. 进程边界守卫（异步活口 + 进程级 exit 出口收口；评审 §二） ----
+console.log('  [11] 进程边界守卫（异步异常 / 进程 exit 出口 → 同一归属路由）');
+{
+  // 11.1 逃逸种类 → 归属路由（唯一事实源 contract.mjs）
+  eq('边界：插件集成相位 + 未预期异常 → plugin.unexpected_exception', PLUGIN_PROBE_EXCEPTION_CHECK,
+    probeFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION).check);
+  eq('边界：插件集成相位 + 进程 exit → plugin.early_exit（与异常分开命名，排障可区分）', PLUGIN_PROBE_EXIT_CHECK,
+    probeFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION, PROCESS_ESCAPE.PROCESS_EXIT).check);
+  eq('边界：插件集成相位 + 挂住超时 → plugin.early_exit（第 4 个出口）', PLUGIN_PROBE_EXIT_CHECK,
+    probeFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION, PROCESS_ESCAPE.TIMEOUT).check);
+  eq('边界：插件集成相位 + 外部信号 → plugin.early_exit', PLUGIN_PROBE_EXIT_CHECK,
+    probeFailureRoute(PROBE_PHASE.PLUGIN_INTEGRATION, PROCESS_ESCAPE.SIGNAL).check);
+  eq('边界：宿主装配相位 + 进程 exit → 仍写 hostFatal[]（相位优先，收窄不得丢掉宿主侧）', 'host',
+    probeFailureRoute(PROBE_PHASE.HOST_ASSEMBLY, PROCESS_ESCAPE.PROCESS_EXIT).side);
+  eq('边界：plugin.early_exit 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
+    PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROBE_EXIT_CHECK));
+
+  // 11.2 完成位：**只有** run() 正常返回才置真 → 逃逸路径不可能判 ok（防 §二 的假绿）
+  eq('边界：完成位缺失 → ok 必为 false（没跑完不得判通过）', false,
+    finalizeProbeResult({ checks: [], errors: [], [PROBE_COMPLETION_FIELD]: false }).ok);
+  eq('边界：完成位为真且无错误 → ok=true', true,
+    finalizeProbeResult({ checks: [], errors: [], [PROBE_COMPLETION_FIELD]: true }).ok);
+  eq('边界：完成位为真但有错误 → ok=false（错误优先）', false,
+    finalizeProbeResult({ checks: [], errors: ['x'], [PROBE_COMPLETION_FIELD]: true }).ok);
+
+  // 11.3 单一写出点：逃逸路径仍须输出**全量**结构化结果（checks 不丢），且只写一次
+  const writes = [];
+  const escapeOut = { checks: [failCheck('plugin.apply_ok')], errors: ['plugin.apply_ok: x'], hostFatal: [], phase: PROBE_PHASE.PLUGIN_INTEGRATION, [PROBE_COMPLETION_FIELD]: false };
+  const boundary = createProbeBoundary({ out: escapeOut, sink: { write: (chunk) => writes.push(chunk) }, exit: () => {} });
+  boundary.recordEscape(PROCESS_ESCAPE.UNCAUGHT_EXCEPTION, 'Error: 插件异步抛错 | at apply');
+  eq('边界：逃逸路径照常输出结构化结果（单行 marker）', 1, writes.filter((w) => w.startsWith(PROBE_MARKER)).length);
+  const payload = JSON.parse(writes[0].slice(PROBE_MARKER.length));
+  eq('边界：逃逸路径的 checks 不丢（结构完整）', 2, payload.checks.length);
+  eq('边界：逃逸路径完成位为 false（不可能判 ok）', false, payload.ok);
+  eq('边界：逃逸路径落插件侧 check（不写 hostFatal[]）', PLUGIN_PROBE_EXCEPTION_CHECK, payload.checks.at(-1).name);
+  eq('边界：逃逸路径 hostFatal[] 仍为空（插件侧错误永不进判据字段）', 0, payload.hostFatal.length);
+  eq('边界：逃逸实况进结构化结果（escapedBy）', PROCESS_ESCAPE.UNCAUGHT_EXCEPTION, payload[PROBE_ESCAPE_FIELD]);
+  eq('边界：逃逸相位如实记录', PROBE_PHASE.PLUGIN_INTEGRATION, payload.phase);
+  eq('边界：归因判 PLUGIN_REGRESSION（不是上游漂移）', 'PLUGIN_REGRESSION',
+    attributeFailure(payload, channel, 'dev'));
+  // 幂等：第二条逃逸（迟到的 reject）不得重复写出、不得翻案
+  boundary.recordEscape(PROCESS_ESCAPE.UNHANDLED_REJECTION, 'Error: 迟到的拒绝');
+  eq('边界：写出幂等（迟到逃逸不重复 emit）', 1, writes.length);
+
+  // 11.4 进程 exit 出口：真实退出码保留（防钩子吞掉 exit(1) 语义），退出码一律 1（不吞失败）
+  const exitWrites = [];
+  const exitCodes = [];
+  const exitOut = { checks: [], errors: [], hostFatal: [], phase: PROBE_PHASE.PLUGIN_INTEGRATION, [PROBE_COMPLETION_FIELD]: false };
+  const exitBoundary = createProbeBoundary({ out: exitOut, sink: { write: (c) => exitWrites.push(c) }, exit: (code) => exitCodes.push(code) });
+  exitBoundary.recordEscape(PROCESS_ESCAPE.PROCESS_EXIT, '探针在跑完之前退出（exit code=0）', 0);
+  const exitPayload = JSON.parse(exitWrites[0].slice(PROBE_MARKER.length));
+  eq('边界：进程 exit 逃逸落 plugin.early_exit', PLUGIN_PROBE_EXIT_CHECK, exitPayload.checks.at(-1).name);
+  eq('边界：真实退出码保留在结构化结果（排障不丢实况）', 0, exitPayload.escapeCode);
+  eq('边界：钩子以退出码 1 结束（不吞失败语义）', 1, exitCodes.at(-1));
+  eq('边界：插件 process.exit(0) **不得**判 ok（防假绿）', false, exitPayload.ok);
+
+  // 11.4b 第 4 个出口（挂住超时）：看门狗在**宿主 kill 之前**收口
+  //      （SIGTERM 不触发 exit 钩子 + timeout 路径丢弃被杀后 stdout —— 两条实测事实）
+  {
+    const wdWrites = [];
+    const wdOut = { checks: [failCheck('plugin.loaded')], errors: [], hostFatal: [], phase: PROBE_PHASE.PLUGIN_INTEGRATION, [PROBE_COMPLETION_FIELD]: false };
+    const wdBoundary = createProbeBoundary({ out: wdOut, sink: { write: (c) => wdWrites.push(c) }, exit: () => {}, timeoutMs: 30 });
+    eq('边界：看门狗随 install() 装上（阈值 > 0 时）', true, wdBoundary.armWatchdog());
+    await new Promise((r) => setTimeout(r, 120));
+    const wdPayload = JSON.parse(wdWrites[0].slice(PROBE_MARKER.length));
+    eq('边界：看门狗超时 → 落 plugin.early_exit（插件挂住不得甩给上游）', PLUGIN_PROBE_EXIT_CHECK, wdPayload.checks.at(-1).name);
+    eq('边界：看门狗超时 → hostFatal[] 仍为空', 0, wdPayload.hostFatal.length);
+    eq('边界：看门狗超时 → 逃逸实况=timeout', PROCESS_ESCAPE.TIMEOUT, wdPayload[PROBE_ESCAPE_FIELD]);
+    eq('边界：看门狗超时 → 阈值记进 escapeCode（排障可读）', 30, wdPayload.escapeCode);
+    eq('边界：看门狗超时 → ok=false（完成位未置真，不假绿）', false, wdPayload.ok);
+    eq('边界：看门狗超时 → 归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION', attributeFailure(wdPayload, channel, 'dev'));
+    // 阈值缺省 0 = 不装（离线/无超时场景不引入定时器）
+    const offBoundary = createProbeBoundary({ out: { checks: [], errors: [], hostFatal: [] }, sink: { write: () => {} }, exit: () => {} });
+    eq('边界：阈值缺省 0 → 不装看门狗（无超时场景零副作用）', false, offBoundary.armWatchdog());
+    // 正常收口后看门狗不得翻案（卸载即清定时器）
+    const cleanOut = { checks: [], errors: [], hostFatal: [], phase: PROBE_PHASE.PLUGIN_INTEGRATION, [PROBE_COMPLETION_FIELD]: false };
+    const cleanWrites = [];
+    const cleanBoundary = createProbeBoundary({ out: cleanOut, sink: { write: (c) => cleanWrites.push(c) }, exit: () => {}, timeoutMs: 30 });
+    const uninstall2 = cleanBoundary.install({
+      on: (e, fn) => { (cleanBoundary._h ??= {})[e] = fn; },
+      removeListener: () => {},
+    });
+    cleanOut[PROBE_COMPLETION_FIELD] = true;
+    cleanBoundary.emit();
+    uninstall2();
+    await new Promise((r) => setTimeout(r, 80));
+    eq('边界：正常收口后看门狗不翻案（卸载即清定时器）', 1, cleanWrites.length);
+  }
+
+  // 11.5 装钩子/卸钩子：假 process 上真实装配（离线可测，不必起子进程）
+  const handlers = {};
+  const fakeProcess = {
+    on(event, fn) { (handlers[event] ??= []).push(fn); },
+    removeListener(event, fn) { handlers[event] = (handlers[event] ?? []).filter((h) => h !== fn); },
+  };
+  const fakeWrites = [];
+  const fakeOut = { checks: [], errors: [], hostFatal: [], phase: PROBE_PHASE.PLUGIN_INTEGRATION, [PROBE_COMPLETION_FIELD]: false };
+  const fakeBoundary = createProbeBoundary({ out: fakeOut, sink: { write: (c) => fakeWrites.push(c) }, exit: () => {} });
+  const uninstall = fakeBoundary.install(fakeProcess);
+  eq('边界：装了五个进程级钩子（uncaughtException / unhandledRejection / exit / SIGTERM / SIGINT）', 5,
+    ['uncaughtException', 'unhandledRejection', 'exit', 'SIGTERM', 'SIGINT'].filter((e) => (handlers[e] ?? []).length === 1).length);
+  handlers.unhandledRejection[0](new Error('插件未处理拒绝'));
+  eq('边界：unhandledRejection 钩子 → 插件侧 check', PLUGIN_PROBE_EXCEPTION_CHECK, fakeOut.checks.at(-1).name);
+  eq('边界：unhandledRejection 钩子 → hostFatal[] 为空', 0, fakeOut.hostFatal.length);
+  eq('边界：unhandledRejection 钩子 → 实况记 unhandled-rejection', PROCESS_ESCAPE.UNHANDLED_REJECTION, fakeOut[PROBE_ESCAPE_FIELD]);
+  uninstall();
+  // 信号钩子：SIGTERM 不触发 exit 钩子（实测）→ 必须显式接，否则挂住场景仍有活口。
+  // 用**新**边界（逃逸幂等：已 emit 的边界会忽略后续逃逸，复用会误判）。
+  {
+    const sigHandlers = {};
+    const sigOut = { checks: [], errors: [], hostFatal: [], phase: PROBE_PHASE.PLUGIN_INTEGRATION, [PROBE_COMPLETION_FIELD]: false };
+    const sigBoundary = createProbeBoundary({ out: sigOut, sink: { write: () => {} }, exit: () => {} });
+    sigBoundary.install({ on: (e, fn) => { sigHandlers[e] = fn; }, removeListener: () => {} });
+    sigHandlers.SIGTERM('SIGTERM');
+    eq('边界：SIGTERM 钩子 → 落 plugin.early_exit', PLUGIN_PROBE_EXIT_CHECK, sigOut.checks.at(-1).name);
+    eq('边界：SIGTERM 钩子 → hostFatal[] 为空', 0, sigOut.hostFatal.length);
+    eq('边界：SIGTERM 钩子 → 实况记 signal', PROCESS_ESCAPE.SIGNAL, sigOut[PROBE_ESCAPE_FIELD]);
+    eq('边界：SIGTERM 钩子 → 归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION', attributeFailure(sigOut, channel, 'dev'));
+  }
+  eq('边界：卸载后钩子摘干净（离线测试不留全局副作用）', 0,
+    ['uncaughtException', 'unhandledRejection', 'exit', 'SIGTERM', 'SIGINT'].reduce((n, e) => n + (handlers[e] ?? []).length, 0));
+
+  // 11.6 源码守卫：探针写出点必须唯一（不得再出现裸 process.stdout.write 结果行）
+  const probeSrc2 = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+  const probeCode = codeOnly(probeSrc2);
+  // 按**标识符**判（codeOnly 后注释与字符串都不在视野内，别名也拦得住）：
+  // 探针不得再出现裸 `process.stdout.write`（写出点必须唯一，经 emitProbeResult）。
+  eq('边界：探针结果写出点唯一（无裸 process.stdout.write）', 'single-write',
+    /process\.stdout\.write/.test(probeCode) ? 'raw-write' : 'single-write');
+  eq('边界：探针装了进程边界守卫', 'installed',
+    /createProbeBoundary\(/.test(probeCode) && /boundary\.install\(\)/.test(probeCode) ? 'installed' : 'missing');
+  eq('边界：探针完成位只在 run() 返回后置真（逃逸路径到不了）', true,
+    /await run\(\);[\s\S]{0,200}PROBE_COMPLETION_FIELD\] = true/.test(probeCode));
+  eq('边界：探针不再自算 ok（交由 finalizeProbeResult 完成位判定）', false,
+    /out\.ok = out\.errors\.length === 0/.test(probeCode));
+  eq('边界：装配器按唯一事实源的 marker 取值（不硬编码字面量）', true,
+    /startsWith\(PROBE_MARKER\)/.test(codeOnly(readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8'))));
+
+  // 11.7 真子进程实测：本仓 `contract.mjs` 的守卫在**真 node 进程**里也成立
+  //      （离线可跑：不需要宿主缓存，只验证「异步异常 / exit → 照常输出结构化结果」）
+  const childScript = path.join(tmpdir(), `dsh-boundary-${process.pid}.mjs`);
+  writeFileSync(childScript, [
+    `import { createProbeBoundary, PROBE_MARKER, PROBE_COMPLETION_FIELD } from '${pathToFileURL(path.join(ROOT, 'src/harness/contract.mjs')).href}';`,
+    `import { PROBE_PHASE } from '${pathToFileURL(path.join(ROOT, 'src/harness/contract.mjs')).href}';`,
+    `const out = { checks: [{ name: 'plugin.apply_ok', status: 'pass', detail: '' }], errors: [], hostFatal: [], phase: PROBE_PHASE.PLUGIN_INTEGRATION, [PROBE_COMPLETION_FIELD]: false };`,
+    `const boundary = createProbeBoundary({ out });`,
+    `boundary.install();`,
+    `queueMicrotask(() => { throw new Error('子进程异步抛错'); });`,
+    `setTimeout(() => { out[PROBE_COMPLETION_FIELD] = true; boundary.emit(); process.exit(0); }, 300);`,
+    '',
+  ].join('\n'), 'utf8');
+  try {
+    const result = spawnSync(process.execPath, [childScript], { encoding: 'utf8', timeout: 20_000 });
+    const line = (result.stdout ?? '').split('\n').find((l) => l.startsWith(PROBE_MARKER));
+    eq('边界（真子进程）：异步抛错仍输出结构化结果（不再「悄悄死掉」）', true, Boolean(line));
+    const childPayload = line ? JSON.parse(line.slice(PROBE_MARKER.length)) : {};
+    eq('边界（真子进程）：逃逸 → 插件侧 check', PLUGIN_PROBE_EXCEPTION_CHECK, childPayload.checks?.at(-1)?.name);
+    eq('边界（真子进程）：逃逸 → hostFatal[] 为空', 0, (childPayload.hostFatal ?? []).length);
+    eq('边界（真子进程）：逃逸 → ok=false（完成位未置真）', false, childPayload.ok);
+    eq('边界（真子进程）：退出码非 0（失败语义不被吞）', true, result.status !== 0);
+  } finally {
+    rmSync(childScript, { force: true });
+  }
+
+  // 11.8 夹具自检：三份新夹具必须真的复现对应逃逸形态（否则 E2E 断言会空转）
+  for (const [fixture, pattern, label] of [
+    ['async-throw-plugin.mjs', /queueMicrotask\(/, '微任务抛错'],
+    ['async-reject-plugin.mjs', /void Promise\.reject\(/, '未处理拒绝'],
+    ['exit-in-apply-plugin.mjs', /process\.exit\(0\)/, '进程 exit'],
+    ['hang-in-apply-plugin.mjs', /new Promise\(\(\) => \{\}\)/, '挂住超时（第 4 个出口）'],
+  ]) {
+    const src = readText(path.join(ROOT, 'tests/fixtures', fixture), 'utf8');
+    eq(`边界夹具 ${fixture}：真的复现「${label}」`, true, pattern.test(src));
+    eq(`边界夹具 ${fixture}：自述期望 hostFatal 为空`, true, src.includes('hostFatal[]'));
+  }
 }
 console.log();
 console.log(`▶ 归因与契约采集离线回归结果：PASS=${pass} FAIL=${fail}`);

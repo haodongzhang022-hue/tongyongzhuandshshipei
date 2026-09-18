@@ -2,7 +2,7 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.1.7`（module `adapt-hub`；🔴-D 收口 `hostFatal[]` 写入端分相位 + 漂移相关性表唯一事实源 + 上游漂移自动归因影响面）
+> 版本：`dsh-adapt-hub v0.1.8`（module `adapt-hub`；🔴-D **异步活口收口** —— 探针进程边界穷举（异步异常 + 进程 `exit`）+ 完成位防假绿 + 单一 emit 点）
 
 ---
 
@@ -27,7 +27,7 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 80 项 + 归因离线回归 169 项 + 发布面自检 28 项 ✅   归因端到端回归 64 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
+离线单测 80 项 + 归因离线回归 233 项 + 发布面自检 28 项 ✅   归因端到端回归 108 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
 ```
 
 ---
@@ -193,8 +193,8 @@ tongyongzhuandshshipei/
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
 │   ├── test_offline.sh                # 80 项离线单测（无网可跑；含 [14] 漂移相关性表唯一事实源 / [15] watch 影响面）
-│   ├── test_attribution.mjs           # 169 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9]）
-│   ├── test_e2e_regression.mjs        # 64 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D 复现，含 verdict 断言）
+│   ├── test_attribution.mjs           # 233 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9] + 进程边界守卫 [11]）
+│   ├── test_e2e_regression.mjs        # 108 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D + 异步活口/进程 exit/挂住超时出口复现，含 verdict + 完成位断言）
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
 │   └── fixtures/{demo,broken}-plugin.mjs
@@ -252,12 +252,26 @@ export function apply(ctx) {
 > 探针执行分 `host-assembly`（宿主包 import / Context 装配 / 契约采集）与 `plugin-integration`
 > （插件 import / apply / definitions / dispatch / 生命周期）两段；探针顶层兜底按相位归因：
 > `host-assembly` 的未预期异常 → `hostFatal[]`；`plugin-integration` 的 → **插件侧 check**
-> （`plugin.unexpected_exception`），**绝不**进 `hostFatal[]`。
+> （`plugin.unexpected_exception` / `plugin.early_exit`），**绝不**进 `hostFatal[]`。
 > 读插件侧数据的两处（`tools.schemas()` / `definitions.map()`）另有独立护栏，异常落
 > `registry.exact` / `guard.reserved_rejected`。历史缺陷：顶层 catch 一律 `pushHostFatal()`，
 > 插件 bug（未初始化字段 / 抛错 getter）被写成宿主信号 → 判 `UPSTREAM_DRIFT`/AMBER，
 > 并盖掉插件侧已失败的 check。归属路由的唯一事实源：`src/harness/contract.mjs` 的
 > `PROBE_PHASE` / `probeFailureRoute()` / `recordProbeException()`。
+>
+> **探针进程边界（穷举，🔴-D 异步活口收口）**：探针进程逃到「无归属路由」的出口共 **4 个**，
+> 现全部闭合：① `run()` 内同步 `try/catch`；② **异步异常**（`queueMicrotask` 抛错 /
+> 未处理 Promise 拒绝）；③ **进程级 `exit`**（插件在 `apply()` 里 `process.exit()`）；
+> ④ **挂住超时 / 外部信号**（插件 `apply` 永不 resolve 且持有活动句柄 → 宿主 timeout 用 SIGTERM 杀）。
+> ②③④ 由 `createProbeBoundary()`（唯一事实源同上）的进程级守卫接住，经**同一归属路由**落
+> 插件侧 check，并**照常输出结构化结果**（`checks` 不丢）。三条铁律：
+> **完成位** `runCompleted`（只在 `run()` 正常返回后置真 → 逃逸路径**不可能**判 `ok`，防「假绿」）；
+> **单一 emit 点**（`emitProbeResult()`，各条写出路径共用）；**失败语义不吞**（逃逸路径退出码 1，
+> 真实退出码 / 看门狗阈值保留在 `escapeCode`）。报告字段：`probeCompleted` / `probeEscapedBy` / `probeEscapeCode`。
+>
+> ④ 的两条实测事实（缺一就收不了口）：**SIGTERM 默认终止不触发 `process.on('exit')`**；且
+> `execFileSync` 的 timeout 路径**丢弃**被杀子进程写出的 stdout。故 ④ 的收口方式 = 探针**自持看门狗**
+> （阈值由装配器传入 = 宿主 timeout 的 80%，在探针仍活着时经 emit 单点写出）；信号钩子是看门狗之外的兜底。
 
 > **2b 为什么必须在 3 之前**：上游若放宽保留名校验（`reservedName` 漂移），
 > `guard.reserved_rejected` 仍会 fail。若让漂移相关性先判，插件侧硬违规会被吞成
@@ -322,7 +336,7 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 80 项 + 归因离线回归 169 项 + 发布面自检 28 项 + 归因端到端回归 64 项 + 负例拦下（含漂移窗口）+ 变异复测 14/14 拦下 | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 80 项 + 归因离线回归 233 项 + 发布面自检 28 项 + 归因端到端回归 108 项 + 负例拦下（含漂移窗口 + 异步活口 + 进程 exit + 挂住超时出口）+ 变异复测 14/14 拦下 | ✅ done |
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |

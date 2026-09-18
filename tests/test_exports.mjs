@@ -158,6 +158,7 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
   const attrSrc = readFileSync(path.join(ROOT, 'tests/test_attribution.mjs'), 'utf8');
   const expSrc = readFileSync(path.join(ROOT, 'tests/test_exports.mjs'), 'utf8');
   const offlineSrc = readFileSync(path.join(ROOT, 'tests/test_offline.sh'), 'utf8');
+  const e2eSrc = readFileSync(path.join(ROOT, 'tests/test_e2e_regression.mjs'), 'utf8');
   // 已知防线编号 → 其应出现的测试文件（编号在文件里需以 `[编号]` 形式出现）
   const registry = {
     '[7b]': attrSrc,
@@ -169,6 +170,9 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
     '[7c]': attrSrc,
     '[9]': attrSrc,
     '[14]': offlineSrc,
+    // v0.1.8 新增防线：进程边界守卫（离线 [11]）+ 异步活口/进程 exit 出口（真宿主 [10]）
+    '[11]': attrSrc,
+    '[10]': e2eSrc,
   };
   const claimed = new Set();
   // 只扫「回归防线」列与「防线编号」提及，避免把正文里对其他编号的引用算成自述

@@ -33,7 +33,7 @@
 | 一站式适配器 | `src/adapter.mjs` | 代码 | 插件侧唯一 import 面 |
 | 隔离宿主装配 | `src/harness/host.mjs` | 代码 | 真宿主 + 缓存 + 离线 |
 | 验收探针 | `src/harness/probe-template.mjs` | 代码 | 17 项检查（临时目录内执行；**按相位**归因：宿主装配段信号落结构化 `hostFatal[]`，插件集成段一律落 check） |
-| 契约指纹采集 | `src/harness/contract.mjs` | 代码 | 探测后**立即卸载**（可离线单测；防残留污染工具清单）；★ 归因判据表唯一事实源（`HOST_FATAL_FIELD` / 三张 check 表） |
+| 契约指纹采集 | `src/harness/contract.mjs` | 代码 | 探测后**立即卸载**（可离线单测；防残留污染工具清单）；★ 归因判据表唯一事实源（`HOST_FATAL_FIELD` / 三张 check 表）+ **探针进程边界守卫唯一事实源**（`createProbeBoundary()` / 完成位 / 单一 emit 点） |
 | 双通道验收 | `src/verify/runner.mjs` | 代码 | 判决 + 归因（漂移相关性表**从 `triage` import**，不在此硬编码） |
 | 上游侦测 | `src/watch/upstream.mjs` | 代码 | dist-tag 漂移 + 契约 diff |
 | ★ 漂移影响面归因 | `src/triage/index.mjs` | 代码 | **唯一事实源**：`DRIFT_IMPACT`（漂移字段 → 受影响检查 → 责任方 → 中台改哪一处 → 插件义务）+ `triageUpstream()` |
@@ -41,8 +41,8 @@
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
 | 离线单测 | `tests/test_offline.sh` | 测试 | 80 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🔴-D 相位化兜底、漂移相关性表唯一事实源 [14]、watch 影响面 [15]） |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 169 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9]（无网可跑） |
-| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 64 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧异常写进判据字段）场景，含 attribution + verdict 双断言 |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 233 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **进程边界守卫 [11]**（异步异常 / 进程 exit / 挂住超时 / 外部信号 → 同一归属路由 + 完成位防假绿；含真子进程实测 + 看门狗）（无网可跑） |
+| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 108 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧异常写进判据字段 + **异步活口 / 进程 exit / 挂住超时出口**）场景，含 attribution + verdict + 完成位三断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 7 步「文档计数防漂移」） |
 | 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + 防线编号自述可检索（28 项） |
 | 示例插件 | `tests/fixtures/demo-plugin.mjs` | 测试 | 同时是接入模板 |

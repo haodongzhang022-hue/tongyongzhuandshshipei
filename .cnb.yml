@@ -68,10 +68,16 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D 闸门：插件写错代码（未初始化类字段 / 抛错 getter）→ 必须判插件，
-            # 且 hostFatal[] 必须为空（插件侧错误**永远**不进判据字段）。
+            # 🔴-D 闸门（同步 + **异步活口 + 进程 exit 出口**）：插件写错代码
+            # （未初始化类字段 / 抛错 getter / 异步抛错 / 未处理拒绝 / apply 里 process.exit）
+            # 注：挂住超时（第 4 出口）不进本闸门——它会吃满 timeout，由 test_e2e_regression.mjs 用短 timeout 覆盖。
+            # → 必须判插件，且 hostFatal[] 必须为空（插件侧错误**永远**不进判据字段）。
             # 只看 attribution 不够：AMBER 漂移窗口下也可能 fail，必须同时断言 hostFatal 为空。
-            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin; do
+            # 异步两形态尤其要断 verdict：历史缺陷下它们是 AMBER/UPSTREAM_DRIFT（插件 bug 甩给上游）。
+            # 同步两份（插件侧数据读取抛错）：探针 `run()` 正常收尾 → 完成位应为 true；
+            # 逃逸三份（异步抛错 / 未处理拒绝 / apply 里 process.exit）：探针没跑完 → 完成位必须为 false。
+            for entry in plugin-side-throw-plugin:true plugin-registry-throw-plugin:true async-throw-plugin:false async-reject-plugin:false exit-in-apply-plugin:false; do
+              fixture="${entry%%:*}"; expectCompleted="${entry##*:}"
               if node src/cli.mjs verify --channel stable \
                    --plugin ./tests/fixtures/$fixture.mjs \
                    --tools demo_echo --json ./.ci/verify-$fixture.json; then
@@ -79,16 +85,30 @@ main:
               fi
               node -e '
                 const file = process.argv[1];
+                const expectCompleted = process.argv[2] === "true";
                 const r = require(file);
                 const c = r.channels[0];
                 const bad = [];
                 if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因不是 PLUGIN_REGRESSION（实得 " + c.attribution + "）");
                 if ((c.hostFatal || []).length !== 0) bad.push("hostFatal 非空（插件侧错误写进了判据字段）：" + JSON.stringify(c.hostFatal));
                 if (r.summary.verdict === "AMBER") bad.push("判决为 AMBER（插件 bug 被甩给上游）");
+                if (r.summary.verdict === "GREEN") bad.push("判决为 GREEN（假绿：没跑完被报成通过）");
+                if (c.probeCompleted !== expectCompleted) bad.push("探针完成位不是 " + expectCompleted + "（实得 " + c.probeCompleted + "）");
                 if (bad.length) { console.error("❌ 🔴-D 闸门失败：" + bad.join("；")); process.exit(1); }
-                console.log("✅ " + file + "：PLUGIN_REGRESSION / hostFatal 为空 / verdict=" + r.summary.verdict);
-              ' ./.ci/verify-$fixture.json
+                console.log("✅ " + file + "：PLUGIN_REGRESSION / hostFatal 为空 / 完成位=" + c.probeCompleted + " / escapedBy=" + c.probeEscapedBy + " / verdict=" + r.summary.verdict);
+              ' ./.ci/verify-$fixture.json "$expectCompleted"
             done
+            # 反向护栏：收口不得把健康插件打穿（完成位必须为真、17 项全跑完）
+            node -e '
+              const r = require("./.ci/verify-stable.json");
+              const c = r.channels[0];
+              const bad = [];
+              if (c.attribution !== "PASS") bad.push("健康插件归因不是 PASS（实得 " + c.attribution + "）");
+              if (c.probeCompleted !== true) bad.push("健康插件完成位不是 true");
+              if ((c.checks || []).length !== 17) bad.push("健康插件检查项不是 17 项（实得 " + (c.checks || []).length + "）");
+              if (bad.length) { console.error("❌ 反向护栏失败：" + bad.join("；")); process.exit(1); }
+              console.log("✅ 健康插件未被过度修正：PASS / 完成位 true / 17 项全跑完");
+            '
     - name: upstream-watch
       docker:
         image: node:22
@@ -141,24 +161,34 @@ main:
             node tests/test_e2e_regression.mjs
         - name: plugin-error-not-host-signal
           script: |
-            # 🔴-D 闸门（同 push）：插件侧异常不得进 hostFatal[]
-            for fixture in plugin-side-throw-plugin plugin-registry-throw-plugin; do
+            # 🔴-D 闸门（同 push）：插件侧异常 / 异步活口 / 进程 exit 出口均不得进 hostFatal[]
+            # 同步两份完成位 true（run() 正常收尾）/ 逃逸三份完成位 false（探针没跑完）
+            for entry in plugin-side-throw-plugin:true plugin-registry-throw-plugin:true async-throw-plugin:false async-reject-plugin:false exit-in-apply-plugin:false; do
+              fixture="${entry%%:*}"; expectCompleted="${entry##*:}"
               node src/cli.mjs verify --channel stable \
                 --plugin ./tests/fixtures/$fixture.mjs \
                 --tools demo_echo --json ./.ci/verify-$fixture.json && { echo "❌ $fixture 被误判为通过"; exit 1; }
               node -e '
                 const r = require(process.argv[1]);
+                const expectCompleted = process.argv[2] === "true";
                 const c = r.channels[0];
-                if (c.attribution !== "PLUGIN_REGRESSION" || (c.hostFatal || []).length !== 0) {
-                  console.error("❌ 🔴-D 闸门失败：" + c.attribution + " / hostFatal=" + JSON.stringify(c.hostFatal));
-                  process.exit(1);
-                }
-                console.log("✅ " + process.argv[1] + "：PLUGIN_REGRESSION / hostFatal 为空");
-              ' ./.ci/verify-$fixture.json
+                const bad = [];
+                if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因不是 PLUGIN_REGRESSION（实得 " + c.attribution + "）");
+                if ((c.hostFatal || []).length !== 0) bad.push("hostFatal 非空：" + JSON.stringify(c.hostFatal));
+                if (r.summary.verdict === "GREEN") bad.push("判决为 GREEN（假绿）");
+                if (c.probeCompleted !== expectCompleted) bad.push("完成位不是 " + expectCompleted + "（实得 " + c.probeCompleted + "）");
+                if (bad.length) { console.error("❌ 🔴-D 闸门失败：" + bad.join("；")); process.exit(1); }
+                console.log("✅ " + process.argv[1] + "：PLUGIN_REGRESSION / hostFatal 为空 / 完成位=" + c.probeCompleted + " / escapedBy=" + c.probeEscapedBy);
+              ' ./.ci/verify-$fixture.json "$expectCompleted"
             done
-        - name: attribution-e2e
-          script: |
-            node tests/test_e2e_regression.mjs
+            node -e '
+              const c = require("./.ci/verify-stable.json").channels[0];
+              if (c.attribution !== "PASS" || c.probeCompleted !== true || (c.checks || []).length !== 17) {
+                console.error("❌ 反向护栏失败：健康插件 attribution=" + c.attribution + " completed=" + c.probeCompleted + " checks=" + (c.checks || []).length);
+                process.exit(1);
+              }
+              console.log("✅ 健康插件未被过度修正：PASS / 完成位 true / 17 项全跑完");
+            '
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
     - name: upstream-drift-scan

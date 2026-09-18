@@ -31,7 +31,7 @@ else
   bad "离线单元测试失败"; tail -20 /tmp/offline.log
 fi
 if "$NODE_BIN" "$ROOT/tests/test_attribution.mjs" > /tmp/attribution.log 2>&1; then
-  ok "归因离线回归全绿（$(count_of /tmp/attribution.log) 项：判据只读结构化字段 + 硬证据优先 + 🔴-D 相位化兜底 + P2-10 守卫加固）"
+  ok "归因离线回归全绿（$(count_of /tmp/attribution.log) 项：判据只读结构化字段 + 硬证据优先 + 🔴-D 相位化兜底 + 进程边界守卫（异步异常/进程 exit/挂住超时/信号）+ P2-10 守卫加固）"
 else
   bad "归因离线回归失败"; tail -20 /tmp/attribution.log
 fi
@@ -90,7 +90,7 @@ step "4. 归因端到端回归（真宿主；上游取消保留名 / 插件侧�
 "$NODE_BIN" "$ROOT/tests/test_e2e_regression.mjs" > /tmp/e2e.log 2>&1
 E2E_EXIT=$?
 if [[ "$E2E_EXIT" -eq 0 ]]; then
-  ok "归因端到端回归全绿（$(count_of /tmp/e2e.log) 项；含 🔴-A / 🔴-B / 🔴-C / 🔴-D 复现场景 + attribution/verdict 双断言）"
+  ok "归因端到端回归全绿（$(count_of /tmp/e2e.log) 项；含 🔴-A / 🔴-B / 🔴-C / 🔴-D + 异步活口/进程 exit/挂住超时出口复现场景 + attribution/verdict/完成位三断言）"
 elif [[ "$E2E_EXIT" -eq 2 ]]; then
   echo "  ⚠️ 无宿主缓存，端到端回归跳过（前一步 verify 已建立缓存，正常不会走到这里）"
   ok "端到端回归显式跳过（不假装通过）"
@@ -120,20 +120,22 @@ fi
 step "7. 文档计数防漂移（文档声明的项数必须等于实际跑出来的项数）"
 # P2-9 同族：文档/编排里的「N 项」最容易与实际脱节（59/48/34 就曾残留两轮）。
 # 这里把**实际**项数与文档声明**逐一对齐**：任一文档写错 → 本节红（不是靠人眼复核）。
-DOC_COUNT_MISMATCH=0
+#
+# 🟡-2（本轮）：**声明缺失即判红**（原实现 `⚠️ 跳过` → 删掉声明行反而全绿，守卫静默失效）；
+# 并移除 `DOC_COUNT_MISMATCH` 死变量（此前只在函数内自增、从未参与最终判定 —— 尾部只看 `FAIL`）。
 check_doc_count() {
   local label="$1" actual="$2" pattern="$3" file="$4"
   local declared
   declared="$(grep -oE "$pattern" "$ROOT/$file" | head -1 | sed -E 's/.* ([0-9]+) 项$/\1/')"
   if [[ -z "$declared" ]]; then
-    echo "  ⚠️ $file 未找到「$label」的项数声明（跳过比对）"
+    # 声明是**必需项**：删掉声明 = 防漂移防线失效（历史缺陷：删声明行 → 三条比对全部跳过 → 全绿）
+    bad "$file 缺「$label」的项数声明（声明是必需项，缺失即防线失效）"
     return
   fi
   if [[ "$declared" == "$actual" ]]; then
     ok "$file 的「$label」项数 = 实际（$actual）"
   else
     bad "$file 的「$label」声明 $declared 项，实际 $actual 项（文档漂移）"
-    DOC_COUNT_MISMATCH=$((DOC_COUNT_MISMATCH + 1))
   fi
 }
 check_doc_count "离线单测" "$(count_of /tmp/offline.log)" '离线单测 [0-9]+ 项' 'README.md'

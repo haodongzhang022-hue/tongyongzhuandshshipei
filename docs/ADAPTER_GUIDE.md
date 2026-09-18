@@ -201,9 +201,14 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 
 > 顺序即探针实际输出顺序（`guard.reserved_rejected` 在**末尾**，依赖插件 `definitions()`）。
 > 本清单顺序由 `tests/test_exports.mjs` [2b] 守住：与探针 `check()` 调用顺序不一致即红。
-**另有 1 项条件检查**（不计入上表 17 项，仅在异常路径出现）：`plugin.unexpected_exception`——
-探针在 `plugin-integration` 相位发生未预期异常（读插件侧数据时**插件代码**抛错）时写入，
-归因 `PLUGIN_REGRESSION`。它是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
+**另有 2 项条件检查**（不计入上表 17 项，仅在异常路径出现）：
+
+| 条件检查 | 何时出现 | 归因 |
+|---|---|---|
+| `plugin.unexpected_exception` | `plugin-integration` 相位发生未预期异常（读插件侧数据时**插件代码**抛错 / 插件异步抛错 / 未处理 Promise 拒绝） | `PLUGIN_REGRESSION` |
+| `plugin.early_exit` | 插件在 `apply()` 里直接 `process.exit()`；或插件 `apply()` **永不 resolve** 把探针挂住（超时）/ 探针被信号终止——探针在跑完之前被结束 | `PLUGIN_REGRESSION` |
+
+两项都是「插件侧错误不进 `hostFatal[]`」这条不变量的执行点（见下）。
 
 **归因优先级**（`attributionReasons` 判据链按此顺序取第一条命中）：
 
@@ -222,7 +227,17 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 > 探针分两段跑：`host-assembly`（宿主包 import / Context 装配 / 契约采集）与
 > `plugin-integration`（插件 import / apply / definitions / dispatch / 生命周期）。
 > **只有 `host-assembly` 段的未预期异常**才写 `hostFatal[]`；插件集成段的异常一律落
-> **插件侧 check**（`plugin.unexpected_exception` / `registry.exact` / `guard.reserved_rejected`）。
+> **插件侧 check**（`plugin.unexpected_exception` / `plugin.early_exit` / `registry.exact` / `guard.reserved_rejected`）。
+>
+> **探针进程边界（穷举）**：探针进程逃到「无归属路由」的出口共 4 个，现全部闭合——
+> ① `run()` 内同步 `try/catch`（各段护栏 + 顶层按相位兜底）；
+> ② **异步异常**（`queueMicrotask` 抛错 / 未处理 Promise 拒绝）；
+> ③ **进程级 `exit`**（插件 `apply()` 里 `process.exit()`）；
+> ④ **挂住超时 / 外部信号**（插件 `apply()` 永不 resolve 且持有活动句柄 → 探针看门狗先收口）。
+> ②③④ 由探针的进程级守卫接住，经**同一归属路由**落插件侧 check，并**照常输出结构化结果**
+> （`checks` 不丢）。报告里的 `probeCompleted`（完成位）与 `probeEscapedBy`（逃逸种类：
+> `uncaught-exception` / `unhandled-rejection` / `process-exit` / `timeout` / `signal`）
+> 是排障入口：`probeCompleted=false` ⇒ 探针没跑完（此类运行**不可能**判 PASS，防「假绿」）。
 > 所以：`hostFatal[]` 非空 ⇒ 确实是宿主/环境侧问题；`hostFatal[]` 为空 + 插件侧 check 失败
 > ⇒ 是你的插件问题（哪怕 `errors[]` 里出现了宿主侧措辞的字面量——`errors` 不参与判据）。
 > 报告里的 `probePhase` 字段告诉你异常发生在哪一段，排障不必猜。

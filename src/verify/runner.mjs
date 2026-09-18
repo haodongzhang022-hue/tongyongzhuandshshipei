@@ -73,6 +73,11 @@ export function verifyChannel(options) {
     hostFatal: Array.isArray(probe.hostFatal) ? probe.hostFatal : [],
     // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
     probePhase: probe.phase ?? null,
+    // 完成位与进程边界逃逸实况（探针透传；装配器/执行器都不改判）：
+    // runCompleted=false 表示探针没跑完（异步逃逸 / 插件 process.exit）——此类运行**不可能**判 PASS。
+    probeCompleted: probe.runCompleted === true,
+    probeEscapedBy: probe.escapedBy ?? null,
+    probeEscapeCode: probe.escapeCode ?? null,
     probeExit: probe.probeExit ?? null,
     install: probe.install,
     cacheHit: probe.cacheHit,

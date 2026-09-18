@@ -1,5 +1,58 @@
 # 变更记录（dsh-adapt-hub）
 
+## v0.1.8 — 🔴-D 异步活口收口：探针进程边界穷举（异步异常 + 进程 `exit` + 挂住超时/信号）+ 完成位防假绿 + 单一 emit 点
+
+> 承接 v0.1.7（写入端分相位）。评审复评结论：判 `fix_bug` 成立（🔴 未清零），但**不标 blocked**——
+> 根因已收敛到**单一、可穷举的进程边界**，本轮结构性收口。
+> 评审独立复现：A/B 唯一差异 = `apply` 末尾一行 `queueMicrotask` 抛错 → 对照 GREEN 17/17，
+> 实验 AMBER / `UPSTREAM_DRIFT` / `hostFatal` 非空 / `checks=0`（3 次重跑一致，四种形态全命中）。
+
+### 🔴 必修
+
+| # | 问题 | 修复 | 回归防线 |
+|---|---|---|---|
+| **必修-1** | **异步活口**：插件在 `apply()` **返回之后**抛异步错误（`queueMicrotask` 抛错 / 未处理 Promise 拒绝）时，探针的同步 `try/catch` 完全看不见它——异常逃到 Node 进程级，探针既不输出结构化结果也不归属 → 装配器只能记「探针未输出结构化结果」→ `hostFatal[]` 非空 → 判 `UPSTREAM_DRIFT`/AMBER（插件 bug 甩给上游）。违反本 PR 自订不变量「插件侧错误**永远**不进该字段」 | **进程边界守卫** `createProbeBoundary()`（`contract.mjs`，探针与离线回归共用）：`uncaughtException` + `unhandledRejection` 经**同一归属路由** `recordProbeException()` 落**插件侧 check** `plugin.unexpected_exception`，并**照常输出** `__DSH_PROBE__`（`checks` 不丢） | **离线** [11] 216 项（逃逸路由 / 完成位 / 单一 emit 点 / 幂等 / 假 process 装钩子 + **真子进程实测**）；**真宿主** [10]（`async-throw-plugin` / `async-reject-plugin` → `PLUGIN_REGRESSION`/RED、`hostFatal=[]`、`probeCompleted=false`、`probeEscapedBy` 如实）；**闸门** `.cnb.yml`（push + PR） |
+| **必修-2** | **进程级 `exit` 出口**：插件在 `apply()` 里 `process.exit()` → 探针在跑完之前结束。**比异步活口更危险**：若只在 `process.on('exit')` 里补 emit 而不带完成位，`process.exit(0)` 会得到 **GREEN 且 checks 只剩 6 条**的**假绿**（把「没跑完」报成「通过」） | 同一守卫的 `exit` 钩子接住 → 落插件侧 check `plugin.early_exit`（与异常分开命名，排障可区分）；**完成位** `runCompleted`（**只有** `run()` 正常返回才置真 → 逃逸路径**不可能**判 `ok`）；真实退出码保留在 `escapeCode`，钩子内显式以退出码 1 结束（不吞失败语义） | 离线 [11]（完成位三态 / `exit` 逃逸落 `plugin.early_exit` / 真实退出码保留 / 钩子退出码 1 / `exit(0)` 不得判 ok）；真宿主 [10]（`exit-in-apply-plugin` → RED、`hostFatal=[]`、`probeCompleted=false`、`escapeCode=0`）；闸门断言 `verdict !== GREEN` |
+| **必修-2b** | **第 4 个进程边界出口（本轮实测补充，评审 §二 枚举 ①②③ 之外）**：插件 `apply()` 返回**永不 resolve** 的 Promise 且持有活动句柄 → 进程不自然退出、`exit` 钩子不触发；宿主 `execFileSync` timeout 用 SIGTERM 杀进程，而 timeout 路径**丢弃**被杀子进程写出的 stdout（两条均实测）→ 探针输出拿不到 → 装配器记宿主侧致命 → 判 `UPSTREAM_DRIFT`/AMBER | **探针自持看门狗**（阈值由装配器传入 = 宿主 timeout 的 80%，早于宿主 kill）+ SIGTERM/SIGINT 信号钩子兜底 → 落插件侧 `plugin.early_exit`，`escapedBy=timeout`/`signal` | 离线 [11]（看门狗阈值触发 / 落点 / `escapeCode`=阈值 / 缺省 0 不装 / 正常收口后不翻案 + 信号钩子）；真宿主 [11]（`hang-in-apply-plugin` + **短 timeout** 直接调 `runHostProbe()` → RED、`hostFatal=[]`、`escapedBy=timeout`、`probeCompleted=false` + 反向护栏）；夹具不进 CI 闸门（吃满 timeout 纯浪费额度） |
+| **必修-3** | 缺「插件侧异步抛错」夹具与闸门——回归防线只覆盖**同步**读插件侧数据（🔴-D 的两份夹具） | 新增 3 份夹具（`async-throw-plugin` / `async-reject-plugin` / `exit-in-apply-plugin`），纳入**离线**（夹具自检：真的复现对应逃逸形态）+ **真宿主 E2E** + **`.cnb.yml` 闸门**（push + PR，断言 `hostFatal.length === 0` **且** `attribution === PLUGIN_REGRESSION` 且 `probeCompleted === false` 且非 GREEN） | 夹具自检离线；真宿主 [10] 各 10 条断言；闸门两个事件 |
+
+### 🟡 建议（同批修）
+
+| # | 问题 | 处置 |
+|---|---|---|
+| **建议-1** | 不变量源码守卫可绕过：`stripComments` 把「同行含 `//` 的字符串」截断 → 守卫**看不见** `pushHostFatal(`（装上该变异后 169/169 全绿）；别名 `const pf = pushHostFatal` 也不命中 | **已修**：顶层 catch 守卫改 `codeOnly` + **按标识符**判（与 [10] 口径统一）；**自证**三种写法（直接调用 / 同行注释字符串 / 别名）全部命中、注释不误报；段落定位失败即红（守卫不得空转）。主防线仍是行为反证 |
+| **建议-2** | 计数守卫对「删声明」静默失效（删 `README.md` 声明行 → 三条比对全部 `⚠️ 跳过`、不判红）；且 `DOC_COUNT_MISMATCH` 是**死声明**（只在函数内自增、从未参与最终判定） | **已修**：`check_doc_count` **声明缺失即判 `FAIL`**（声明是必需项）；移除死变量 `DOC_COUNT_MISMATCH`（尾部判定只看 `FAIL`）。已实测三种变异：声明正确 ✅ / 删声明 ❌ / 改数字 ❌ |
+| **建议-3** | `.cnb.yml` PR 段 `attribution-e2e` **重复 stage**（`138` / `159` 两处逐字相同，`test_e2e_regression.mjs` 被跑两遍，纯浪费额度） | **已修**：去重（PR 段只保留一处 `attribution-e2e`） |
+
+### 🟢 优化（同批顺手）
+
+- **单一 emit 点**：三条写出路径（正常收口 / 异步逃逸 / 进程 exit 兜底）共用 `emitProbeResult()`（`writeSync(1, …)`——`process.exit()` 前用流写大 payload 有截断风险）；装配器按唯一事实源 `PROBE_MARKER` 取值（不再硬编码字面量）。
+- **逃逸幂等**：迟到逃逸（正常收口后飞来的 reject）不重复 emit、不改判（否则正常通过的验收会被收尾后的噪声改写）。
+- **相位与逃逸实况进报告**：`probeCompleted` / `probeEscapedBy` / `probeEscapeCode`（执行器透传，装配器与执行器都**不改判**）。
+- 探针 `ok` 不再自算（`out.ok = errors.length === 0`），改由 `finalizeProbeResult()` 按**完成位 + 无错误**判定（唯一事实源）。
+
+### 兼容性
+
+- 探针输出、验收报告新增字段：`runCompleted` / `escapedBy` / `escapeCode`（探针侧）与 `probeCompleted` / `probeEscapedBy` / `probeEscapeCode`（报告侧）。
+- `attributionDetail()` / `attributeFailure()` 签名不变；**写入端语义收窄**——插件集成相位的异步异常与进程 exit 均不再进 `hostFatal[]`。
+- 新增 `contract.mjs` 导出：`PROBE_MARKER` / `PROCESS_ESCAPE` / `PLUGIN_PROBE_EXIT_CHECK` / `PROBE_COMPLETION_FIELD` / `PROBE_ESCAPE_FIELD` / `PROBE_ESCAPE_CODE_FIELD` / `createProbeBoundary()` / `emitProbeResult()` / `serializeProbeResult()` / `finalizeProbeResult()`。
+- 新增 `PLUGIN_SIDE_CHECKS` 项：`plugin.early_exit`（条件检查，不计入 17 项）。
+- **口径收口（评审 §三④）**：走方案① —— 探针覆盖全部退出路径（①同步 ②异步 ③进程 exit **④挂住超时/信号**），
+  故不变量文案「插件侧错误**永不**进 `hostFatal[]`」**成立**，无需收窄口径。
+- 新增 `PROCESS_ESCAPE.TIMEOUT` / `PROCESS_ESCAPE.SIGNAL` 与 `createProbeBoundary({ timeoutMs })` 看门狗；
+  探针命令行新增第 4 个参数 `watchdogMs`（装配器传入 = 宿主 timeout 的 80%）。
+
+### 测试项数
+
+- `tests/test_offline.sh`：80 项（不变）
+- `tests/test_attribution.mjs`：169 → **233 项**（新增 [11] 进程边界守卫 64 条：异步异常 / 进程 exit / 看门狗超时 / 信号钩子 + 真子进程实测）
+- `tests/test_e2e_regression.mjs`：64 → **108 项**（新增 [10] 异步活口 / 进程 exit 出口 34 条 + [11] 挂住超时出口 10 条）
+- `tests/test_exports.mjs`：28 项（不变）
+- 新增夹具：`tests/fixtures/async-throw-plugin.mjs`、`async-reject-plugin.mjs`、`exit-in-apply-plugin.mjs`、`hang-in-apply-plugin.mjs`（后者不进 CI 闸门）
+- `tests/test_hub.sh`：第 7 步「文档计数防漂移」——声明缺失即判红 + 移除死变量
+- `.cnb.yml`：`plugin-error-not-host-signal` 闸门扩到 5 份夹具 + 反向护栏（健康插件仍 PASS / 完成位 true / 17 项）；PR 段去重 `attribution-e2e`
+
+
 ## v0.1.7 — 🔴-D 收口：`hostFatal[]` 写入端分相位（插件侧异常永不进判据字段）+ P2-9 / P2-10
 
 > 承接 v0.1.5（复测清单闭环）/ v0.1.6（文档守卫加固）。

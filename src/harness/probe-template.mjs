@@ -1,7 +1,7 @@
 /**
  * 双通道验收探针（在隔离临时目录内执行，由**真实宿主运行时**装配）。
  *
- * 用法：`node probe.mjs <hubRoot> <pluginPath> <expectedToolsJson>`
+ * 用法：`node probe.mjs <hubRoot> <pluginPath> <expectedToolsJson> [watchdogMs]`
  * 输出：单行 `__DSH_PROBE__<json>`（结构化结果）。
  *
  * 验收分两段：
@@ -26,6 +26,22 @@
  * 未知相位**保守判插件侧**（宁可让人多看一眼插件失败，也不让未确认的信号去开「上游漂移」的门）。
  * 归属路由的唯一事实源：`contract.mjs` 的 `PROBE_PHASE` / `probeFailureRoute()` / `recordProbeException()`。
  * 读插件侧数据的两处（`tools.schemas()` / `definitions.map()`）另有独立护栏，异常落插件侧 check。
+ *
+ * ## 进程边界（异步活口 + `process.exit` 出口，评审 §二）
+ * 探针进程逃到「无归属路由」的出口只有 3 个，全部收敛到同一处归属路由：
+ * 1. `run()` 内的同步 `try/catch`（各段护栏 + 顶层按相位兜底）—— 已闭合；
+ * 2. **异步异常**（`queueMicrotask` 抛错 / 未处理 Promise 拒绝）→ 进程级钩子接住 → 插件侧 check；
+ * 3. **进程级 exit**（插件在 `apply()` 里 `process.exit()`）→ 钩子接住 → 插件侧 check。
+ *
+ * 三条铁律（见 `contract.mjs` 的 `createProbeBoundary()`）：
+ * - **完成位** `runCompleted`：只在 `run()` 正常返回后置真 → 逃逸路径**不可能判 ok**（防假绿）；
+ * - **同一 emit 单点**：三条写出路径共用 `emitProbeResult()`（`checks` 不丢）；
+ * - **失败语义不吞**：逃逸路径显式退出码 1，真实退出码保留在 `escapeCode`。
+ *
+ * 第 4 个出口（挂住超时）：插件 `apply` 永不 resolve 且持有活动句柄 → 进程不自然退出、
+ * `exit` 钩子不触发；宿主 `execFileSync` timeout 用 SIGTERM 杀进程，而 timeout 路径**丢弃**
+ * 被杀后写出的 stdout（实测）→ 信号钩子单独不够。故探针**自持看门狗**（阈值由装配器传入，
+ * 取宿主 timeout 的 80%），在探针仍活着时用同一 emit 单点写出结果。
  * 历史缺陷（🔴-B）：插件侧错误曾被统一写成 `fatal: ...`，而 `runner` 用裸 `fatal:` 判上游漂移
  * → 插件写坏了却被告知「上游变了，不是你的问题」。
  * 历史缺陷（🔴-C）：改用 `fatal(host)` 前缀后判据仍在**扫自由文本**——插件文件路径/错误文本里
@@ -34,14 +50,34 @@
  * 该文件由 `src/harness/host.mjs` 复制进临时目录后执行；不要直接运行。
  */
 import { pathToFileURL } from 'node:url';
-import { collectContract, PLUGIN_SIDE_CHECKS, PROBE_PHASE, pushHostFatal, recordProbeException } from './contract.mjs';
+import {
+  PLUGIN_SIDE_CHECKS,
+  PROBE_COMPLETION_FIELD,
+  PROBE_PHASE,
+  collectContract,
+  createProbeBoundary,
+  pushHostFatal,
+  recordProbeException,
+} from './contract.mjs';
 
-const [hubRoot, pluginPath, expectedToolsJson] = process.argv.slice(2);
+const [hubRoot, pluginPath, expectedToolsJson, watchdogMsArg] = process.argv.slice(2);
 const expectedTools = JSON.parse(expectedToolsJson ?? '[]');
+// 看门狗阈值（毫秒，由装配器传入；缺省 0 = 不装）。见 contract.mjs 的 PROCESS_ESCAPE.TIMEOUT。
+const watchdogMs = Number(watchdogMsArg ?? 0);
 
 // hostFatal：**结构化**的宿主/环境侧致命信号（归因判据唯一依据，见 🔴-C）。
 // errors：人类可读日志（可含插件侧 stack/路径）——**不参与判据**。
-const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}, probes: [], phase: null, ok: false };
+// runCompleted：**完成位**——只在 `run()` 正常返回后置真（见 contract.mjs 的 PROBE_COMPLETION_FIELD）。
+// 没有它，插件 `process.exit(0)` 会被 `exit` 钩子补出的结果报成「GREEN 但 checks 只有前几项」的假绿。
+const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}, probes: [], phase: null, [PROBE_COMPLETION_FIELD]: false, ok: false };
+/**
+ * 进程边界守卫（异步活口 / `process.exit` 出口收口，唯一事实源 `contract.mjs`）。
+ *
+ * 装上后：异步异常与提前退出都经 `recordProbeException()` 按相位归属、**照常输出结构化结果**、
+ * 并以退出码 1 结束——不再有「探针悄悄死掉 → 装配器只能记宿主侧致命」的活口。
+ */
+const boundary = createProbeBoundary({ out, timeoutMs: watchdogMs });
+boundary.install();
 /**
  * 当前执行相位（🔴-D 的唯一事实源在 `contract.mjs` 的 {@link PROBE_PHASE}）。
  *
@@ -325,6 +361,8 @@ async function run() {
 
 try {
   await run();
+  // 完成位：**只有走到这里**才算探针跑完（逃逸路径永远到不了）。
+  out[PROBE_COMPLETION_FIELD] = true;
 } catch (error) {
   // 兜底：探针自身未预期的异常。**按相位归因**（🔴-D），不猜：
   // - host-assembly：宿主包 import / Context 装配 / 契约采集阶段 → 宿主/环境侧 → hostFatal[]；
@@ -336,6 +374,8 @@ try {
   recordProbeException(out, phase, brief(error, 1200));
 }
 
-out.ok = out.errors.length === 0;
-process.stdout.write(`__DSH_PROBE__${JSON.stringify(out)}\n`);
+// 唯一写出点（boundary.emit 内部经 contract.mjs 的 emitProbeResult 同步写出）。
+// 正常路径在这里收口；逃逸路径（异步异常 / 提前退出）由边界钩子收口——写出点仍是这一处。
+boundary.emit();
+// 退出码：完成位 + 无错误 才 0（见 contract.mjs 的 finalizeProbeResult，防「没跑完报通过」）。
 process.exit(out.ok ? 0 : 1);
