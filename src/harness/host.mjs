@@ -93,6 +93,33 @@ export function pruneHostCache(options = {}) {
 }
 
 /**
+ * 宿主侧**子进程终止信号**（唯一事实源）：`probeSpawnOptions` / `npm install` 到点后用它终止子进程。
+ *
+ * ## 为什么必须是 `SIGKILL`（不是 Node 默认的 `SIGTERM`）
+ * `execFileSync`/`spawnSync` 的 `timeout` 到点发的是 `killSignal`（默认 `SIGTERM`）。而**探针自己装了**
+ * `SIGTERM`/`SIGINT`/`SIGHUP`/`SIGQUIT` 处理器（出口 ③：插件自杀式信号的归因）——
+ * Node 语义：**一旦有监听器，默认终止行为即被替换**。于是「插件在 `apply()` 里同步占死
+ * 事件循环」时：
+ *   1. 看门狗 / 信号处理器都在**同一个事件循环**上 ⇒ 一个都跑不了（信号已入队但没人处理）；
+ *   2. `SIGTERM` 被探针自己的处理器**吞掉**（处理器不可达 ≠ 信号无效）⇒ 探针不死；
+ *   3. 宿主于是**等不到子进程退出** ⇒ CI 级**无界挂起**（`while(true)` 形态吃满 `CNB_PIPELINE_MAX_RUN_TIME`）。
+ * `SIGKILL` **不可捕获、不可屏蔽** ⇒ 一定终止 ⇒ 有界返回（实测 5.07s → 3.01s）。
+ *
+ * ## 代价（显式声明，不静默）
+ * 探针来不及写结构化结果 ⇒ 装配器按**相位信标**（`__DSH_PROBE_PHASE__`）归因：
+ * 有信标（终止发生在插件代码运行期间）→ 插件侧 check `plugin.abnormal_termination`，
+ * `hostFatal[]` 保持为空（**不甩锅上游**）；无信标 → `hostFatal[]`（真上游信号不丢）。
+ * 这与「不可捕获终止」的既有口径一致，不是新活口。
+ *
+ * ## 残留（未越权承诺）
+ * 1. 默认 `timeoutMs` 仍是 600s ⇒ `while(true)` 插件在 CI 上**有界但慢**（吃满 600s 才被杀）；
+ *    是否缩短默认超时属**待拍板**项，见 `docs/RISKS.md` R24 / R27 残留①。
+ * 2. 探针内的看门狗（出口 ④）仍依赖**被占满的事件循环**——它对本形态无效；
+ *    根治方向是**结构性重做**（进程隔离 / 独立线程），见 `docs/REDO-PROPOSAL.md`。
+ */
+export const CHILD_KILL_SIGNAL = 'SIGKILL';
+
+/**
  * 探针子进程的执行参数（**唯一事实源**）。
  *
  * 抽出来的理由：`killSignal`（R24）与结果通道 fd3（R26）都是**安全相关**的固定取值，
@@ -100,11 +127,13 @@ export function pruneHostCache(options = {}) {
  * 「CI 挂死」或「放行级假绿」）。抽成函数后离线单测可直接断言这两个不变量。
  *
  * @param {{hubRoot:string, pluginPath:string, expectedTools:string[], timeoutMs:number,
- *   nonce?:{envName:string, value:string}|null}} options 选项
+ *   nonce?:{envName:string, value:string}|null, killSignal?:string}} options 选项
+ *   `killSignal` 仅用于**回归反证**（离线台传 `'SIGTERM'` 复现「超时被探针处理器吞掉 ⇒ 无界」的旧缺陷）；
+ *   生产路径**不得**传它——默认值就是 {@link CHILD_KILL_SIGNAL}（源码守卫 [14] 钉住这一点）。
  * @returns {import('node:child_process').SpawnSyncOptionsWithStringEncoding} spawnSync 选项
  */
 export function probeSpawnOptions(options) {
-  const { hubRoot, pluginPath, expectedTools, timeoutMs, nonce = null } = options;
+  const { hubRoot, pluginPath, expectedTools, timeoutMs, nonce = null, killSignal = CHILD_KILL_SIGNAL } = options;
   return {
     // 探针与其依赖同目录（probe.mjs / contract.mjs 由本模块拷入）
     cwd: undefined,
@@ -112,7 +141,8 @@ export function probeSpawnOptions(options) {
     timeout: timeoutMs,
     // R24：不可捕获、不可屏蔽的二次终止。默认 SIGTERM 会被探针自己的出口③ 处理器吞掉
     // （Node 默认终止行为被禁用）⇒ 插件同步死循环时宿主杀不掉探针（实测 30.3s / 永久挂死）。
-    killSignal: 'SIGKILL',
+    // 取值来自唯一事实源 CHILD_KILL_SIGNAL（离线台可覆写成 SIGTERM 做**反向反证**，见 [17]）。
+    killSignal,
     // R26：[stdin, stdout, stderr, fd3]；fd3 = 结构化结果专用通道（探针 `writeSync(3, ...)`）。
     // 于是「stdout 里出现结果行」本身就是篡改证据（通道隔离）。
     stdio: ['ignore', 'pipe', 'inherit', 'pipe'],
@@ -200,8 +230,8 @@ export function runHostProbe(options) {
           stdio: ['ignore', 'ignore', 'inherit'],
           timeout: timeoutMs,
           // 同 R24：npm 也可能挂住（网络半死 / 子进程不响应 SIGTERM）⇒ 超时后 SIGKILL 兜底，
-          // 让 `timeoutMs` 对**安装段**同样是有界承诺（不是只对探针段）。
-          killSignal: 'SIGKILL',
+          // 让 `timeoutMs` 对**安装段**同样是有界承诺（不是只对探针段）。同一份唯一事实源常量。
+          killSignal: CHILD_KILL_SIGNAL,
         });
       } catch (error) {
         // 安装失败 = 宿主/环境侧（网络不可达 或 上游钉版消失）→ 显式措辞，供归因按**结构**判定

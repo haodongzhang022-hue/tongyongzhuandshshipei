@@ -471,6 +471,36 @@ assert "占死事件循环：5s timeout 内**有界**返回（< 20s，实测约 
 assert "占死事件循环：由 SIGKILL 收尾（signal=SIGKILL，非无限等待）" "SIGKILL" "$(echo "$BOUNDED_OUT" | cut -d'|' -f2)"
 assert "占死事件循环：归因 PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$BOUNDED_OUT" | cut -d'|' -f3)"
 
+# 反向反证（**为什么必须 SIGKILL**，机器可检、不是注释里的断言）：
+# 同一形态的**有界**占死夹具（plugin-busy-loop-hang-plugin，占死时长 > 外层超时），
+# 把宿主终止信号换回**旧口径 SIGTERM**（探针为出口③装了 SIGTERM 处理器 ⇒ 默认终止行为被替换
+# ⇒ 超时发的 SIGTERM 被吞掉）⇒ 耗时**随插件占死时长走**，超时形同虚设。
+# 与上一条的差异只来自 killSignal ⇒ 证明有界性不是环境噪声。两条断言都用相对量（×timeout）。
+export DSH_BUSY_LOOP_MS=6000
+SIGTERM_OUT="$("$NODE_BIN" --input-type=module -e '
+import path from "node:path";
+import { runOfflineProbe } from "'"$ROOT"'/tests/offline-probe-harness.mjs";
+const TIMEOUT = 1500;
+const run = (killSignal) => {
+  const t0 = Date.now();
+  const r = runOfflineProbe({
+    pluginPath: path.join("'"$ROOT"'", "tests/fixtures/plugin-busy-loop-hang-plugin.mjs"),
+    expectedTools: ["demo_echo"], timeoutMs: TIMEOUT, killSignal,
+  });
+  const fails = r.result.checks.filter((c) => c.status === "fail").map((c) => c.name);
+  return { ms: Date.now() - t0, timeout: TIMEOUT, signal: r.exit.signal ?? "none", attribution: r.attribution,
+    hostFatal: r.result.hostFatal.length, completed: r.result.runCompleted, fails, ok: r.result.ok === true };
+};
+console.log(JSON.stringify({ killed: run(undefined), legacy: run("SIGTERM") }));
+')"
+unset DSH_BUSY_LOOP_MS
+jk17() { echo "$SIGTERM_OUT" | "$NODE_BIN" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);const c=r['$1'];console.log(eval('c$2'))})"; }
+assert "🔴-1 反向反证（生产口径）：耗时 < 2×timeout（超时真的生效，不随占死时长走）" "true" "$(jk17 killed '.ms < c.timeout * 2')"
+assert "🔴-1 反向反证（生产口径）：SIGKILL 收尾 + 归因插件侧 + hostFatal 空 + 未跑完" "SIGKILL|PLUGIN_REGRESSION|0|false" "$(jk17 killed '.signal+"|"+c.attribution+"|"+c.hostFatal+"|"+c.completed')"
+assert "🔴-1 反向反证（生产口径）：失败项 plugin.abnormal_termination + 不得假绿" "true|false" "$(jk17 killed '.fails.includes("plugin.abnormal_termination")+"|"+c.ok')"
+assert "🔴-1 反向反证（旧口径 SIGTERM）：耗时 ≥ 2×timeout（超时被探针处理器吞掉 ⇒ 形同虚设）" "true" "$(jk17 legacy '.ms >= c.timeout * 2')"
+assert "🔴-1 反向反证：SIGTERM 下确实**不是**被超时杀掉的（差异来自 killSignal，非环境噪声）" "false" "$(jk17 legacy '.signal === "SIGKILL"')"
+
 echo "  [13] 🆕 nonce 带外通道（侧信道：只认带 nonce 的报告 + 伪造即判）"
 NONCE_OUT="$("$NODE_BIN" --input-type=module -e '
 import { interpretProbeStdout } from "'"$ROOT"'/src/harness/host.mjs";

@@ -10,6 +10,7 @@
 | 我想知道这中台怎么设计的 | `docs/ARCHITECTURE.md` |
 | 我的验收失败了，不知道是谁的问题 | `docs/ADAPTER_GUIDE.md` §4「归因怎么读」 |
 | 我想知道有哪些风险 | `docs/RISKS.md` |
+| 我想知道「报告凭什么可信」 | `docs/RISKS.md` **R26（架构前提：插件为可信代码）** + `docs/REDO-PROPOSAL.md`（结构性重做一页方案） |
 | 我想改通道钉版（bump 上游版本） | `registry/channels.json` |
 | 上游新增了一个契约字段，我想让它参与漂移归因 | `src/triage/index.mjs` 的 `DRIFT_IMPACT`（**唯一事实源**，只改这一处） |
 | 我想看上游有没有发新版 | `node src/cli.mjs watch` 或页面按钮「上游漂移侦测」 |
@@ -38,10 +39,12 @@
 | 上游侦测 | `src/watch/upstream.mjs` | 代码 | dist-tag 漂移 + 契约 diff |
 | ★ 漂移影响面归因 | `src/triage/index.mjs` | 代码 | **唯一事实源**：`DRIFT_IMPACT`（漂移字段 → 受影响检查 → 责任方 → 中台改哪一处 → 插件义务）+ `triageUpstream()` |
 | 二级信息汇报 | `src/report/secondary.mjs` | 代码 | JSON + Markdown 双视图 |
+| ★ 架构前提（信任边界） | `docs/RISKS.md` R26 | 文档 | **显式前提：插件为可信代码**；前提被打破 ⇒ 结论不可信（本中台是验收工具，不是沙箱） |
+| 结构性重做一页方案 | `docs/REDO-PROPOSAL.md` | 文档 | 批 1（fd3 + nonce）**已落地** / 批 2（进程隔离）**待拍板** |
 | CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 124 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🆕 nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**v0.1.9d R28/R26/R24 三形态 [18]**） |
-| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 401 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **v0.1.9d [9.10] R28 判据 / [9.11] R26 协议注入 / [9.12] R24 行为级**（无网可跑） |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 129 项，无网可跑（含 `summarize()` verdict 优先级 [13]、🆕 nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**v0.1.9d R28/R26/R24 三形态 [18]**） |
+| 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 430 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **v0.1.9d [9.10] R28 判据 / [9.11] R26 协议注入 / [9.12] R24 行为级**（无网可跑） |
 | 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 146 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d] 侧信道 / [8e] R28+R26 / [8f] R24** 场景，含 attribution + verdict + **完成位**三重断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 4b 步插件侧闸门 / 第 7 步「文档计数防漂移」） |
 | 插件侧闸门 | `tests/gate_plugin_side.sh` | 测试 | ★ 唯一事实源：四条出口 + SIGKILL 边界 + **防过度修正**（健康插件 17/17）；`.cnb.yml` push/PR 两段共用同一份 |

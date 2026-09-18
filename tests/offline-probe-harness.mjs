@@ -88,11 +88,14 @@ export default function ToolRuntime(ctx) { ctx.provide('tools', new FakeToolRunt
  * @param {string[]} [options.expectedTools] 期望工具清单
  * @param {number} [options.watchdogMs] 看门狗窗口（**只许缩短**，用于「run() 被拖住」的回归）
  * @param {number} [options.timeoutMs] 子进程超时（默认 30s）
+ * @param {string} [options.killSignal] 超时后的终止信号（**仅回归反证用**：传 `'SIGTERM'` 复现旧缺陷；
+ *   不传 = 生产口径，取自 `probeSpawnOptions` 的 `CHILD_KILL_SIGNAL`）
  * @returns {{result: object, attribution: string, reasons: string[], exit: {status:number|null, signal:string|null}}}
  *   `result` 是装配器结构（`checks` / `hostFatal` / `runCompleted` / `phase` / `ok`）
  */
 export function runOfflineProbe(options) {
-  const { pluginPath, expectedTools = [], watchdogMs, timeoutMs = 30_000 } = options;
+  const { pluginPath, expectedTools = [], watchdogMs, timeoutMs = 30_000, killSignal } = options;
+  const startedAt = Date.now();
   const work = mkdtempSync(path.join(tmpdir(), 'dsh-offline-probe-'));
   try {
     // 1. 造假宿主
@@ -116,7 +119,9 @@ export function runOfflineProbe(options) {
     let stdout = '';
     let resultFd = '';
     let exit = { status: 0, signal: null };
-    const probeOptions = probeSpawnOptions({ hubRoot: ROOT, pluginPath, expectedTools, timeoutMs, nonce });
+    // killSignal 仅用于**反向反证**（[17]）：传 'SIGTERM' 复现「超时被探针处理器吞掉 ⇒ 无界」；
+    // 不传即生产口径（probeSpawnOptions 的默认值 = CHILD_KILL_SIGNAL，唯一事实源）。
+    const probeOptions = probeSpawnOptions({ hubRoot: ROOT, pluginPath, expectedTools, timeoutMs, nonce, ...(killSignal ? { killSignal } : {}) });
     const probeRun = spawnSync('node', probeOptions.args, {
       ...probeOptions,
       cwd: work,
@@ -136,6 +141,7 @@ export function runOfflineProbe(options) {
       install: 'fake-host', cacheHit: false, durationMs: 0,
     };
     result.probeExit = exit;
+    result.durationMs = Date.now() - startedAt;
     interpretProbeStdout(result, stdout, { resultFd, nonce: nonce.value });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');

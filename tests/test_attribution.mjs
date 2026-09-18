@@ -1470,6 +1470,63 @@ console.log('  [12] 🔴-5 命名口径对齐（check 名单一事实源 + 跨�
     PLUGIN_SIDE_CHECKS.filter((n) => !CONDITIONAL_PROBE_CHECKS.includes(n))), JSON.stringify(PLUGIN_SKIP_ON_PRECONDITION));
 }
 
+// ---- 14. 信任边界**显式前提**（🟡-4 / 总师 §3-Q2）+ 结构性重做一页方案 ----
+// 为什么单列（评审 🟡-4 / 总师 §3-Q2）：同进程 + 共用输出面下，插件可伪造 marker / 摘防线 /
+// 抢先 exit ⇒ 探针结论**不可信**。这不是探针 bug，而是**架构前提**（「插件为可信代码」）被打破。
+// 总师要求：① 写进 RISKS（HIGH）；② 对外主张（README/ARCHITECTURE/GUIDE）**同步加限定词**，
+// 不得宣称「报告可信」而不带此前提；③ 结构性重做**先出一页方案**再动手。
+console.log('  [14] 信任边界显式前提 + 结构性重做一页方案');
+{
+  const risks = readText(path.join(ROOT, 'docs/RISKS.md'), 'utf8');
+  const r26 = risks.split('\n').find((line) => /^\|\s*R26\s*\|/.test(line)) ?? '';
+  eq('R26 已登记且等级 = HIGH（放行级：伪造 marker → ok=true 放行）', true, r26.length > 0 && /\*\*HIGH/.test(r26));
+  eq('R26 显式声明「插件为可信代码」为前提（此前是隐式）', true, r26.includes('可信代码') && r26.includes('显式前提'));
+  eq('R26 给出根治方向（进程隔离 / 独立 fd 作真·带外通道）', true,
+    r26.includes('进程隔离') && r26.includes('独立 fd'));
+  eq('R26 点名三条形态（伪造 stdout / 改 hostFatal / 自杀）', true,
+    r26.includes('stdout') && r26.includes('hostFatal') && r26.includes('SIGKILL'));
+
+  // 对外主张必须带限定词：显式前提 + 「不是沙箱」+ 指向 R26 与重做方案
+  for (const file of ['README.md', 'docs/ARCHITECTURE.md', 'docs/ADAPTER_GUIDE.md']) {
+    const text = readText(path.join(ROOT, file), 'utf8');
+    eq(`${file} 显式声明「插件为可信代码」前提`, true, text.includes('可信代码'));
+    eq(`${file} 声明「本中台是验收工具、不是沙箱」`, true, text.includes('不是沙箱') || text.includes('不是**沙箱**'));
+    eq(`${file} 指向风险行 R26 与结构性重做方案`, true, text.includes('R26') && text.includes('REDO-PROPOSAL'));
+  }
+  // 反向：不得出现**无限定**的「报告可信 / 归因可信」主张（历史教训：文档撒谎的代价 > 代码有洞）
+  for (const file of ['README.md', 'docs/ARCHITECTURE.md', 'docs/ADAPTER_GUIDE.md']) {
+    const text = readText(path.join(ROOT, file), 'utf8');
+    const offenders = text.split('\n').filter((line) => /报告可信|归因可信/.test(line)
+      && !/不得|前提|R26|推翻|不可信/.test(line));
+    eq(`${file} 无无限定的「报告可信 / 归因可信」主张`, JSON.stringify([]), JSON.stringify(offenders.map((l) => l.slice(0, 80))));
+  }
+
+  // 结构性重做一页方案必须存在且内容齐备（总师 §3-Q1 / §5-2：先出一页方案再动手）
+  const redo = readText(path.join(ROOT, 'docs/REDO-PROPOSAL.md'), 'utf8');
+  eq('重做方案声明「只出方案、不动代码」', true, redo.includes('只出方案') && redo.includes('不动代码'));
+  eq('重做方案含候选 A：独立 fd 作真·带外通道', true, redo.includes('独立 fd'));
+  eq('重做方案含候选 B：进程隔离', true, redo.includes('进程隔离'));
+  eq('重做方案落地 nonce 前置项（一次性凭据 + 唯一性校验）', true, redo.includes('nonce') && redo.includes('randomUUID'));
+  eq('重做方案给出决策矩阵与推荐', true, redo.includes('决策矩阵') && redo.includes('推荐'));
+  eq('重做方案划清非目标（不做安全沙箱 / 不改插件可见行为）', true, redo.includes('非目标'));
+  eq('重做方案留待总师裁定项（不自行拍板范围）', true, redo.includes('待总师裁定'));
+  eq('重做方案给出回滚路径（fd 不可用 → 显式降级，不静默）', true, redo.includes('回滚') && redo.includes('降级'));
+
+  // 唯一事实源守卫：R24 的终止信号必须来自 host.mjs 常量（probeSpawnOptions + npm 共用一份）
+  const hostSrc = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
+  const hostCode = codeOnly(hostSrc);
+  eq('R24：host.mjs 导出 CHILD_KILL_SIGNAL = SIGKILL（唯一事实源）', true,
+    /CHILD_KILL_SIGNAL = .SIGKILL./.test(hostSrc));
+  eq('R24：probeSpawnOptions 的 killSignal 默认取 CHILD_KILL_SIGNAL（回退成字面量 SIGTERM 即红）', true,
+    /killSignal = CHILD_KILL_SIGNAL/.test(hostCode));
+  eq('R24：npm 安装子进程同样用 CHILD_KILL_SIGNAL（同族加固，不得无界挂起）', true,
+    /execFileSync\( S , \[[\s\S]{0,500}killSignal: CHILD_KILL_SIGNAL/.test(hostCode));
+  eq('R24：离线回归台**镜像**生产路径的 spawn 参数（不自造一套）', true,
+    /probeSpawnOptions\(/.test(readText(path.join(ROOT, 'tests/offline-probe-harness.mjs'), 'utf8')));
+  eq('R24：有界占死夹具存在（供反向反证：SIGTERM 下超时形同虚设）', true,
+    /BUSY_MS/.test(readText(path.join(ROOT, 'tests/fixtures/plugin-busy-loop-hang-plugin.mjs'), 'utf8')));
+}
+
 console.log();
 console.log(`▶ 归因与契约采集离线回归结果：PASS=${pass} FAIL=${fail}`);
 process.exit(fail === 0 ? 0 : 1);
