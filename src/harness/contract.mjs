@@ -151,6 +151,17 @@ export const RESULT_CHANNEL_FD3 = 'fd3';
 export const RESULT_CHANNEL_STDOUT_DEGRADED = 'stdout-degraded';
 
 /**
+ * **被重定向**形态（🔴-R3）：宿主侧观测到的「探针的结果通道被插件换掉」。
+ *
+ * ⚠️ 与 {@link RESULT_CHANNEL_FD3} 的关键区别：`fd3` 是**探针自报**的（它写 fd3 成功），
+ * 本值是**装配器按宿主侧观测**得出的结论（宿主给的 pipe 为空 + stdout 出现匹配 nonce 的结果行）
+ * ——探针对自己被重定向一无所知，故不得把它当作探针自报值使用。
+ *
+ * 用途：报告与二级信息里**显式可见**（排障时一眼看出「不是环境降级，是通道被换掉了」）。
+ */
+export const RESULT_CHANNEL_FD3_REDIRECTED = 'fd3-redirected';
+
+/**
  * 生成一次运行的随机 nonce。
  *
  * @param {() => Buffer} randomBytes `node:crypto` 的 `randomBytes`（注入以便离线单测）

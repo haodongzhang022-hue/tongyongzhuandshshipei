@@ -21,6 +21,7 @@ import {
   PLUGIN_PROTOCOL_INJECTION_CHECK,
   PROBE_NONCE_STDIN_CHANNEL,
   RESULT_CHANNEL_FD3,
+  RESULT_CHANNEL_FD3_REDIRECTED,
   RESULT_CHANNEL_STDOUT_DEGRADED,
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
@@ -289,8 +290,14 @@ export function runHostProbe(options) {
 
     let stdout = '';
     let resultFd = '';
+    // 宿主侧对结果通道的**观测**（不是探针自报）：本次运行是否真的把 fd3 作为管道给了探针。
+    // 🔴-R3 的交叉校验要它——「报告自称降级」只有在「宿主根本没给 fd3」时才可信；
+    // 宿主给了 pipe 却说降级 ⇒ 与宿主侧观测矛盾（详见 `interpretProbeStdout()` 的说明）。
+    // 取值来自唯一事实源 `probeSpawnOptions().stdio`（生产路径恒为 `['pipe','pipe','inherit','pipe']`）。
+    let resultChannelProvided = false;
     try {
       const probeOptions = probeSpawnOptions({ hubRoot, pluginPath, expectedTools, timeoutMs, nonce });
+      resultChannelProvided = probeOptions.stdio?.[3] === 'pipe';
       const probeRun = spawnSync('node', probeOptions.args, { ...probeOptions, cwd: workDir });
       stdout = `${probeRun.stdout ?? ''}`;
       resultFd = `${probeRun.output?.[3] ?? ''}`;
@@ -314,13 +321,15 @@ export function runHostProbe(options) {
       result.errors.push(`探针非零退出（status=${error.status ?? 'null'}${error.signal ? `, signal=${error.signal}` : ''}）`);
     }
 
-    // 🔴-R3：把**宿主侧实测**的 fd3 能力一并交给解释器——通道形态的判据不得只信探针自报
-    // （自报字段由被审查方提供：探针与插件同进程）。
+    // 🔴-R3：把**宿主侧观测**（本次运行是否真给了 fd3 管道）+ **宿主侧实测**的 fd3 能力
+    // 一并交给解释器——通道形态的判据**不得只信探针自报**（自报字段由被审查方提供：同进程）。
     interpretProbeStdout(result, stdout, {
       resultFd,
       nonce: nonce.value,
-      fd3Usable: probeFd3Capability(),
       // 生产路径恒给 fd3（`probeSpawnOptions()` 的 `stdio[3] = 'pipe'`）⇒ 探针自报「降级」= 矛盾。
+      resultChannelProvided,
+      // 环境能力独立实测（另起极小子进程写 fd3）：`true/false/null`（null ⇒ 判据不启用）。
+      fd3Usable: probeFd3Capability(),
       fd3Provided: true,
     });
     return result;
@@ -441,8 +450,14 @@ export function collectProbeResultLines(text) {
  *
  * @param {object} result 装配器结果对象（就地写入）
  * @param {string} stdout 探针 stdout（**只应含日志**；出现结果行即篡改证据）
- * @param {string|{resultFd?:string, nonce?:string|null}} [channelOrOptions] 结果通道（fd3 文本）
- *   或选项对象 `{ resultFd, nonce }`；两种写法都支持（旧 2 参调用与 3 参字符串调用行为不变）
+ * @param {string|{resultFd?:string, nonce?:string|null, resultChannelProvided?:boolean}} [channelOrOptions]
+ *   结果通道（fd3 文本）或选项对象 `{ resultFd, nonce, resultChannelProvided }`；
+ *   两种写法都支持（旧 2 参调用与 3 参字符串调用行为不变）。
+ *   `resultChannelProvided` = **宿主侧观测**：本次运行是否真的把 fd3 作为管道交给了探针
+ *   （生产路径取自 `probeSpawnOptions().stdio[3] === 'pipe'`）。🔴-R3 的交叉校验要用它：
+ *   「报告自称降级 / 通道为空」只有在「宿主**没**给 fd3」时才可信；宿主给了 pipe 却是空的
+ *   ⇒ 与宿主侧观测矛盾 ⇒ 通道被插件换掉了。不传（老调用 / 合成输入）时退化为「只信探针自报」
+ *   的历史行为，并**不**据此判篡改（保守，不制造假红）。
  * @returns {object} 同一个 result（便于链式使用）
  */
 export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
@@ -465,9 +480,9 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   // - **凭据有效**的（正文与标签相符）= 像探针写的（进通道/条数结构判定）；
   // - **无效**（裸 marker / 标签不符）= **冒用探针输出协议** ⇒ 伪造证据（{@link PLUGIN_PROBE_FORGED_RESULT_CHECK}）。
   //
-  // 凭据（v0.2.5 起，🔴-R3′ 4.2）= 逐行**认证标签** `HMAC(nonce, 正文)`，**不是**回显 nonce 的前缀。
-  // 为什么改：插件可把 fd3 换成自己的文件 ⇒ 探针把**带 nonce 的真报告**写进插件文件 ⇒
-  // 插件读出 nonce 即可伪造（旧实现判 GREEN 放行）。正文绑定的标签**不可迁移**：
+  // 凭据（v0.2.7 / 🔴-R3′ 4.2）= 逐行**认证标签** `HMAC(nonce, 正文)`，**不是**回显 nonce 的前缀。
+  // 为什么改：通道重定向形态下插件可把 fd3 换成自己的文件 ⇒ 探针把**带凭据的真报告**写进插件
+  // 文件 ⇒ 插件读出凭据即可伪造（旧实现判 GREEN 放行）。正文绑定的标签**不可迁移**：
   // 读到真报告只得到**真正文**的标签，伪造正文需要 nonce（插件没有）⇒ 伪造行验不过。
   const credentialOf = (line) => {
     if (!nonce) return { ok: true, body: line.slice(PROBE_RESULT_MARKER.length) };
@@ -499,35 +514,36 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   if (isolated && matchingOnStdout.length > 0) {
     injectionEvidence.push(`结果走独立通道，但 stdout 里也出现 ${matchingOnStdout.length} 条结果行（探针只写结果通道）`);
   }
-  // ---- 🔴-R3′（评审复评）：**宿主侧通道观测**交叉校验 ----
-  // 形态（本仓夹具 `plugin-channel-redirect-plugin`，真宿主实测）：插件 `closeSync(3)` 后
-  // `openSync(<file>)` ⇒ **fd3 被换成普通文件**（探针 `writeSync(3, …)` 照旧"写成功"，
-  // 宿主侧管道读端只见 EOF ⇒ `channelText` 为空）；探针收尾的真报告落进那个文件，
-  // 插件在 `exit` 钩子里读回它（**连 nonce 前缀一起拿到**，不必反读 env / argv），
-  // 再把全绿卡写进 **stdout**，并把 `process.exitCode` 压回 0。
-  // ⇒ 旧实现下三条防线全失效：`isolated=false` ⇒ 回退信任 stdout（伪造行成为唯一 marker）、
-  // 退出码被压成 0 ⇒ 退出码交叉不命中 ⇒ **GREEN 放行**（真缺陷被绿卡掩盖）。
+  // ---- 🔴-R3 / 🔴-R3′：通道**重定向**的交叉校验（**宿主侧观测** vs 报告自称，矛盾即篡改） ----
+  // 形态（评审复评 🔴-R3 / 🔴-R3′ 实测，放行级假绿）：插件 `closeSync(3)` + `openSync(<file>)`
+  // 把 fd3 换成**普通文件**（探针 `writeSync(3, …)` 照旧「写成功」⇒ 自报 `fd3`，对重定向一无所知；
+  // 宿主侧管道读端只见 EOF ⇒ `channelText` 为空 ⇒ `isolated=false` ⇒ 装配器**回落信任 stdout**）；
+  // 探针收尾把**真报告**写进那个文件 ⇒ 插件在 `exit` 钩子里读回它（**连 nonce 前缀一起拿到**，
+  // 不必反读 env / argv）⇒ 把绿卡写进 stdout，并 `process.exitCode = 0` 压掉退出码交叉
+  // ⇒ 旧实现下 **GREEN / PASS 放行**（真缺陷被绿卡掩盖）。
+  // 四条既有防线全失效：① nonce（探针自己把凭据写给了插件）；② 通道隔离（fd3 空 ⇒ 回落 stdout）；
+  // ③ `resultChannel`（写成功 ⇒ 自报 fd3）；④ 降级不放行（只对自报 `stdout-degraded` 生效）；
+  // ⑤ 退出码交叉（退出码与报告同属探针进程的可写状态 ⇒ 被 `process.exitCode = 0` 压掉）。
   //
-  // 判据（**两条触发路径**，见下方 `channelRedirectEvidence`）：报告**自称**走 fd3（或 stdout 上
-  // 的结果行**无一条凭据有效**）而**宿主侧该通道无任何内容**、stdout 却有结果行 ⇒ 通道被重定向
-  // ⇒ 判篡改、**不采信任何一条**。
-  //
-  // 为什么这条腿插件压不掉（与退出码交叉的分工）：它**只依赖宿主侧对 fd3 的实际观测**
-  // （管道读端为空），既**不**依赖探针自报、也**不**依赖退出码——通道重定向发生在**探针进程内**，
-  // 插件改不动宿主进程看到的东西。于是防线从「报告 + 退出码」两条信道升级为
-  // 「报告 + 退出码 + **宿主侧通道观测**」三条。
-  // ⚠️ 边界（不越权承诺）：把伪造行写进 **fd3 本身**（= 探针来不及 emit 时占住真通道，自称与观测
-  // 一致）仍不可区分，属批 2（`docs/REDO-PROPOSAL.md`：独立 fd 且永不回退 stdout）。
-  // ---- 判据 D（🔴-R3′）：**通道重定向**（宿主侧 fd3 为空，结果行却出现在 stdout） ----
-  let channelRedirectEvidence = false;
-  // 报告**自称**的通道形态：从 stdout 上**任意**结果行做 best-effort 解析（**不要求凭据有效**）。
-  // 为什么不要求凭据有效（🔴-R3′ 4.2 的正文绑定标签）：插件用「从被重定向的真报告里偷到的**标签**」
-  // 伪造时，那行的凭据**本身无效**（标签只对真正文有效）⇒ 若只在凭据有效时取自称，本判据会
-  // **漏判** R3′ 最核心的形态。放宽是安全的：本判据的**硬证据**是「宿主侧实际从 fd3 读到空」
-  // （宿主侧观测，插件不可控）；「自称」只用来把「降级到 stdout」的合法形态排除掉。
-  // ⚠️ 仅在 `nonce` 存在（= 走真实带外协议）时启用：2 参 / 无 nonce 调用（老装配器、手工直跑）
-  // 的历史行为**不得**被改变（那些调用本就没有凭据可言）。
-  if (nonce) {
+  // 判据（**两条互相独立的证据链**，任一条成立即判；与「环境无 fd3 的**真**降级」天然可分，
+  // 后者自称 `stdout-degraded` 且宿主**没给** fd3，见下 §降级分支）：
+  //  - **主判据（宿主侧观测）**：宿主本次运行**确实**把 fd3 作为管道给了探针
+  //    （`resultChannelProvided`，取自唯一事实源 `probeSpawnOptions().stdio[3] === 'pipe'`），
+  //    而 fd3 上**一个字节都没有**、stdout 反而出现匹配 nonce 的结果行 ⇒ 内部矛盾：
+  //    探针的结果**只**写 fd3（写成功才自报 fd3；写不进会自报降级）⇒ 结果行不是探针写的。
+  //    ⚠️ 这条**只依赖宿主进程看到的东西**（管道读端为空），既不依赖探针自报、也不依赖退出码
+  //    ⇒ 插件从探针进程内**压不掉**（防线因此从「报告 + 退出码」升级为「报告 + 退出码 + 宿主侧通道观测」）。
+  //  - **辅判据（报告自称）**：报告自称 `fd3` 却 fd3 无内容、stdout 有匹配行（评审给的最小判据）；
+  //    老装配器 / 合成输入不传 `resultChannelProvided` 时由它兜住。
+  // 「报告**自称**降级」（🔴-R3 §三）在这条支路上也要能识别：伪造报告把 `resultChannel` 标成
+  // `stdout-degraded`（=「本环境没有 fd3」）时，报告层必须点明「自报与事实矛盾」，否则人会把
+  // 「插件篡改通道」读成「环境限制」（收口前实测：AMBER / UPSTREAM_DRIFT，甩锅上游）。
+  let claimedDegrade = false;
+  {
+    const channelProvidedByHost = options.resultChannelProvided === true;
+    // 报告**自称**的通道形态：从 stdout 上**任意**结果行做 best-effort 解析（**不要求凭据有效**）。
+    // 为什么不要求凭据有效（🔴-R3′ 4.2 的正文绑定标签）：插件用「从被重定向的真报告里偷到的**标签**」
+    // 伪造时，那行的凭据**本身无效**（标签只对真正文有效）⇒ 若只在凭据有效时取自称，会**漏判**。
     let claimedChannel = null;
     for (const line of stdoutMarkers) {
       try {
@@ -538,29 +554,31 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
         if (typeof parsed?.resultChannel === 'string') { claimedChannel = parsed.resultChannel; break; }
       } catch { /* 畸形行：继续找下一条 */ }
     }
-    // 判据 D（通道重定向）的**两条触发路径**（都是「宿主侧观测」与「凭据有效性」的**结构**判定）：
-    // a) **无一条 stdout 结果行凭据有效**（`matchingOnStdout.length === 0`）：探针的结果行只写
-    //    fd3，凭据无效的行只能是插件自造（含「偷到真报告标签后换正文」——标签**不可迁移**）。
-    // b) 报告**自称**走 fd3（`claimedChannel === 'fd3'`）而宿主侧 fd3 为空：自报与宿主侧观测矛盾。
-    // ⚠️ 为什么 (a) 必须与 (b) 并列（🔴-R3′ 4.2 的正文绑定标签）：插件偷到标签后伪造时，
-    //    **行本身凭据无效**、且它可自称 `stdout-degraded` 来绕开 (b) ⇒ 只留 (b) 会**漏判**。
-    // 合法降级**不会**被误伤：真降级时探针自己把报告写进 stdout ⇒ 那行**凭据有效**
-    // ⇒ (a) 不成立；且其自报是 `stdout-degraded` ⇒ (b) 不成立。
-    channelRedirectEvidence = !isolated && stdoutMarkers.length > 0
-      && (matchingOnStdout.length === 0 || claimedChannel === RESULT_CHANNEL_FD3);
-    // 把「报告**自称**的通道形态」先落进 result：协议注入路径会在下面**提前 return**（此时
-    // `payload` 还没解析），若不留这一手，报告层就看不到「自称降级」这件事 ⇒ 二级信息里
-    // 「降级有两种相反成因」的分支永远走不到（人会把插件篡改读成环境限制）。
-    // 正常路径随后用 `payload.resultChannel` **覆盖**同值，故不影响既有语义。
-    if (claimedChannel !== null) {
-      result.resultChannel = claimedChannel;
-      result.resultChannelDegraded = claimedChannel === RESULT_CHANNEL_STDOUT_DEGRADED;
-    }
-    if (channelRedirectEvidence) {
-      injectionEvidence.push(`宿主侧结果通道（${RESULT_CHANNEL_FD3}）无任何内容，而 stdout 出现 ${stdoutMarkers.length} 条结果行（通道被重定向：探针的真报告被写进了插件替换的文件；其中凭据有效 ${matchingOnStdout.length} 条 / 报告自称 ${claimedChannel ?? '（无）'}）`);
+    claimedDegrade = claimedChannel === RESULT_CHANNEL_STDOUT_DEGRADED;
+    // ⚠️ stdout 侧条件用 `stdoutMarkers.length > 0`（**任何**结果行），而不是
+    // `matchingOnStdout.length > 0`（凭据有效的行）：偷到标签后换正文的伪造行**凭据无效**，
+    // 若按「凭据有效」判会**漏判**（🔴-R3′ 4.2）。放宽仍保守：健康路径下 stdout **零**结果行。
+    // 另一条独立路径：stdout 上有结果行却**无一条凭据有效** ⇒ 只能来自插件（标签不可迁移）。
+    const noValidCredentialOnStdout = !isolated && stdoutMarkers.length > 0 && matchingOnStdout.length === 0;
+    // 单一命名布尔（便于变异自证 / 源码守卫锚定；改名即红）。
+    const redirectEvidence = !isolated && stdoutMarkers.length > 0
+      && (channelProvidedByHost || claimedChannel === RESULT_CHANNEL_FD3 || noValidCredentialOnStdout);
+    if (redirectEvidence) {
+      injectionEvidence.push(
+        `结果通道被**重定向**（宿主已把 fd3 作为管道交给探针，fd3 却为空；stdout 上出现 ${stdoutMarkers.length} 条结果行、其中凭据有效 ${matchingOnStdout.length} 条${claimedChannel === RESULT_CHANNEL_FD3 ? '，且报告自称走 fd3' : ''}${claimedDegrade ? '，且报告自称降级（`stdout-degraded`）' : ''}）——探针写进的是插件的文件，本轮结果不可信`,
+      );
     }
   }
-  if (injectionEvidence.length > 0) return markProtocolInjection(result, injectionEvidence);
+  // 单一落点（`markProtocolInjection`）+ 通道形态**可见化**（🔴-R3 并集）：
+  // 这一支里报告整体不可信，故不复用被篡改的 payload 字段，只把「被重定向」这一事实记下来
+  // （`fd3-redirected` 非探针自报值，是宿主侧观测结论）；`resultChannelDegraded` 显式置假——
+  // 本形态**不是**环境降级（降级是「宿主没给 fd3」），而是「宿主给了 fd3、却被插件换掉」。
+  if (injectionEvidence.length > 0) {
+    return markProtocolInjection(result, injectionEvidence, {
+      resultChannel: RESULT_CHANNEL_FD3_REDIRECTED,
+      ...(claimedDegrade ? { degradeClaimed: true } : {}),
+    });
+  }
   // nonce 不匹配 ⇒ 伪造证据（**先收集**，解析出报告后再落 check——否则会被 `result.checks = payload.checks` 覆盖）。
   const forgedEvidence = forgedMarkers.length > 0
     ? {
@@ -674,15 +692,33 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
     // - 早探测即失败 ⇒ **环境**本身没有 fd3（容器 / Windows / 直接跑探针）⇒ 宿主/环境侧信号，
     //   落 `hostFatal[]` ⇒ `UPSTREAM_DRIFT`（AMBER，人须确认）——**不是**通过。
     const closedByPlugin = result.resultChannelAtStart === RESULT_CHANNEL_FD3;
-    if (closedByPlugin) {
-      if (!result.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK)) {
-        result.checks.push({
-          name: PLUGIN_PROTOCOL_INJECTION_CHECK,
-          status: 'fail',
-          detail: '结果通道 fd3 在插件代码运行期间变为不可写（早探测可写、收尾不可写）——插件关闭/替换了探针的结果通道，本轮结果不可信',
-        });
-      }
-      result.errors.push(`${PLUGIN_PROTOCOL_INJECTION_CHECK}: 结果通道被插件关闭/替换（早探测可写 → 收尾不可写）`);
+    // 🔴-R3 §三（**同源**形态）：自报 `stdout-degraded` 同样可被利用——探针的**自报**是唯一依据时，
+    // 插件只要把伪造报告标成降级，就能把「通道被自己关掉」讲成「环境没有 fd3」⇒ 甩锅上游
+    // （实测 `AMBER / UPSTREAM_DRIFT`）。故**真实降级必须由宿主侧观测到「fd3 不可用」**：
+    // 宿主本次运行**确实**把 fd3 作为管道给了探针（`resultChannelProvided`，取自唯一事实源
+    // `probeSpawnOptions().stdio`）却收到「写不进 fd3」的自报 ⇒ 与宿主侧观测**矛盾** ⇒ 插件侧篡改。
+    const channelProvidedByHost = options.resultChannelProvided === true;
+    const channelTampered = closedByPlugin || channelProvidedByHost;
+    if (channelTampered) {
+      // 结构性矛盾 ⇒ 报告整体不可信（与上面「重定向」分支同一取向）：**不采信任何一条**，
+      // 只留篡改证据。否则插件伪造的 17 项全 pass 会与篡改证据并列出现，报告自相矛盾。
+      // 证据里**带上探针的自报字段**（排障用）：宿主侧观测与自报的矛盾点要能一眼看见
+      // （`resultChannelAtStart` 缺失 = 报告被整体改写；`= fd3` = 通道在插件代码运行期间被关掉）。
+      const selfReport = `（探针自报：resultChannel=${reportedChannel ?? 'null'} / resultChannelAtStart=${result.resultChannelAtStart ?? 'null'}）`;
+      const evidence = channelProvidedByHost && !closedByPlugin
+        ? `宿主本次运行**已把 fd3 作为管道**给探针，探针却自报 fd3 不可写（自报与宿主侧观测矛盾）——通道是在插件代码运行期间被关闭/替换的，本轮结果不可信${selfReport}`
+        : `结果通道 fd3 在插件代码运行期间变为不可写（早探测可写、收尾不可写）——插件关闭/替换了探针的结果通道，本轮结果不可信${selfReport}`;
+      result.checks = [{
+        name: PLUGIN_PROTOCOL_INJECTION_CHECK,
+        status: 'fail',
+        detail: evidence,
+      }];
+      result.runCompleted = false;
+      result.hostFatal = [];
+      result.resultChannel = RESULT_CHANNEL_FD3_REDIRECTED;
+      // 同 §二：这不是环境降级，而是通道被插件接管 ⇒ 降级标记置假（归因不同，不得混为一谈）。
+      result.resultChannelDegraded = false;
+      result.errors = [`${PLUGIN_PROTOCOL_INJECTION_CHECK}: 结果通道被插件关闭/替换（${closedByPlugin ? '早探测可写 → 收尾不可写' : '宿主已提供 fd3 管道，探针却自报不可写'}）`];
     } else if (!result.errors.some((line) => String(line).includes(RESULT_CHANNEL_STDOUT_DEGRADED))) {
       pushHostFatal(result, `结果通道 fd3 在本环境不可用（早探测即失败）⇒ 结构化结果降级走 stdout（${RESULT_CHANNEL_STDOUT_DEGRADED}）：stdout 上的结果行不再具备篡改证据能力，本轮结论不可信（不放行，人须确认）`);
     }
@@ -700,7 +736,17 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
     return markProtocolInjection(result, [
       '报告自称结果通道**降级**（`stdout-degraded`，即「本环境没有 fd3」），但宿主侧 fd3 能力**实测可用**',
       '⇒ 降级不是环境限制，而是通道在插件代码运行期间被关闭/替换（自报与宿主侧实测矛盾）',
-    ]);
+    ], { resultChannel: RESULT_CHANNEL_FD3_REDIRECTED, degradeClaimed: true });
+  }
+  // ---- 🔴-R3（并集）：**宿主侧观测**（本次运行是否真给了 fd3 管道）与自报降级的矛盾 ----
+  // 与上一条（fd3 **能力**实测）**互相独立**：上一条答「本环境能不能用 fd3」，本条答
+  // 「**这次 spawn** 宿主有没有给 fd3」——两者都不读探针自报，任一成立即判篡改。
+  // 老调用 / 合成输入不传 `resultChannelProvided` 时本条不启用（保守，不制造假红）。
+  if (result.resultChannelDegraded && options.resultChannelProvided === true) {
+    return markProtocolInjection(result, [
+      '宿主本次运行**已把 fd3 作为管道**交给探针，报告却自称结果通道降级（`stdout-degraded`）',
+      '⇒ 自报与宿主侧观测矛盾 ⇒ 通道是在插件代码运行期间被关闭/替换的，本轮结果不可信',
+    ], { resultChannel: RESULT_CHANNEL_FD3_REDIRECTED, degradeClaimed: true });
   }
   // 完成位 + **降级** + **退出码交叉**：任一不满足即不得判 PASS（假绿比 AMBER 更危险）。
   // 退出码交叉（🔴 必修-4）把矛盾写进 errors[]（见上），故这里的 errors.length 检查已覆盖它。
@@ -717,9 +763,14 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
  *
  * @param {object} result 装配器结果对象（就地写入）
  * @param {string[]} evidence 人读证据（进 check.detail 与 errors 日志）
+ * @param {{resultChannel?: string, degradeClaimed?: boolean}} [options] 可选的**通道形态可见值**（🔴-R3）：
+ *   传 {@link RESULT_CHANNEL_FD3_REDIRECTED} 时报告与二级信息里看得见「不是环境降级，是通道被换掉」
+ *   （并**显式置假** `resultChannelDegraded`——降级 = 宿主没给 fd3，两者归因不同）；
+ *   传 `degradeClaimed: true` 时额外记「报告**自称**降级」这一成因（报告层据此把
+ *   「自报与事实矛盾」与「真环境限制」分开说，见 `report/secondary.mjs`）。
  * @returns {object} 同一个 result
  */
-function markProtocolInjection(result, evidence) {
+function markProtocolInjection(result, evidence, options = {}) {
   result.runCompleted = false;
   result.checks = [];
   result.errors = [];
@@ -732,6 +783,12 @@ function markProtocolInjection(result, evidence) {
   result.errors.push(`${PLUGIN_PROTOCOL_INJECTION_CHECK}: 结果通道被插件篡改（${evidence.join('；')}）`);
   // 末位兼容（契约要求）：多 marker 时**先判篡改**，不再用 `find(first)` 采信任何一条。
   result.phase = PROBE_PHASE.PLUGIN_INTEGRATION;
+  if (typeof options.resultChannel === 'string') {
+    result.resultChannel = options.resultChannel;
+    result.resultChannelDegraded = false;
+  }
+  // 「报告**自称**降级」这一成因（🔴-R3 §三）：报告层据此把「自报与事实矛盾」与「真环境限制」分开说。
+  if (options.degradeClaimed === true) result.resultChannelDegradeClaimed = true;
   result.ok = false;
   return result;
 }

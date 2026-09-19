@@ -314,6 +314,9 @@ captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收�
 | 加载期捕获引用（🔴 必修-4，v0.2.3） | 探针在**模块加载期**捕获 `JSON.stringify` 引用（`const STRINGIFY = JSON.stringify`）且**只用**捕获值 ⇒ 插件在 `apply()` 里猴子补丁 `JSON.stringify` **不被探针采用**（实测：`plugin-stringify-tamper-plugin` 由「绿卡被采信」变为「真缺陷照常判出」） |
 | 退出码交叉（🔴 必修-4，v0.2.3） | 装配器无条件记录探针退出实况；**报告自称 `ok=true` 而退出码非 0**（或带终止信号）⇒ 内部矛盾 ⇒ 判插件侧 `plugin.exit_code_mismatch`、不放行。两个独立产物（退出码不经序列化 / 报告字节可被替换）互相矛盾即证据 |
 | 宿主侧通道观测（🔴-R3′，v0.2.5） | 报告**自称**走 `fd3`（`resultChannel === 'fd3'`）而**宿主侧该通道无任何内容**、stdout 反而出现**匹配 nonce** 的结果行 ⇒ 通道被**重定向**（插件把 fd3 换成文件、从真报告里抄 nonce 前缀）⇒ 判 `plugin.protocol_injection`、**不采信任何一条**。⚠️ 本判据**只依赖宿主进程看到的东西**（管道读端为空）⇒ 插件压不掉（退出码交叉只能把门槛抬一层：压 `process.exitCode` 即可绕过）|
+| **宿主侧观测主判据**（🔴-R3，v0.2.6） | 与上一条是**同一根因的两条独立证据链**：宿主本次运行**确实**把 fd3 作为管道给了探针（`resultChannelProvided`，取自唯一事实源 `probeSpawnOptions().stdio[3] === 'pipe'`）而 fd3 为空、stdout 出现匹配 nonce 的结果行 ⇒ 判本项。**不依赖探针自报**（自报可被插件连报告一起改掉）⇒ 覆盖「报告被整体改写 / 无 `resultChannel` 字段」的形态 |
+| **降级分支的宿主侧观测**（🔴-R3 §三，v0.2.6） | **真实降级必须由宿主侧观测确认**：宿主已给 fd3 管道、报告却自报 `stdout-degraded`（写不进 fd3）⇒ 自报与宿主侧观测**矛盾** ⇒ 判本项。收口前该形态实测 **`AMBER` / `UPSTREAM_DRIFT`（甩锅上游）** |
+| 通道形态可见值 `fd3-redirected` | **宿主侧观测结论**（非探针自报）：二级信息里独立成一条 **HIGH** 风险 + `resultChannelRedirected` 字段 + Markdown 标注。与「降级」显式分开：**降级 = 宿主没给 fd3**（环境限制、归因上游）；**重定向 = 宿主给了 fd3 却被插件换掉**（归因插件） |
 | 残留边界 | 同进程同 uid 下，**恶意**插件仍可篡改**其它**全局 / 直接读探针内存 / **同时**改退出码（`process.exitCode`）后伪造——`JSON.stringify` 这一形态已由上面的「加载期捕获 + 退出码交叉」收口（R29），但**逐点补不可穷尽**；nonce **不经** env / argv 下发（那两条读取面已实测收窄）。根治需**进程隔离**（结构性重做，**批 2 已立项在办**，见 R29）——本项**不越权承诺**。一页方案见 [`docs/REDO-PROPOSAL.md`](REDO-PROPOSAL.md) |
 
 > 结论（给接入方）：**不要**在 `apply()` 里往 stdout 写探针协议行（`__DSH_PROBE__` / `__DSH_PROBE_PHASE__`）。

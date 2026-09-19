@@ -27,6 +27,7 @@
 # | `plugin-exit-hook-tamper-plugin` | **批 1.5 第 8 项**：只摘出口③ 的 `exit` 钩子（其余健康） | `plugin.process_defense_tampered` | true |
 # | `plugin-stringify-tamper-plugin` | 🔴 必修-4：猴子补丁 `JSON.stringify` 伪造绿卡（同族：同进程 + 共用输出面） | `registry.exact` | true |
 # | `plugin-channel-redirect-plugin` | 🔴-R3′：**结果通道重定向**（fd3 → 文件）+ 压 `process.exitCode`（宿主侧通道观测交叉校验） | `plugin.protocol_injection` | **false** |
+# | `plugin-channel-degrade-forge-plugin` | 🔴-R3 §三：**自报降级**甩锅上游（宿主给了 fd3 却自报不可写 ⇒ 矛盾） | `plugin.protocol_injection` | **false** |
 # | `plugin-sync-loop-plugin` | R24：`apply()` 内同步死循环（宿主二次终止） | `plugin.abnormal_termination` | **false** |
 # | `demo-plugin`（健康） | —— | 无（必须 GREEN 17/17） | true |
 #
@@ -138,6 +139,12 @@ NEGATIVE_CASES=(
   # （猴子补丁 / 读内存）⇒ **不得**写「真宿主不可达」（那是把未验证的命题写成对外口径，见 R26）。
   # 故本项在真宿主侧由上面两份夹具（侧信道 / §3 反例）覆盖，结构级形态由离线 [9.11f]
   # 用**可证伪**的正反两条断言覆盖（构造输入→必须命中；去掉 nonce→必须不命中）。
+  # 🔴-R3 §三（**同源**活口的另一个出口，判据走**降级分支**）：同一手法把伪造报告标成
+  # `stdout-degraded` + 删掉早探测快照（`resultChannelAtStart`）+ 伪造 `hostFatal[]`
+  # ⇒ 收口前实测 **AMBER / UPSTREAM_DRIFT**（把「插件关掉通道」讲成「环境没有 fd3」，**甩锅上游**）。
+  # 收口 = **真实降级必须由宿主侧观测确认**（宿主给了 fd3 管道却自报不可写 ⇒ 矛盾 ⇒ 判本项）。
+  # 与上面 `plugin-channel-redirect-plugin`（自称 fd3）是**同一根因的两个出口**、两条独立判据。
+  "plugin-channel-degrade-forge-plugin|plugin.protocol_injection|false|false|plugin.protocol_injection"
   # 🔴 必修-4（评审复评，与 🔴-3 **同族**）：插件**不改输出协议、不改通道**，而是猴子补丁
   # `JSON.stringify` —— 探针若在写出报告时才取全局，报告字节就被插件决定（一张完美绿卡，
   # nonce 前缀照样匹配）。收口 = 探针**加载期捕获引用** + 装配器**退出码交叉**（两道并集）。
