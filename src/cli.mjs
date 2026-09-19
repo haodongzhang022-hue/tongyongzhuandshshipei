@@ -212,7 +212,8 @@ function cmdVerify(args) {
 /**
  * 把地铁视图压成**可序列化摘要**（不含契约正文，避免报告膨胀）。
  *
- * 语义：每通道 = 一条线路；`origin` = 出发点，`stations` = 站点序列，`endedAt` = 末站。
+ * 语义：每通道 = 一条线路；`origin` = 出发点，`stations` = 站点序列（**指纹齐全**才算站），
+ * `terminal` = 取值来源（可能落在空壳快照上），`shallowStations` = 画不出站的半截快照。
  * `carried` 显式列出「末站之后无该线站点、当前基线仍在前向携带」的通道——这正是
  * 单轴 `composeChain()` **看不见**的偏差（未声明通道被静默携带）。
  *
@@ -225,8 +226,12 @@ function describeMetro(metro) {
   return {
     lines: Object.fromEntries(Object.entries(metro?.lines ?? {}).map(([channel, line]) => [channel, {
       origin: line.origin,
+      // 站点 = **指纹齐全**的显式声明（更严的注解面判据）；空壳快照见 shallowStations
       stations: line.stations.map((station) => station.periodKey),
       stationCount: line.stations.length,
+      shallowStations: line.shallowStations ?? [],
+      // 末站 = **取值来源**（可能落在空壳快照上）⇒ 与 perChannel 同源，不因画不出站而漂移
+      terminal: line.terminalPeriodKey ?? null,
       endedAt: line.endedAt ?? null,
       ended: line.ended === true,
     }])),
@@ -234,6 +239,8 @@ function describeMetro(metro) {
     perChannel: metro?.perChannel ?? {},
     carried: metro?.carried ?? {},
     endedLines: metro?.endedLines ?? [],
+    // 空壳快照通道（非空但无指纹字段）：画不出站，但**仍是取值来源** ⇒ 显式暴露
+    shallowChannels: Object.keys(metro?.shallowStations ?? {}),
   };
 }
 

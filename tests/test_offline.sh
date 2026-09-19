@@ -1036,7 +1036,7 @@ OUT="$("$NODE_BIN" --input-type=module -e "
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { segmentStore, settleSegment, resolveBaseline, composeChain, composeMetro, renderMetro, isUsableStation } from '$ROOT/src/watch/baseline.mjs';
+import { segmentStore, settleSegment, resolveBaseline, composeChain, composeMetro, renderMetro, isUsableStation, hasContractFingerprint } from '$ROOT/src/watch/baseline.mjs';
 const dir = mkdtempSync(path.join(tmpdir(), 'dsh-metro-'));
 const store = segmentStore({ hubRoot: dir });
 const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
@@ -1060,13 +1060,33 @@ console.log(JSON.stringify(Object.keys(metro.carried).sort()));
 console.log(metro.carried.legacy.from + '->' + metro.carried.legacy.to);
 // ⑤ 已停运线（末站不在链尾）
 console.log(JSON.stringify(metro.endedLines.slice().sort()));
-// ⑥ 🚇 与单轴取值**一致**（地铁视图是严格上位，不改取值语义）
-console.log(String(JSON.stringify(metro.contracts) === JSON.stringify(composeChain(store.list().map((k) => ({ periodKey:k, ...store.load(k) }))).contracts)));
-// ⑦ 空壳契约（无任何指纹字段）不算站点 ⇒ 不得凭空多站
-console.log(String(isUsableStation({})) + '|' + String(isUsableStation({ configProjection:'x' })));
+// ⑥ 🚇 与单轴取值**一致**（解耦：取值面与 composeChain 同口径）——**良好契约 + 畸形空壳都要比**
+const ordered = () => store.list().map((k) => ({ periodKey:k, ...store.load(k) }));
+console.log(String(JSON.stringify(composeMetro(ordered()).contracts) === JSON.stringify(composeChain(ordered()).contracts)));
+// ⑥b **分叉回归**（评审 critical）：畸形通道「非空但无指纹字段」+ 它**之前还有真实站点** ⇒
+//     地铁视图不得把该通道整个丢掉、也不得连带丢掉该线前面的真站（旧实现两处都错）
+const dirX = mkdtempSync(path.join(tmpdir(), 'dsh-metro-x-'));
+const sX = segmentStore({ hubRoot:dirX });
+settleSegment({ store:sX, key:'2026-05-01', run:{ at:'2026-05-01T01:10:00Z', orderAt:'2026-05-01T01:10:00Z', channels:[{channel:'legacy',ok:true,contract:C('L1')}] } });
+settleSegment({ store:sX, key:'2026-05-05', run:{ at:'2026-05-05T01:10:00Z', orderAt:'2026-05-05T01:10:00Z', channels:[{channel:'legacy',ok:true,contract:C('L2')}] } });
+// 手工注入「非空但无任何指纹字段」的畸形快照（模拟上游产出半截快照；这正是 R34 要暴露的场景）
+const seg = sX.load('2026-05-05');
+seg.baseline = { ...seg.baseline, legacy: { SHALLOW:{} } };
+sX.save('2026-05-05', { baseline: seg.baseline });
+const mX = resolveBaseline({ hubRoot:dirX }).metro;
+const cX = composeChain(sX.list().map((k) => ({ periodKey:k, ...sX.load(k) }))).contracts;
+console.log(String(JSON.stringify(mX.contracts) === JSON.stringify(cX)));
+console.log(JSON.stringify(mX.contracts.legacy));            // 空壳仍是取值
+console.log(String(mX.perChannel.legacy));                    // 取值来源仍指 05-05（不因画不出站而漂移）
+console.log(String(mX.lines.legacy.stations.length));         // 真站仍在（旧实现被 continue 连带丢掉）
+console.log(JSON.stringify(mX.lines.legacy.shallowStations)); // 空壳被显式注解（不隐身）
+// ⑦ 站点注解面判据：空壳不算站；**合法 null 值**（Object.hasOwn）算声明过
+console.log([String(isUsableStation({})), String(isUsableStation({ configProjection:'x' })), String(hasContractFingerprint({ configProjection:null }))].join('|'));
 // ⑧ 渲染面：线路图含出发点列 + 停运标记
 const md = renderMetro(metro);
 console.log(String(md.includes('出发点')) + '|' + String(md.includes('已停运')) + '|' + String(md.includes('前向携带')));
+const mdX = renderMetro(mX);
+console.log(String(mdX.includes('空壳快照')) + '|' + String(mdX.includes('仍参与取值')));
 // ⑨ 单一分片（只有出发点那期）⇒ 无停运、无携带
 const dir2 = mkdtempSync(path.join(tmpdir(), 'dsh-metro2-'));
 const s2 = segmentStore({ hubRoot:dir2 });
@@ -1083,10 +1103,16 @@ assert "🚇 末站：当前基线取值来源（dev=03-10 / stable=03-05 / lega
 assert "🚇 前向携带**显式化**：停运线被点名（单轴看不见）" '["legacy","stable"]' "$(echo "$OUT" | sed -n 4p)"
 assert "🚇 前向携带记 from→to（legacy 从 03-02 携带到 03-10）" '2026-03-02->2026-03-10' "$(echo "$OUT" | sed -n 5p)"
 assert "🚇 已停运线 = 末站不在链尾（legacy + stable）" '["legacy","stable"]' "$(echo "$OUT" | sed -n 6p)"
-assert "🚇 与单轴 composeChain **取值一致**（严格上位，不改取值语义）" "true" "$(echo "$OUT" | sed -n 7p)"
-assert "🚇 空壳契约（无指纹字段）不算站点（防凭空多站）" "false|true" "$(echo "$OUT" | sed -n 8p)"
-assert "🚇 渲染面：含出发点列 + 停运标记 + 前向携带告警" "true|true|true" "$(echo "$OUT" | sed -n 9p)"
-assert "🚇 单一分片 ⇒ 无停运、无携带（反证非恒真）" "[]|{}" "$(echo "$OUT" | sed -n 10p)"
+assert "🚇 与单轴 composeChain **取值逐键一致**（解耦：取值面同判据）" "true" "$(echo "$OUT" | sed -n 7p)"
+assert "🚇 **分叉回归**：畸形空壳通道不能被地铁视图丢掉（与链式取值一致）" "true" "$(echo "$OUT" | sed -n 8p)"
+assert "🚇 **分叉回归**：空壳仍是取值（不被 continue 掉）" '{"SHALLOW":{}}' "$(echo "$OUT" | sed -n 9p)"
+assert "🚇 **分叉回归**：取值来源仍指空壳分片（不因画不出站而漂移）" "2026-05-05" "$(echo "$OUT" | sed -n 10p)"
+assert "🚇 **分叉回归**：该线**前面的真站**不被连带丢掉（旧实现 continue 全丢）" "1" "$(echo "$OUT" | sed -n 11p)"
+assert "🚇 **分叉回归**：空壳快照被显式注解（不再隐身）" '["2026-05-05"]' "$(echo "$OUT" | sed -n 12p)"
+assert "🚇 站点注解判据：空壳不算站 / 有指纹算 / **合法 null 值算声明过**" "false|true|true" "$(echo "$OUT" | sed -n 13p)"
+assert "🚇 渲染面：含出发点列 + 停运标记 + 前向携带告警" "true|true|true" "$(echo "$OUT" | sed -n 14p)"
+assert "🚇 渲染面：空壳快照**可见**（画不出站但仍是取值来源）" "true|true" "$(echo "$OUT" | sed -n 15p)"
+assert "🚇 单一分片 ⇒ 无停运、无携带（反证非恒真）" "[]|{}" "$(echo "$OUT" | sed -n 16p)"
 
 # 守卫自证：确认这些断言不是恒真——① 把「站点=显式声明」改成「站点=一切出现过的通道」
 # （即单轴语义：未声明也顶一个站）⇒ 站点数必变；② 把 endedLines 判据改成恒空 ⇒ 第 6 行必变。
@@ -1103,9 +1129,23 @@ const m = composeMetro(segs);
 console.log(m.lines.legacy.stations.length === 1 ? 'explicit-only' : 'BROKEN');
 // ② 停运判据：必须点名 legacy（若判据恒空则这里为 BROKEN）
 console.log(m.endedLines.includes('legacy') ? 'ended-detected' : 'BROKEN');
-")"
+// ③ **假绿自证**：把站点判据收紧成「必须有指纹字段」后，**取值**仍必须与链式合并相等
+//     （若取值也跟着收紧 ⇒ 分叉回来 ⇒ BROKEN；这正是评审 critical 的回归点）
+import { composeChain } from '$ROOT/src/watch/baseline.mjs';
+const malformed = [
+  { periodKey:'2026-05-01', orderAt:'2026-05-01T01:10:00Z', baseline:{ legacy:{ configProjection:'L1' } } },
+  { periodKey:'2026-05-05', orderAt:'2026-05-05T01:10:00Z', baseline:{ legacy:{ SHALLOW:{} } } },
+];
+const mm = composeMetro(malformed);
+const cc = composeChain(malformed);
+console.log(JSON.stringify(mm.contracts) === JSON.stringify(cc.contracts) ? 'contracts-decoupled' : 'BROKEN');
+console.log(mm.lines.legacy.stations.length === 1 && (mm.lines.legacy.shallowStations ?? []).length === 1 ? 'annotation-separated' : 'BROKEN');
+")
+"
 assert "🟡自证①：站点只算**显式声明**（否则单轴语义会凭空给 legacy 多站）" "explicit-only" "$(echo "$SELF" | sed -n 1p)"
 assert "🟡自证②：停运判据真的点名 legacy（非恒空）" "ended-detected" "$(echo "$SELF" | sed -n 2p)"
+assert "🟡自证③：取值与站点注解**解耦**（收紧站判据后 contracts 仍与链式相等）" "contracts-decoupled" "$(echo "$SELF" | sed -n 3p)"
+assert "🟡自证④：畸形场景下站点/空壳注解分离（1 真站 + 1 空壳）" "annotation-separated" "$(echo "$SELF" | sed -n 4p)"
 
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"

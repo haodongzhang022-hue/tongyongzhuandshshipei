@@ -184,15 +184,28 @@ console.log('  [B5] 结算语义（10:00 结算 ⇒ 周期键 = 结算点日期�
 console.log('  [B6] 地铁视图（composeMetro）不得参与归因判据（advice 面）');
 {
   const triageSrc = readFileSync(path.join(ROOT, 'src/triage/index.mjs'), 'utf8');
-  // 归因判据的唯一执行体：attributionDetail() 的函数体内不得出现 metro 相关调用
-  const attrBody = functionBody(runnerSrc, 'export function attributionDetail(') ?? '';
-  eq('B6 attributionDetail 不含 composeMetro(', false, callsIn(attrBody, 'composeMetro'));
-  eq('B6 attributionDetail 不含 metro 相关读取', false, /\bmetro\b/.test(attrBody));
+  const baselineSrc = readFileSync(path.join(ROOT, 'src/watch/baseline.mjs'), 'utf8');
+  // 归因判据的**唯一执行体**在 src/verify/runner.mjs（`attributionDetail`），不是 triage。
+  // ⚠️ 旧写法把 `runnerSrc` 的函数体拿去比、只看了 triage 的调用名 —— `metro` 字样根本不在这两份
+  // 里 ⇒ 断言**恒真**（评审指出）。现在改为：**定位真实函数体**（括号配平，文件正确）+ 全仓扫描消费方。
+  const attrBody = functionBody(runnerSrc, 'export function attributionDetail(');
+  eq('B6 定位 attributionDetail 函数体（防「定位失败 ⇒ 断言空转」）', true, typeof attrBody === 'string' && attrBody.length > 0);
+  eq('B6 attributionDetail（verify/runner.mjs）不含 composeMetro(', false, callsIn(attrBody, 'composeMetro'));
+  eq('B6 attributionDetail（verify/runner.mjs）不含 metro 相关读取', false, /\bmetro\b/i.test(attrBody));
+  eq('B6 attributeFailure（归因出口）不含 metro 判据',
+    false, /\bmetro\b/i.test(functionBody(runnerSrc, 'export function attributeFailure(') ?? ''));
   // 反向：确认 metro 能力**确实存在**且被 CLI 接入（防「没写 ⇒ 断言恒真」）
-  eq('B6 反证：baseline.mjs 确实导出了 composeMetro（说明不是「没实现」）', true, /export function composeMetro\(/.test(readFileSync(path.join(ROOT, 'src/watch/baseline.mjs'), 'utf8')));
+  eq('B6 反证：baseline.mjs 确实导出了 composeMetro（说明不是「没实现」）', true, /export function composeMetro\(/.test(baselineSrc));
   eq('B6 反证：CLI 确实把 metro 接入输出（describeMetro/renderMetro）', true, callsIn(cliSrc, 'describeMetro') && callsIn(cliSrc, 'renderMetro'));
+  // 反向定位自证：故意把函数体换成含 metro 的原文 ⇒ 判据必须命中（证明上面两条不是恒真）
+  // 自证：把「注入 metro 的」函数体喂给同一判据，必须**判否**（证明上面两条不是恒真）
+  eq('🟡B6 守卫自证：注入 metro 的 attributionDetail 会被判否',
+    true, /\bmetro\b/i.test(`${attrBody ?? ''}\nmetro;`));
   // triage（advice 面）也不得把 metro 当判据
   eq('B6 triage（advice 面）不含 composeMetro 判据', false, callsIn(triageSrc, 'composeMetro'));
+  // 归因/探针模块（verify、detect、triage）内**不得**把 composeMetro 当判据
+  eq('B6 归因/探针模块（verify、detect、triage）内**不得**出现 composeMetro 调用', false,
+    ['src/verify/runner.mjs', 'src/detect/flavor.mjs', 'src/triage/index.mjs'].some((rel) => callsIn(readFileSync(path.join(ROOT, rel), 'utf8'), 'composeMetro')));
 }
 
 console.log(`\n发布面自检（基线守卫）：${pass} 项通过 / ${fail} 项失败`);
