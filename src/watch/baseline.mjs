@@ -161,6 +161,8 @@ export function settleSegment(options) {
 
   const record = {
     mode: options.run?.mode ?? 'day',
+    // 「内容真的变了才 +1」——幂等重跑 / 未变化跳过都不涨版本（零副作用但可观测）
+    baselineVersion: baselineVersion(previous, { baseline }),
     // 显式排序键：链式合并按它推进（不依赖 periodKey 字典序，见 segmentOrderAt）
     orderAt: options.run?.orderAt ?? previous?.orderAt ?? at,
     firstRunAt: previous?.firstRunAt ?? (Object.keys(accepted).length > 0 ? at : null),
@@ -172,11 +174,25 @@ export function settleSegment(options) {
   };
   // 无实质变化则不落盘（避免「什么都没变却改写文件」⇒ CI 脏工作区 / 无意义 diff）。
   // 「实质变化」= 该周期基线变了，或候选台账变长（新候选进来）。
+  //
+  // ⚠️ **空站台不落盘**（条件触发的第二道兜底）：本周期**没有任何声明**（`baseline` 为空）
+  // 时**不建立分片**——站台 = 「该周期**显式声明**过的契约快照」，空手声明不是站台。
+  // 否则每个空跑的日期都会在链上多一个空站（`baseline` 为 `{}`），线路图被噪声填满。
+  const stationless = !isUsableContract(baseline) || Object.keys(baseline).length === 0;
   const previousCandidates = (previous?.candidates ?? []).length;
-  const materiallyChanged = !hadBaseline || candidates.length !== previousCandidates
-    || JSON.stringify(baseline) !== JSON.stringify(previous?.baseline ?? {});
+  const materiallyChanged = !stationless && (!hadBaseline || candidates.length !== previousCandidates
+    || JSON.stringify(baseline) !== JSON.stringify(previous?.baseline ?? {}));
   const written = options.dryRun ? false : (materiallyChanged ? (store.save(key, record), true) : false);
-  return { key, baseline, ignored, written, materiallyChanged, candidates: record.candidates, firstRunAt: record.firstRunAt };
+  return {
+    key,
+    baseline,
+    ignored,
+    written,
+    materiallyChanged,
+    baselineVersion: record.baselineVersion,
+    candidates: record.candidates,
+    firstRunAt: record.firstRunAt,
+  };
 }
 
 /**
@@ -195,6 +211,96 @@ export function segmentOrderAt(segment) {
   const raw = segment?.orderAt ?? segment?.settledAt ?? segment?.firstRunAt ?? null;
   const ms = raw ? new Date(raw).getTime() : Number.NaN;
   return Number.isFinite(ms) ? ms : Infinity;
+}
+
+/**
+ * 契约集合的**稳定指纹**（排序键 ⇒ 与通道插入顺序无关）。
+ *
+ * 用「每通道各自的 JSON 指纹」而不是「整体 JSON.stringify」做比对：
+ * 通道顺序不同、`{}` 里键序不同都不该被判成「变化」——那会产生**假变更**，
+ * 让「每日基线」每天无脑多一站（正是本次要消掉的形态）。
+ *
+ * @param {object|null|undefined} contracts channel → contract
+ * @returns {string} 形如 `dev=<json>|stable=<json>` 的稳定指纹
+ */
+export function contractFingerprint(contracts) {
+  const entries = Object.entries(contracts ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  return entries.map(([channel, contract]) => `${channel}=${stableStringify(contract)}`).join('|');
+}
+
+/**
+ * 键序无关的 JSON 序列化（对象键**排序**后递归）。
+ *
+ * @param {unknown} value 任意值
+ * @returns {string} 稳定字符串
+ */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+/**
+ * 「基线是否有变化」的**唯一判据** —— 每日基线**按条件触发**的基础。
+ *
+ * 口径（用户点名）：
+ * - 有些日子上游没发版、契约没变 ⇒ **不改基线、也不新增站台**（跳过）；
+ * - 只有「本周期真的有显式声明」时才多一站，空跑的日期不留站台。
+ *
+ * 判据细节（防误判/防假绿）：
+ * - **新增通道** 或 **已声明通道的契约变了** ⇒ `changed = true`；
+ * - **候选里缺某通道**（`removedChannels`）**不算变更**——候选是「本周期**显式声明**的通道」，
+ *   缺席只代表「没声明」，不代表「上游删了契约」。链式合并本身会前向携带上一站的值
+ *   （这正是「未声明 ≠ 值消失」的口径）；若把缺席判成变更，每条线都会天天被前向携带，
+ *   等于把「静默携带」做成「显式变更」——那是另一种假绿。
+ *   ⚠️ 实现口径：**缺席可单独出现**（候选只声明了部分通道）⇒ 只要「共有通道逐个相同」
+ *   就判**未变化**（各线路保持原站台，不新增）；只有「新增通道 / 共有通道有变」才推进。
+ * - **空基线**（首次结算）⇒ `changed = true`，否则第一个站台永远落不下来。
+ *
+ * @param {{previous?:object|null, baseline?:object|null}} options 比对对象与本次候选
+ * @returns {{changed:boolean, reason:string, addedChannels:string[], removedChannels:string[]}}
+ */
+export function detectBaselineChange(options = {}) {
+  const previousHas = Object.keys(options.previous ?? {}).length > 0;
+  const nextHas = Object.keys(options.baseline ?? {}).length > 0;
+  const unknown = '无候选（未跑验收或全部通道未通过）';
+  if (!nextHas) return { changed: false, reason: unknown, addedChannels: [], removedChannels: [] };
+  const previous = options.previous ?? {};
+  const baseline = options.baseline ?? {};
+  const addedChannels = Object.keys(baseline).filter((channel) => !(channel in previous));
+  const removedChannels = Object.keys(previous).filter((channel) => !(channel in baseline));
+  if (!previousHas) {
+    return { changed: true, reason: '首次结算（当前基线为空）', addedChannels, removedChannels };
+  }
+  const shared = Object.keys(baseline).filter((channel) => channel in previous);
+  const altered = shared.filter((channel) => stableStringify(baseline[channel]) !== stableStringify(previous[channel]));
+  if (addedChannels.length === 0 && altered.length === 0) {
+    // 只看**共有通道**：缺席的通道不算变化（见上方口径）⇒ 链式合并保持原站台
+    return { changed: false, reason: '契约与当前基线（共有通道）逐键相同', addedChannels, removedChannels };
+  }
+  const parts = [];
+  if (addedChannels.length > 0) parts.push(`新增通道 ${addedChannels.join(', ')}`);
+  if (altered.length > 0) parts.push(`契约变更 ${altered.join(', ')}`);
+  return { changed: true, reason: parts.join('；'), addedChannels, removedChannels };
+}
+
+/**
+ * 在分片上维护「基线版本号」：**内容真的变了才 +1**。
+ *
+ * 用途：在不动基线内容的前提下，给「跳过」留一个**零副作用但可观测**的标记——
+ * 幂等重跑不涨版本、未变化跳过不涨版本、有变化结算才涨。
+ *
+ * @param {object|null} previous 已有分片
+ * @param {object} candidate 本次将写入的 `record`
+ * @returns {number} 新的版本号
+ */
+export function baselineVersion(previous, candidate) {
+  const prev = previous?.baselineVersion;
+  const base = Number.isInteger(prev) ? prev : 0;
+  const first = !(previous?.baseline ?? null) ? true : false;
+  if (first) return base; // 首次写入固定从 0 起（不依赖历史）
+  const changed = stableStringify(previous?.baseline ?? {}) !== stableStringify(candidate?.baseline ?? {});
+  return changed ? base + 1 : base;
 }
 
 /**

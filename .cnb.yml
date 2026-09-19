@@ -151,6 +151,12 @@ main:
   # 为什么是 10 点：用户点名「早晨 10 点，很多时候这时候都是不用的」——把写基线的动作
   # 放在没人用仓库的时段，且**不跟** push / PR（否则基线被每一次 push 顶上，漂移被静默吸收）。
   # 语义：同周期多次运行**取相对早的那个**当基线；每周期独立分片，不合并到主线。
+  #
+  # 🚦 **条件触发（不是每天都结算）**：
+  #   每日基线**不是必然触发**——有些日子上游没发版、契约没变，那就**不改基线、也不新增站台**。
+  #   判据：本次候选 vs 当前基线（链式合并后）的契约指纹，逐键相同 ⇒ 跳过（不落盘、不多一站）。
+  #   实现用两段：① `settle --changed-only` 只判不写（exit 1 = 有变化）；② `changed=1` 才真结算。
+  #   空跑的那些日期不留站台 ⇒ 「地铁线路图」上只出现**真有声明**的日期。
   "crontab: 0 10 * * *":
     - name: settle-contract-baseline
       docker:
@@ -164,6 +170,13 @@ main:
               --plugin ./tests/fixtures/demo-plugin.mjs \
               --tools demo_echo,demo_status \
               --json ./.ci/verify-settle.json --markdown || true
+            # 条件门：契约没变化就不做（exit 1 = 有变化）；同一份报告既当候选又当比对面
+            node src/cli.mjs settle --from ./.ci/verify-settle.json --changed-only || CHANGED=1
+            if [ "${CHANGED:-0}" != "1" ]; then
+              echo "⏭ 基线未变化：跳过结算（不改基线、不新增站台）——每日基线为条件触发"
+              node src/cli.mjs baseline --markdown
+              exit 0
+            fi
             # ★ 唯一写基线的地方：一天一个基线（周期键 = 当日结算点日期）
             node src/cli.mjs settle --from ./.ci/verify-settle.json --mode day --markdown
             # 链式合并后的当前基线（早 → 晚顺序合并，「连起来」才是最新版）
@@ -228,6 +241,15 @@ $:
             if [ "$DRY_RUN" = "yes" ]; then ARGS="$ARGS --dry-run"; fi
             node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs \
               --tools demo_echo,demo_status --json ./.ci/verify-settle.json --markdown || true
+            # 条件触发：没变化就不做（除非显式 FORCE=yes 强制落一版站台）
+            if [ "$FORCE" != "yes" ]; then
+              node src/cli.mjs settle --from ./.ci/verify-settle.json --changed-only || CHANGED=1
+              if [ "${CHANGED:-0}" != "1" ]; then
+                echo "⏭ 基线未变化：跳过结算（页面按钮同样按条件触发）"
+                node src/cli.mjs baseline --markdown
+                exit 0
+              fi
+            fi
             # shellcheck disable=SC2086
             node src/cli.mjs settle --from ./.ci/verify-settle.json $ARGS --markdown
             node src/cli.mjs baseline --markdown

@@ -1146,6 +1146,92 @@ assert "🟡自证①：站点只算**显式声明**（否则单轴语义会凭�
 assert "🟡自证②：停运判据真的点名 legacy（非恒空）" "ended-detected" "$(echo "$SELF" | sed -n 2p)"
 assert "🟡自证③：取值与站点注解**解耦**（收紧站判据后 contracts 仍与链式相等）" "contracts-decoupled" "$(echo "$SELF" | sed -n 3p)"
 assert "🟡自证④：畸形场景下站点/空壳注解分离（1 真站 + 1 空壳）" "annotation-separated" "$(echo "$SELF" | sed -n 4p)"
+echo "  [25] 每日基线**条件触发**（未变化即跳过：不改基线、不新增站台）"
+# 为什么补：把「每日基线」实现成「每天都无脑结算」会立刻产生两个问题——
+#   ① 没变化的日子也在链上多一个站台 ⇒ 线路图被空站填满，「哪天真的变了」看不出来；
+#   ② 空跑的日期改写了分片文件 ⇒ CI 脏工作区 / 无意义 diff。
+# 用户点名：**有些日子没产生修改，基线不变就不需要触发**。
+# 本节断言全部是**语义级**（真跑函数），并配变异自证（防「没写 ⇒ 断言恒真」）。
+OUT="$("$NODE_BIN" --input-type=module -e "
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { periodKeyForDay, segmentStore, settleSegment, resolveBaseline, detectBaselineChange, contractFingerprint } from '$ROOT/src/watch/baseline.mjs';
+const dir = mkdtempSync(path.join(tmpdir(), 'dsh-cond-'));
+const store = segmentStore({ hubRoot: dir });
+const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
+const ch = (t) => [{ channel:'dev', ok:true, contract:C(t) }, { channel:'stable', ok:true, contract:C(t) }];
+
+// ① 首次结算（空基线）⇒ 必须判「有变化」（否则第一个站台永远落不下来）
+const first = detectBaselineChange({ previous:null, baseline:{ dev:C('v1') } });
+console.log(String(first.changed) + '|' + first.reason);
+
+// ② 逐键相同（且通道键序被打乱）⇒ 判「无变化」
+console.log(String(detectBaselineChange({ previous:{ stable:C('v1'), dev:C('v1') }, baseline:{ dev:C('v1'), stable:C('v1') } }).changed));
+
+// ③ 已声明通道的契约变了 ⇒ 判「有变化」
+console.log(String(detectBaselineChange({ previous:{ dev:C('v1') }, baseline:{ dev:C('v2') } }).changed));
+
+// ④ 候选缺席某通道 ⇒ **不**判成变更（未声明 ≠ 值消失；链式合并本来就前向携带）
+console.log(String(detectBaselineChange({ previous:{ stable:C('v1'), dev:C('v1') }, baseline:{ stable:C('v1') } }).changed));
+
+// ⑤ 无候选（空报告）⇒ 判「无变化」（空报告不得推进基线）
+console.log(String(detectBaselineChange({ previous:{ dev:C('v1') }, baseline:{} }).changed));
+
+// ⑥ 端到端：D1 有声明 ⇒ 落站；D2/D3 同契约 ⇒ 不算变化、不落盘 ⇒ 链上只有 D1 一站
+const K = (day) => periodKeyForDay(new Date('2026-05-' + day + 'T02:00:00+08:00'));  // 本地 10:00 ⇒ 落次日键，但**稳定可复现**
+const d1 = settleSegment({ store, key:K('05'), run:{ at:'2026-05-05T02:00:00+08:00', channels:ch('same') } });
+console.log('D1:' + String(d1.written));
+const cur = resolveBaseline({ hubRoot:dir }).contracts;
+const d2changed = detectBaselineChange({ previous:cur, baseline:Object.fromEntries(ch('same').map((c) => [c.channel, c.contract])) }).changed;
+const d3changed = detectBaselineChange({ previous:cur, baseline:Object.fromEntries(ch('same').map((c) => [c.channel, c.contract])) }).changed;
+console.log('D2:' + String(d2changed) + '|D3:' + String(d3changed));
+console.log(JSON.stringify(store.list()));
+
+// ⑦ D4 契约真的变了 ⇒ 判「有变化」并落新站 ⇒ 链推进到两站
+const d4c = detectBaselineChange({ previous:cur, baseline:{ dev:C('CHANGED'), stable:C('CHANGED') } });
+console.log('D4:' + String(d4c.changed) + '|' + d4c.reason);
+settleSegment({ store, key:K('08'), run:{ at:'2026-05-08T02:00:00+08:00', channels:ch('CHANGED') } });
+console.log(JSON.stringify(store.list()));
+
+// ⑧ 指纹与通道插入顺序无关（防「键序不同 ⇒ 假变化 ⇒ 每天多一站」）
+console.log(String(contractFingerprint({ a:C('x'), b:C('y') }) === contractFingerprint({ b:C('y'), a:C('x') })));
+
+// ⑨ 空候选的第二道兜底：不建立空站台（站台 = 该周期**显式声明**过的快照）
+const empty = settleSegment({ store, key:K('20'), run:{ at:'2026-05-20T02:00:00+08:00', channels:[] } });
+console.log('empty:' + String(empty.written) + '|' + String(store.list().includes(K('20'))));
+rmSync(dir, { recursive:true, force:true });
+")"
+assert "空基线（首次结算）⇒ 必须有变化，否则站台永远落不下" "true|首次结算（当前基线为空）" "$(echo "$OUT" | sed -n 1p)"
+assert "逐键相同（通道键序不同也算相同）⇒ 判无变化" "false" "$(echo "$OUT" | sed -n 2p)"
+assert "已声明通道的契约变了 ⇒ 判有变化" "true" "$(echo "$OUT" | sed -n 3p)"
+assert "候选缺席某通道 ⇒ 不判成变更（未声明 ≠ 值消失）" "false" "$(echo "$OUT" | sed -n 4p)"
+assert "无候选（空报告）⇒ 判无变化（空报告不得推进基线）" "false" "$(echo "$OUT" | sed -n 5p)"
+assert "D1 有声明 ⇒ 落站" "D1:true" "$(echo "$OUT" | sed -n 6p)"
+assert "D2/D3 契约没变 ⇒ 都不触发（每日基线按条件触发，不是必然）" "D2:false|D3:false" "$(echo "$OUT" | sed -n 7p)"
+assert "空跑的日期**不留站台**（链上只有真有声明的日期 ⇒ 恰好 1 站）" "1" "$(echo "$OUT" | sed -n 8p | tr -d '[]"' | tr ',' '\n' | grep -c .)"
+assert "D4 契约变了 ⇒ 触发，且原因写明「契约变更」" "D4:true|契约变更 dev, stable" "$(echo "$OUT" | sed -n 9p)"
+assert "真变化才推进一站（站点→下一站 ⇒ 恰好 2 站，而非天天一站）" "2" "$(echo "$OUT" | sed -n 10p | tr -d '[]"' | tr ',' '\n' | grep -c .)"
+assert "契约指纹与通道插入顺序无关（防假变化）" "true" "$(echo "$OUT" | sed -n 11p)"
+assert "空候选不建立空站台（第二道兜底）" "empty:false|false" "$(echo "$OUT" | sed -n 12p)"
+
+# 变异自证：确认上面不是恒真——把「逐键比对」退回「整体 JSON.stringify」，
+# 键序不同的同一份契约会被误判成「有变化」（即每天无脑多一站）。
+SELF="$("$NODE_BIN" --input-type=module -e "
+const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
+const prev = { stable:C('v1'), dev:C('v1') };
+const next = { dev:C('v1'), stable:C('v1') };
+// 整体 stringify：键序不同 ⇒ 假变化（这正是要避免的形态）
+console.log(JSON.stringify(prev) !== JSON.stringify(next) ? 'naive-json-false-positive' : 'BROKEN');
+// 排序指纹：键序无关 ⇒ 判等（正确形态）
+const fp = (o) => Object.keys(o).sort().map((k) => k + '=' + JSON.stringify(o[k])).join('|');
+console.log(fp(prev) === fp(next) ? 'sorted-fingerprint-stable' : 'BROKEN');
+// 反证：内容真的变了，排序指纹必须能看出来（防「指纹恒等」的空转）
+console.log(fp({ dev:C('v1') }) !== fp({ dev:C('v2') }) ? 'fingerprint-detects-change' : 'BROKEN');
+")"
+assert "🟡自证①：整体 stringify 会把键序不同误判成假变化（故必须用排序指纹）" "naive-json-false-positive" "$(echo "$SELF" | sed -n 1p)"
+assert "🟡自证②：排序指纹键序无关 ⇒ 判等（正确形态）" "sorted-fingerprint-stable" "$(echo "$SELF" | sed -n 2p)"
+assert "🟡自证③：排序指纹仍能看出真变化（非恒等空转）" "fingerprint-detects-change" "$(echo "$SELF" | sed -n 3p)"
 
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"

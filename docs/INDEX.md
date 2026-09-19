@@ -19,6 +19,9 @@
 | 契约基线（遗留）什么时候会被改写 | **只有 `settle` 会写**（默认一天一个基线，10:00 结算）；`verify` 只读，push/PR 段不写。同周期取**相对早**的候选 |
 | 基线为什么不是一个滚动的 `latest.json` | 旧语义每次运行都改写它 ⇒ 基线自己一直在动、累积偏移被静默吸收。现在按**周期分片**，`latest` 是链式合并的**派生**结果 |
 | 我想手动结算一次基线 | `node src/cli.mjs settle --from ./.ci/verify.json`（`--dry-run` 只看不写） |
+| 每日基线是不是每天都跑 | **不是**。契约没变化就**跳过**（不改基线、不新增站台）。判据 `detectBaselineChange()`；CI 用 `settle --changed-only` 做条件门 |
+| 我想知道某次结算为什么被跳过 | `settle --changed-only` 会打印 `changed` / `reason`（如「契约与当前基线（共有通道）逐键相同」） |
+| 我想人工补一版站台（未变化也落） | `node src/cli.mjs settle --force --from ...`（逃生门） |
 | 我想看当前基线链 / 迁遗留 | `node src/cli.mjs baseline`（`--migrate` 把历史遗留 `latest.json` 迁成分片） |
 | 我想看「每条线路从哪出发、到哪停、谁在**前向携带**」 | `node src/cli.mjs baseline --markdown`（🚇 线路图：每通道一条线，含**出发点** / 站点 / 末站 / **已停运线**） |
 | 我想按上游版本（而不是按天）切基线 | `node src/cli.mjs settle --mode release --release dsh-tools@0.1.6-alpha.3 --from ...` |
