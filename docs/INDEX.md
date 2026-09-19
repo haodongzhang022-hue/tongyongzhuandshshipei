@@ -16,7 +16,11 @@
 | 我想看上游有没有发新版 | `node src/cli.mjs watch` 或页面按钮「上游漂移侦测」 |
 | 上游发版后，我想知道「漂移到哪、影响谁、我该改哪一处」 | `node src/cli.mjs watch --markdown`（**影响面自动归因**：契约字段 → 受影响检查 → 中台改哪个文件 → 插件要不要动） |
 | 我想清理宿主依赖缓存（历史残留） | `node src/cli.mjs cache`（保留当前三通道指纹） |
-| 契约基线什么时候会被改写 | 只在通道 `ok` 时更新该通道基线；失败运行**不覆盖**、不产生假漂移 |
+| 契约基线（遗留）什么时候会被改写 | **只有 `settle` 会写**（默认一天一个基线，10:00 结算）；`verify` 只读，push/PR 段不写。同周期取**相对早**的候选 |
+| 基线为什么不是一个滚动的 `latest.json` | 旧语义每次运行都改写它 ⇒ 基线自己一直在动、累积偏移被静默吸收。现在按**周期分片**，`latest` 是链式合并的**派生**结果 |
+| 我想手动结算一次基线 | `node src/cli.mjs settle --from ./.ci/verify.json`（`--dry-run` 只看不写） |
+| 我想看当前基线链 / 迁遗留 | `node src/cli.mjs baseline`（`--migrate` 把历史遗留 `latest.json` 迁成分片） |
+| 我想按上游版本（而不是按天）切基线 | `node src/cli.mjs settle --mode release --release dsh-tools@0.1.6-alpha.3 --from ...` |
 | 我想手动跑一次双通道验收 | 页面按钮「双通道验收」或 `node src/cli.mjs verify --channel all --plugin ... --tools ...` |
 | 我想加一个新的通道（如 beta） | 在 `registry/channels.json` 的 `channels` 加一项，其余全自动 |
 | 我的验收失败了，但上游刚好在发版 | 先看 `attributionReasons`：命中「插件侧硬证据」就是你的问题，漂移不背锅 |
@@ -26,7 +30,10 @@
 | 产物 | 位置 | 类型 | 说明 |
 |---|---|---|---|
 | 通道钉版表 | `registry/channels.json` | 机器可读 | ★ 唯一事实源：stable / dev / legacy |
-| 契约指纹基线 | `registry/contract-snapshots/latest.json` | 机器可读 | 上游契约漂移对比基线 |
+| 契约基线（遗留）分片 | `registry/contract-snapshots/segments/<周期>.json` | 机器可读 | ★ 每周期**独立**基线（一天一个 / 一版一个）；同周期取**最早**候选 |
+| 契约基线（遗留）（派生） | `registry/contract-snapshots/latest.json` | 机器可读 | **历史遗留**（v0.3.0 起不再由 verify 写）；可由 `baseline --migrate` 迁成分片 |
+| ★ 基线周期与链式合并 | `src/watch/baseline.mjs` | 代码 | 周期键（10:00 结算）/ `first-wins` / 分片存储 / **顺序链式合并**（早→晚） |
+| 基线「分段 + 只读」守卫 | `tests/test_baseline_guard.mjs` | 测试 | B1 `verify` 只读 / B2 `settle` 唯一写入点 / B3 CI 接线 / B4 链式来源 / B5 结算语义 + 守卫自证 |
 | 上游漂移影响面 | `src/triage/index.mjs` | 代码 | ★ 唯一事实源：漂移字段 → 受影响检查 → 责任方 → 中台改哪一处 |
 | 版本线探测 | `src/detect/flavor.mjs` | 代码 | `ptc`→modern / `code`→legacy / unknown 不抛错 |
 | Schema 兼容 | `src/compat/schema.mjs` | 代码 | 压平 + 校验（与宿主同构） |
@@ -37,19 +44,20 @@
 | 契约指纹采集 | `src/harness/contract.mjs` | 代码 | 探测后**立即卸载**（可离线单测；防残留污染工具清单）；★ 归因判据表唯一事实源（`HOST_FATAL_FIELD` / 三张 check 表 / `PROBE_CHECK_ORDER` / `CONDITIONAL_PROBE_CHECKS` / 相位路由） |
 | 双通道验收 | `src/verify/runner.mjs` | 代码 | 判决 + 归因（漂移相关性表**从 `triage` import**，不在此硬编码） |
 | 上游侦测 | `src/watch/upstream.mjs` | 代码 | dist-tag 漂移 + 契约 diff |
+| ★ 契约基线分段与链 | `src/watch/baseline.mjs` | 代码 | **唯一事实源**：周期键（`settleHour` 默认 10）/ `first-wins` / 分片 `segments/` / `composeChain()` 顺序合并 |
 | ★ 漂移影响面归因 | `src/triage/index.mjs` | 代码 | **唯一事实源**：`DRIFT_IMPACT`（漂移字段 → 受影响检查 → 责任方 → 中台改哪一处 → 插件义务）+ `triageUpstream()` |
 | 二级信息汇报 | `src/report/secondary.mjs` | 代码 | JSON + Markdown 双视图 |
 | ★ 架构前提（信任边界） | `docs/RISKS.md` R26 | 文档 | **显式前提：插件为可信代码**；前提被打破 ⇒ 结论不可信（本中台是验收工具，不是沙箱） |
 | 结构性重做一页方案 | `docs/REDO-PROPOSAL.md` | 文档 | 批 1（fd3 + nonce）**已落地** / 批 2（进程隔离）**已立项在办**（总师裁定；R29 证逐点补不可穷尽） |
-| CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / report / detect / cache |
+| CLI | `src/cli.mjs` | 命令 | matrix / verify / watch（含影响面） / **settle（唯一写基线）** / **baseline（看链 + 迁移）** / report / detect / cache |
 | 接入模板 | `templates/adapter/` | 模板 | 拷贝即用 |
-| 离线单测 | `tests/test_offline.sh` | 测试 | 212 项，无网可跑（含 `summarize()` verdict 优先级 [13]、nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**nonce 侧信道 + v0.1.9d 三形态 [18]**、**批 1.5 通道可见化/降级不放行/§3 反例/exit 台账 [19]**、**🔴 必修-4 同族假绿 [20]**、**🔴-R3′ 通道重定向 + 压退出码 [21]**、**🔴-R3③ 自报降级甩锅（宿主侧 fd3 能力实测）[21]**、**🔴-R3 宿主侧观测主判据 + §三 自报降级 [22]**） |
+| 离线单测 | `tests/test_offline.sh` | 测试 | 229 项，无网可跑（含 `summarize()` verdict 优先级 [13]、nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**nonce 侧信道 + v0.1.9d 三形态 [18]**、**批 1.5 通道可见化/降级不放行/§3 反例/exit 台账 [19]**、**🔴 必修-4 同族假绿 [20]**、**🔴-R3′ 通道重定向 + 压退出码 [21]**、**🔴-R3③ 自报降级甩锅（宿主侧 fd3 能力实测）[21]**、**🔴-R3 宿主侧观测主判据 + §三 自报降级 [22]**、**契约基线分段：取最早 / 分片独立 / 顺序链式合并 / 迁移幂等 [23]**） |
 | 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 654 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **[9.10]-[9.17] R28/R26/R24/🔴 必修-4/R26 残留② fail-open/🔴-R3′ 通道重定向/🔴-R3③ 自报降级甩锅/🔴-R3 宿主侧观测**（无网可跑） |
 | 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 191 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d]-[8i] 侧信道 / R28+R26 / R24 / §3 反例 / 🔴 必修-4 / 🔴-R3′ 通道重定向 / 🔴-R3③ 自报降级甩锅 / 🔴-R3 §三 自报降级** 场景，含 attribution + verdict + **完成位**三重断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 4b 步插件侧闸门 / 第 7 步「文档计数防漂移」） |
 | 插件侧闸门 | `tests/gate_plugin_side.sh` | 测试 | ★ 唯一事实源：四条出口 + SIGKILL 边界 + **§3 反例固化** + **exit 钩子台账** + **防过度修正**（健康插件 17/17）；`.cnb.yml` push/PR 两段共用同一份 |
 | 离线探针回归台 | `tests/offline-probe-harness.mjs` | 测试 | 最小假宿主 + 真实探针子进程 + **装配器真实实现**解释输出（秒级覆盖四条出口；边界：假宿主通过 ≠ 真宿主适配通过） |
-| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索 + **产物索引表完整性 [2d]**（50 项） |
+| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索 + **产物索引表完整性 [2d]**（51 项） |
 | 示例插件 | `tests/fixtures/demo-plugin.mjs` | 测试 | 同时是接入模板 |
 | 负例插件 | `tests/fixtures/broken-plugin.mjs` | 测试 | 验证护栏不静默失效（声明保留名 → 插件侧硬证据） |
 | 负例插件（🔴-D 同步） | `tests/fixtures/plugin-side-throw-plugin.mjs` / `plugin-registry-throw-plugin.mjs` | 测试 | 插件侧**同步**异常（抛错 getter / 未初始化字段）→ `PLUGIN_REGRESSION` 且 `hostFatal=[]` |

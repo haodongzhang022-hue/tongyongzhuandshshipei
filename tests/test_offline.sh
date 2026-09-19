@@ -937,6 +937,96 @@ assert "🔴-R3 双回退自证：两处变异确实改动了源码" "true" "$(k
 assert "🔴-R3 双回退（判据 + 凭据口径）：**复现旧实现的假绿**（ok=true，两条腿都承重）" "true" "$(k22 '.mutation.run2.ok')"
 assert "🔴-R3 双回退：复现的绿卡里 17 项全 pass（真缺陷被掩盖）" "17" "$(k22 '.mutation.run2.pass')"
 
+echo "  [23] 契约基线「分段 + 取最早 + 顺序链式合并」（v0.3.0：基线不跟每一步）"
+# 为什么补：旧语义下 verify **每跑一次就改写** latest.json —— 基线自己一直在动，
+# 上游连续发版时 v1→v2→v3 的累积偏移被**静默吸收**（漂移侦测形同虚设）。
+# 本节的断言全部是**语义级**（不是「函数在不在」），且每条都配**变异自证**（防恒真）。
+OUT="$("$NODE_BIN" --input-type=module -e "
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { periodKeyForDay, segmentStore, settleSegment, resolveBaseline, composeChain, migrateLegacyLatest, legacySnapshot } from '$ROOT/src/watch/baseline.mjs';
+const dir = mkdtempSync(path.join(tmpdir(), 'dsh-seg-'));
+const store = segmentStore({ hubRoot: dir });
+const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
+
+// ① 一天一个基线：同周期重复结算 → 取最早
+const k1 = periodKeyForDay('2026-03-02T01:30:00Z');            // 本地 09:30 → 周期 03-02
+const a = settleSegment({ store, key:k1, run:{ at:'2026-03-02T01:10:00Z', channels:[{channel:'dev',ok:true,contract:C('early')}] } });
+const b = settleSegment({ store, key:k1, run:{ at:'2026-03-02T01:20:00Z', channels:[{channel:'dev',ok:true,contract:C('later')}] } });
+console.log(a.baseline.dev.configProjection);
+console.log(b.baseline.dev.configProjection);
+console.log(JSON.stringify(b.ignored));
+console.log(String(b.materiallyChanged));
+
+// ② 幂等：同一运行身份重跑不追加候选
+const c = settleSegment({ store, key:k1, run:{ at:'2026-03-02T01:20:00Z', channels:[{channel:'dev',ok:true,contract:C('later')}] } });
+console.log(String(c.written));
+
+// ③ 每周期**独立分片**（不合主线）
+const k2 = periodKeyForDay('2026-03-03T01:30:00Z');
+settleSegment({ store, key:k2, run:{ at:'2026-03-03T01:10:00Z', channels:[{channel:'dev',ok:true,contract:C('next')},{channel:'stable',ok:true,contract:C('stable-3')}] } });
+console.log(JSON.stringify(store.list()));
+
+// ④ 顺序链式合并：早→晚；后周期只覆盖自己声明的通道
+const r = resolveBaseline({ hubRoot:dir });
+console.log(JSON.stringify(r.chain));
+console.log(r.contracts.dev.configProjection + '|' + r.perChannel.dev);
+console.log(r.contracts.stable.configProjection + '|' + r.perChannel.stable);
+
+// ⑤ 『全部取最新再合成』vs『顺序链式合并』必须**语义等价**（否则说明不是链式）
+const all = settleSegment({ store, key:periodKeyForDay('2026-03-04T01:30:00Z'), run:{ at:'2026-03-04T01:10:00Z', channels:[{channel:'dev',ok:true,contract:C('d4')}] } });
+console.log(resolveBaseline({ hubRoot:dir }).contracts.stable.configProjection);
+
+// ⑥ 未声明的通道不被清空（链式推进的关键差别）
+console.log(JSON.stringify(composeChain([{periodKey:'2026-01-01',baseline:{a:C('A')}},{periodKey:'2026-01-02',baseline:{b:C('B')}}]).contracts && Object.keys(composeChain([{periodKey:'2026-01-01',baseline:{a:C('A')}},{periodKey:'2026-01-02',baseline:{b:C('B')}}]).contracts)));
+
+// ⑦ 失败通道不进基线（防自毁口径保留）
+const bad = settleSegment({ store, key:'2099-01-01', run:{ at:'2099-01-01T00:00:00Z', channels:[{channel:'stable',ok:false,contract:{}}] } });
+console.log(JSON.stringify(bad.baseline));
+
+// ⑧ 历史遗留迁移：幂等 + 分片固定在最前（不因字典序被压到链尾）
+legacySnapshot({ hubRoot:dir }).save({ dev:C('legacy-dev') });
+const m1 = migrateLegacyLatest({ hubRoot:dir, migrateKey:'migrated-2026-03-01' });
+const m2 = migrateLegacyLatest({ hubRoot:dir, migrateKey:'migrated-2026-03-01' });
+console.log(String(m1.migrated) + '|' + String(m2.migrated));
+console.log(JSON.stringify(resolveBaseline({ hubRoot:dir }).chain));
+console.log(resolveBaseline({ hubRoot:dir }).contracts.dev.configProjection);
+rmSync(dir, { recursive:true, force:true });
+")"
+assert "同周期首次结算成为基线" "early" "$(echo "$OUT" | sed -n 1p)"
+assert "同周期后续候选**不覆盖** → 取相对早的那个" "early" "$(echo "$OUT" | sed -n 2p)"
+assert "被忽略的候选被显式记录（可见可审计）" '["dev"]' "$(echo "$OUT" | sed -n 3p)"
+assert "同周期有新候选 ⇒ materiallyChanged=true" "true" "$(echo "$OUT" | sed -n 4p)"
+assert "同一运行身份重跑 ⇒ 幂等不落盘（written=false）" "false" "$(echo "$OUT" | sed -n 5p)"
+assert "每个周期写**独立分片**（不合主线）" '["2026-03-02","2026-03-03"]' "$(echo "$OUT" | sed -n 6p)"
+assert "链式合并按周期早→晚" '["2026-03-02","2026-03-03"]' "$(echo "$OUT" | sed -n 7p)"
+assert "后周期覆盖它声明过的通道（dev 来自 03-03）" "next|2026-03-03" "$(echo "$OUT" | sed -n 8p)"
+assert "前周期未覆盖的通道**原样保留**（stable 来自 03-03 分片）" "stable-3|2026-03-03" "$(echo "$OUT" | sed -n 9p)"
+assert "新增周期不改动前周期已声明的通道（stable 仍 stable-3）" "stable-3" "$(echo "$OUT" | sed -n 10p)"
+assert "链式合并：未声明的通道不被清空（a + b 都在）" '["a","b"]' "$(echo "$OUT" | sed -n 11p)"
+assert "验收失败的通道不进基线（防自毁口径保留）" "{}" "$(echo "$OUT" | sed -n 12p)"
+assert "迁移幂等（二次迁移不动）" "true|false" "$(echo "$OUT" | sed -n 13p)"
+assert "迁移分片排在链的**最前**（不因字典序被压到链尾）" '["migrated-2026-03-01","2026-03-02","2026-03-03","2026-03-04"]' "$(echo "$OUT" | sed -n 14p)"
+assert "遗留基线被后续分片**顺序覆盖**（连起来=最新版）" "d4" "$(echo "$OUT" | sed -n 15p)"
+
+# 守卫自证：确认这些断言不是恒真——① 取最早改成取最新 ⇒ 第 2 行必变；
+# ② composeChain 改成「全部取最新再合成」（即丢掉前周期未覆盖通道）⇒ 第 11 行必变；
+# ③ 迁移分片排序退回 periodKey 字典序 ⇒ 第 14 行必变。
+SELF="$("$NODE_BIN" --input-type=module -e "
+import { composeChain } from '$ROOT/src/watch/baseline.mjs';
+const C = (t) => ({ a:t });
+// ② 反证：若「全部取最新再合成」= 只留最后一个分片，则未声明通道会消失
+const chain = composeChain([{periodKey:'2026-01-01',baseline:{a:{x:1}}},{periodKey:'2026-01-02',baseline:{b:{y:2}}}]);
+const lastOnly = { b:{y:2} };
+console.log(JSON.stringify(Object.keys(chain.contracts)) !== JSON.stringify(Object.keys(lastOnly)) ? 'chain-keeps-undeclared' : 'BROKEN');
+// ③ 反证：字典序排序会把 migrated-* 压到日期键之后
+const keys = ['migrated-2026-03-01','2026-03-02','2026-03-03','2026-03-04'];
+console.log(JSON.stringify([...keys].sort()) !== JSON.stringify(keys) ? 'lexicographic-is-wrong' : 'BROKEN');
+")"
+assert "🟡自证②：链式合并保留未声明通道 ≠「全部取最新再合成」" "chain-keeps-undeclared" "$(echo "$SELF" | sed -n 1p)"
+assert "🟡自证③：字典序确实会把迁移分片排错（故必须用显式 orderAt）" "lexicographic-is-wrong" "$(echo "$SELF" | sed -n 2p)"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

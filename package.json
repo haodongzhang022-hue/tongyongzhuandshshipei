@@ -1,6 +1,6 @@
 {
   "name": "@dongdongxiaozu/dsh-adapt-hub",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "description": "DSH 适配中台：把「插件适配 DSH 生态」的重复劳动固化为可复用能力——版本线探测 / 契约兼容层 / 双通道（稳定版+开发版）验收 / 上游变更侦测。",
   "type": "module",
   "bin": {
@@ -14,6 +14,7 @@
     "./harness": "./src/harness/index.mjs",
     "./verify": "./src/verify/runner.mjs",
     "./watch": "./src/watch/upstream.mjs",
+    "./baseline": "./src/watch/baseline.mjs",
     "./triage": "./src/triage/index.mjs"
   },
   "files": [
@@ -27,12 +28,15 @@
     "detect": "node src/cli.mjs detect",
     "matrix": "node src/cli.mjs matrix",
     "watch": "node src/cli.mjs watch",
+    "settle": "node src/cli.mjs settle",
+    "baseline": "node src/cli.mjs baseline",
     "verify:stable": "node src/cli.mjs verify --channel stable --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
     "verify:dev": "node src/cli.mjs verify --channel dev --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
     "verify:all": "node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status",
     "test": "bash tests/test_hub.sh",
     "test:offline": "bash tests/test_offline.sh",
     "test:exports": "node tests/test_exports.mjs",
+    "test:baseline": "node tests/test_baseline_guard.mjs",
     "test:attribution": "node tests/test_attribution.mjs",
     "test:e2e": "node tests/test_e2e_regression.mjs"
   },

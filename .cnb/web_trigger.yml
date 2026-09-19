@@ -41,3 +41,32 @@ branch:
         description: 检查 DSH 上游 dist-tag 是否已越过本中台钉版
         event: web_trigger_watch
         groupName: 上游侦测
+      - name: 结算契约基线
+        description: 结算一个周期的契约基线（默认一天一个；同周期取相对早的候选）
+        event: web_trigger_settle
+        groupName: 基线
+        inputs:
+          - name: 结算参数
+            collapsed: false
+            inputs:
+              SETTLE_MODE:
+                name: 切片模式
+                type: select
+                default: day
+                options:
+                  - name: 一天一个基线（10:00 结算）
+                    value: day
+                  - name: 每个上游版本一个基线
+                    value: release
+              RELEASE_ID:
+                name: 版本标识（仅 release 模式）
+                type: input
+                required: false
+                default: ''
+                placeholder: 如 dsh-tools@0.1.6-alpha.3
+              DRY_RUN:
+                name: 只算不写（演练）
+                type: input
+                required: false
+                default: 'no'
+                placeholder: 填 yes 则 --dry-run

@@ -19,7 +19,9 @@ import { HUB_ROOT, loadChannels, runHostProbe } from '../harness/host.mjs';
 import { CONTRACT_SIDE_CHECKS, HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS } from '../harness/contract.mjs';
 // 漂移相关性表的唯一事实源（与 `docs/ARCHITECTURE.md` 判据表第 3 条、triage 影响面同源）
 import { DRIFT_IMPACT } from '../triage/index.mjs';
-import { channelContractDrift, contractSnapshot } from '../watch/upstream.mjs';
+import { channelContractDrift } from '../watch/upstream.mjs';
+// 基线来源：**分段链派生**（按周期切片 + 顺序合并），不再读「每次运行被改写的那份 latest.json」
+import { resolveBaseline } from '../watch/baseline.mjs';
 
 /**
  * 运行一个通道的验收。
@@ -296,9 +298,12 @@ export function attributeFailure(probe, channel, channelName, evidence = {}) {
  */
 export function verifyAll(options) {
   const channels = options.channels ?? ['stable', 'dev'];
+  // 基线只**读**不写：取「周期分片按早→晚链式合并」的结果（含历史遗留 latest.json 的迁移分片）。
+  // 为什么不再直接读 latest.json：那份文件旧语义下**每次运行都被改写**，基线自己一直在动 ⇒
+  // 累积偏移被静默吸收（issue 里用户点名的「三个通道 + 不同基线 ⇒ 大量问题」）。
   const previousContracts = options.previousContracts !== undefined
     ? options.previousContracts
-    : (contractSnapshot({ hubRoot: options.hubRoot ?? HUB_ROOT }).load()?.contracts ?? null);
+    : (resolveBaseline({ hubRoot: options.hubRoot ?? HUB_ROOT }).contracts ?? null);
   const reports = channels.map((channel) => verifyChannel({ ...options, previousContracts, channel }));
   return {
     generatedAt: new Date().toISOString(),
