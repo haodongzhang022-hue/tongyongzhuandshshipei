@@ -46,12 +46,10 @@
 | 离线单测 | `tests/test_offline.sh` | 测试 | 212 项，无网可跑（含 `summarize()` verdict 优先级 [13]、nonce 侧信道 [13]、🔴-D 相位化兜底（同步 + **异步**）、漂移相关性表唯一事实源 [14]、watch 影响面 [15]、**🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 [16]**、**🔴-1 占死事件循环有界返回 [17]**、**nonce 侧信道 + v0.1.9d 三形态 [18]**、**批 1.5 通道可见化/降级不放行/§3 反例/exit 台账 [19]**、**🔴 必修-4 同族假绿 [20]**、**🔴-R3′ 通道重定向 + 压退出码 [21]**、**🔴-R3③ 自报降级甩锅（宿主侧 fd3 能力实测）[21]**、**🔴-R3 宿主侧观测主判据 + §三 自报降级 [22]**） |
 | 归因离线回归 | `tests/test_attribution.mjs` | 测试 | 654 项：契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由（同步 [9] + **异步 [9.8]**）+ **🔴 四条出口 / 完成位 / 相位信标 [9.9]** + §四 反向护栏 + 判据表完备性 + ARCHITECTURE 判据表守卫 [7b] + 漂移相关性表唯一事实源 [7c] + triage 影响面 [9] + **[9.10]-[9.17] R28/R26/R24/🔴 必修-4/R26 残留② fail-open/🔴-R3′ 通道重定向/🔴-R3③ 自报降级甩锅/🔴-R3 宿主侧观测**（无网可跑） |
 | 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 191 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d]-[8i] 侧信道 / R28+R26 / R24 / §3 反例 / 🔴 必修-4 / 🔴-R3′ 通道重定向 / 🔴-R3③ 自报降级甩锅 / 🔴-R3 §三 自报降级** 场景，含 attribution + verdict + **完成位**三重断言 |
-
-| 归因端到端回归 | `tests/test_e2e_regression.mjs` | 测试 | 191 项：真宿主复现 🔴-A / 🔴-B / 🔴-C / 🔴-D（漂移吞硬违规 + 自由文本翻案 + 插件侧**同步/异步**异常写进判据字段）+ **🔴 必修-2/3（进程 exit / `run()` 被拖住 / SIGKILL）** + **[8d]-[8i] 侧信道 / R28+R26 / R24 / §3 反例 / 🔴 必修-4 / 🔴-R3′ 通道重定向 / 🔴-R3③ 自报降级甩锅 / 🔴-R3 §三 自报降级** 场景，含 attribution + verdict + **完成位**三重断言 |
 | 双通道验收编排 | `tests/test_hub.sh` | 测试 | 真宿主全流程（含第 4b 步插件侧闸门 / 第 7 步「文档计数防漂移」） |
 | 插件侧闸门 | `tests/gate_plugin_side.sh` | 测试 | ★ 唯一事实源：四条出口 + SIGKILL 边界 + **§3 反例固化** + **exit 钩子台账** + **防过度修正**（健康插件 17/17）；`.cnb.yml` push/PR 两段共用同一份 |
 | 离线探针回归台 | `tests/offline-probe-harness.mjs` | 测试 | 最小假宿主 + 真实探针子进程 + **装配器真实实现**解释输出（秒级覆盖四条出口；边界：假宿主通过 ≠ 真宿主适配通过） |
-| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索（43 项） |
+| 发布面自检 | `tests/test_exports.mjs` | 测试 | exports 全解析 + 模板拷贝可用 + 文档清单顺序/结构一致 + 文档版本一致 + **文档条件项计数 = `CONDITIONAL_PROBE_CHECKS` 长度** + 防线编号自述可检索 + **产物索引表完整性 [2d]**（50 项） |
 | 示例插件 | `tests/fixtures/demo-plugin.mjs` | 测试 | 同时是接入模板 |
 | 负例插件 | `tests/fixtures/broken-plugin.mjs` | 测试 | 验证护栏不静默失效（声明保留名 → 插件侧硬证据） |
 | 负例插件（🔴-D 同步） | `tests/fixtures/plugin-side-throw-plugin.mjs` / `plugin-registry-throw-plugin.mjs` | 测试 | 插件侧**同步**异常（抛错 getter / 未初始化字段）→ `PLUGIN_REGRESSION` 且 `hostFatal=[]` |
@@ -64,8 +62,6 @@
 | 负例插件（🆕 🔴-R3′ 通道重定向） | `tests/fixtures/plugin-channel-redirect-plugin.mjs` | 测试 | `closeSync(3)` + `openSync(<file>)` 把 **fd3 换成文件** ⇒ 从探针写进文件的**真报告**里抄 nonce 前缀 ⇒ 把绿卡写进 stdout + 压 `process.exitCode = 0`（旧实现 **GREEN 放行**）→ 现判 `plugin.protocol_injection`（**宿主侧通道观测**）、不采信任何一条、**不得** GREEN |
 | 负例插件（🆕 §3 反例固化） | `tests/fixtures/plugin-host-tamper-poc-plugin.mjs` | 测试 | 反读 nonce + 写 fd3 绿卡 + 摘 `exit` 钩子 + `exit(0)` 抢跑（原始 PoC 曾判 GREEN）→ 现判 `plugin.probe_result_forged` + `plugin.abnormal_termination`、**不得** GREEN |
 | 负例插件（🆕 批 1.5 出口钩子） | `tests/fixtures/plugin-exit-hook-tamper-plugin.mjs` | 测试 | **只摘**出口③ 的 `exit` 钩子（其余健康）→ `plugin.process_defense_tampered`、`hostFatal=[]`（原先**不可判定**） |
-| 负例插件（H1/R28 防线干预） | `tests/fixtures/plugin-defense-tamper-plugin.mjs` | 测试 | 摘掉探针 handler 后装**自己的**（计数判据假阳性形态）→ `plugin.process_defense_tampered`、`hostFatal=[]` |
-| 负例插件（R24 同步死循环） | `tests/fixtures/plugin-sync-loop-plugin.mjs` | 测试 | `apply()` 内**同步**死循环（3s）→ 宿主 `killSignal:'SIGKILL'` 二次终止收口，`plugin.abnormal_termination`（信标）/ `hostFatal=[]` |
 | CI 流水线 | `.cnb.yml` | 配置 | push/PR/crontab/web_trigger |
 | 页面按钮 | `.cnb/web_trigger.yml` | 配置 | 人不用记命令 |
 
