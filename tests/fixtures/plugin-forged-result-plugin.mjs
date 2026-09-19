@@ -9,14 +9,14 @@
  * 先写伪造绿卡，再制造一个真实缺陷（不注册任何工具）。
  *
  * 期望行为（🆕 nonce 带外通道收口后）：
- * - 宿主**只认带 nonce 的报告**（nonce 由宿主随机生成、经 argv/env 传入）；
+ * - 宿主**只认带 nonce 的报告**（nonce 由宿主随机生成、经 **stdin** 下发，不经 argv / env）；
  * - 伪造的裸 `__DSH_PROBE__` 行被识别为伪造 → 落插件侧 check
  *   `plugin.probe_result_forged`（已登记 `PLUGIN_SIDE_CHECKS`）；
  * - 归因 `PLUGIN_REGRESSION` / RED / `hostFatal[]` 为空（不甩锅上游）；
  * - **绝不**因伪造行而判 GREEN。
  *
  * ⚠️ 口径（不越权承诺，见 RISKS R26 残留边界）：nonce 挡的是「无意的自我发绿卡」与
- * 「共用 stdout 的误命中」。**恶意**插件仍可读自己的 argv/env 拿到 nonce 后伪造——
+ * 「共用 stdout 的误命中」。**恶意**插件仍可用**其它同进程手段**（猴子补丁 / 直接读探针内存）拿到 nonce 后伪造——
  * 根治需**进程隔离 / 独立 fd 作真·带外通道**（结构性重做，待人拍板）。
  */
 import { createAdapter } from '../../src/adapter.mjs';

@@ -22,10 +22,10 @@
  *
  * 退出码：0 = 全绿；1 = 有失败。
  */
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { readFileSync as readText } from 'node:fs';
 import {
   CONDITIONAL_PROBE_CHECKS,
@@ -43,9 +43,7 @@ import {
   PLUGIN_SIDE_CHECKS,
   PROBE_NONCE_STDIN_CHANNEL,
   PLUGIN_PROBE_FORGED_RESULT_CHECK,
-  probeReportTag,
   probeResultLine,
-  PROBE_RESULT_MARKER,
   PLUGIN_SKIP_ON_PRECONDITION,
   PROBE_CHECK_ORDER,
   PROBE_PHASE,
@@ -71,6 +69,7 @@ import { runOfflineProbe, runOfflineProbeWithSources } from './offline-probe-har
 // 源码扫描工具（去注释 / 去字符串字面量）——守卫不能有盲区，见 P2-10
 import { codeOnly, stripComments } from './source-scan.mjs';
 import { DRIFT_FIELDS, DRIFT_IMPACT, classifyDrift, diffReservedNames, triageUpstream } from '../src/triage/index.mjs';
+import { buildSecondary } from '../src/report/secondary.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -1175,45 +1174,24 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
   {
     const mkPayload = (ok = true) => JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok, runCompleted: true, phase: 'plugin-integration' });
     const nonce = createProbeNonce(randomBytes).value;
-    // ① 可证伪（正向）：**已知 nonce** 时，把「凭据有效」的结果行写到 **stdout**（通道已隔离）→ 必须命中。
+    // ① 可证伪（正向）：**已知 nonce** 时，把匹配前缀的结果行写到 **stdout**（通道已隔离）→ 必须命中。
     //    这条**不是恒真式**：把判据删掉 / 把通道隔离关掉，它立刻红。
     {
       const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
       const line = `${probeResultLine(nonce, mkPayload())}\n`;
       interpretProbeStdout(r, line, { resultFd: line, nonce });
-      eq('R26 可达性（可证伪·正向）：凭据有效的结果行出现在 stdout（通道已隔离）→ 判 plugin.protocol_injection', PLUGIN_PROTOCOL_INJECTION_CHECK, r.checks[0]?.name);
+      eq('R26 可达性（可证伪·正向）：匹配 nonce 的结果行出现在 stdout（通道已隔离）→ 判 plugin.protocol_injection', PLUGIN_PROTOCOL_INJECTION_CHECK, r.checks[0]?.name);
       eq('R26 可达性（可证伪·正向）：命中即不放行（ok=false / 完成位 false）', 'false|false', `${r.ok}|${r.runCompleted}`);
     }
-    // ② 可证伪（反向）：同样的输入但**凭据无效**（裸 marker / 标签不符，即插件拿不到 nonce 的形态）
-    //    → **不得**命中结构级防线。两条一起构成「判据有判别力」的证明（只写正向的话，
-    //    一个「恒判篡改」的实现也能过）。
+    // ② 可证伪（反向）：同样的输入但**前缀不匹配**（插件拿不到 nonce 的形态）→ **不得**命中结构级防线。
+    //    两条一起构成「判据有判别力」的证明（只写正向的话，一个「恒判篡改」的实现也能过）。
     {
       const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
       interpretProbeStdout(r, `__DSH_PROBE__${mkPayload()}\n`, { resultFd: `${probeResultLine(nonce, mkPayload())}\n`, nonce });
-      eq('R26 可达性（可证伪·反向）：凭据无效（拿不到 nonce）→ **不**命中结构级防线', false,
+      eq('R26 可达性（可证伪·反向）：前缀不匹配（拿不到 nonce）→ **不**命中结构级防线', false,
         r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
       eq('R26 可达性（可证伪·反向）：改判 plugin.probe_result_forged（侧信道，独立证据链）', true,
         r.checks.some((c) => c.name === PLUGIN_PROBE_FORGED_RESULT_CHECK));
-    }
-    // ②b 🔴-R3′（v0.2.5）：**读到真报告也伪造不出绿卡** —— 正文绑定的标签**不可迁移**。
-    //     这条正是「nonce 保密性不是唯一防线」的可执行证据：插件拿到**真报告那一行**
-    //     （标签 + 真正文）后改成正文本 ⇒ 标签与正文不符 ⇒ 判伪造、不被采信。
-    {
-      const realBody = mkPayload();
-      const stolen = `${probeResultLine(nonce, realBody)}\n`; // 插件从被重定向的 fd3 文件里读到的**真报告行**
-      const stolenTag = stolen.slice(PROBE_RESULT_MARKER.length).split(':')[0];
-      // 自造正文必须与真正文**不同**（否则标签恰好也对得上——那正是「标签绑定正文」的语义）
-      const forgedBody = JSON.stringify({ checks: [{ name: 'plugin.loaded', status: 'pass', detail: 'forged' }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: 'plugin-integration' });
-      const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
-      // 伪造：把**真报告的标签**配到**自造正文**上（这是「拿到 nonce」之外唯一能做的事）
-      interpretProbeStdout(r, `__DSH_PROBE__${stolenTag}:${forgedBody}\n`, { resultFd: '', nonce });
-      eq('🔴-R3′：标签不可迁移（真报告标签 + 自造正文）→ 判 plugin.probe_result_forged', true,
-        r.checks.some((c) => c.name === PLUGIN_PROBE_FORGED_RESULT_CHECK && c.status === 'fail'));
-      eq('🔴-R3′：该形态**不得**被采信（ok≠true / 完成位 false）', 'false|false', `${r.ok === true}|${r.runCompleted === true}`);
-      // 反向护栏：同一行的**原文**（标签 + 真正文）必须仍被采信（标签方案不误伤真报告）
-      const r2 = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
-      interpretProbeStdout(r2, stolen, { resultFd: '', nonce });
-      eq('🔴-R3′ 反向护栏：真报告行（标签与正文相符）仍被采信', true, r2.ok === true);
     }
     // ③ 通道形态事实（**这才是**「经 env / argv 不可达」的机器可检依据）：spawn 参数里
     //    nonce 不在 env、不在 argv，经 stdin 字节流下发。
@@ -1244,6 +1222,23 @@ console.log('  [9.11] R26 协议注入防线（结构不变量 + 通道隔离）
       /真宿主下(\*\*)?不可达/.test(r26Row) || /真宿主下插件无法构造/.test(r26Row));
     eq('R26 口径：RISKS R26 写明经 env/argv 不可达 + 同进程其它手段仍可达（事实陈述）', true,
       /经 env \/ argv 不可达/.test(r26Row) && /同进程/.test(r26Row));
+    // ⑦ 🟡-A 措辞守卫（评审复评 §五）：**现在时**不得写成「nonce 经 argv/env 传入」——
+    // 实现是 **stdin** 下发。此前两处注释写反且**无守卫**（改这两处四套件仍全绿 ⇒ 文档债静默存活）。
+    // 守卫只判这两份文件的注释/文案面；口径陈述（「经 env/argv 不可达」）是**事实陈述**，不在守卫内。
+    {
+      const forgedSrc = readText(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'utf8');
+      const e2eSrc = readText(path.join(ROOT, 'tests/test_e2e_regression.mjs'), 'utf8');
+      eq('🟡-A 措辞：伪造夹具注释不再写「经 argv/env 传入」（实现是 stdin，回退即红）', false,
+        /经 argv\/env 传入/.test(forgedSrc));
+      eq('🟡-A 措辞：伪造夹具残留边界不再写「读自己的 argv/env 拿到 nonce」（实现是 stdin，回退即红）', false,
+        /读自己的 argv\/env 拿到 nonce/.test(forgedSrc));
+      eq('🟡-A 措辞：e2e 注释不再写「argv/env 传递」（实现是 stdin，回退即红）', false,
+        /argv\/env 传递/.test(e2eSrc));
+      eq('🟡-A 措辞：伪造夹具改写成 stdin 事实（正面锚，删掉即红）', true,
+        /经 \*\*stdin\*\* 下发/.test(forgedSrc));
+      eq('🟡-A 措辞：e2e 注释改写成 stdin 事实（正面锚，删掉即红）', true,
+        /\*\*stdin\*\* 下发/.test(e2eSrc));
+    }
   }
 }
 
@@ -1685,7 +1680,7 @@ console.log('  [9.13] 🔴 必修-4 同族假绿：猴子补丁 JSON.stringify�
   eq('🔴-4 源码守卫：捕获点早于首次使用（TDZ：捕获块必须在 expectedTools 解析之前）', true,
     probeSrcForFrozen.indexOf('const STRINGIFY = JSON.stringify;') < probeSrcForFrozen.indexOf('const expectedTools = PARSE('));
   // A-2 源码守卫：写出报告的路径**只用捕获值**（回退成裸 JSON.stringify 即红——那正是本形态的成因）
-  // v0.2.5：结果行改为「认证标签 + 正文」（R3′），正文仍必须**只用捕获值**序列化。
+  // v0.2.5（🔴-R3′ 4.2）：结果行 = **正文绑定标签 + 正文**，正文仍必须**只用捕获值**序列化。
   eq('🔴-4 源码守卫：结果序列化只用捕获值（回退成裸 JSON.stringify 即红）', true,
     /const body = STRINGIFY\(out\);/.test(probeSrcForFrozen)
     && /probeResultLine\(nonceValue, body\)/.test(probeSrcForFrozen));
@@ -1781,6 +1776,9 @@ console.log('  [9.13] 🔴 必修-4 同族假绿：猴子补丁 JSON.stringify�
 
 
 // ---- 9.14. R26 残留边界②（**fail-open**）：fd3 隔离在「探针未 emit」时回退信任 stdout ----
+// ⚠️ 本段在 v0.2.5 被 **🔴-R3′ 的宿主侧通道观测**部分收窄：**自称走 fd3 而宿主侧 fd3 为空**的
+//   形态（原「形态 D」）**不再被采信**（判 `plugin.protocol_injection`，见 [9.15]）。
+//   仍未收窄的是「伪造行写进 **fd3 本身**」（原「形态 C」）——那需要批 2 的「独立 fd 且永不回退 stdout」。
 // 为什么单列（评审复评 §四，本轮实测）：结果通道隔离的判定依据是「**fd3 有没有内容**」
 // （`isolated = channelText.trim().length > 0`），而**不是**「探针**是否**报告过」。于是：
 //   · 探针**正常 emit** → fd3 有内容 → `isolated=true` → 插件多出来的那条行 = 篡改证据 → RED；
@@ -1803,60 +1801,39 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
 {
   // 批 2 落地后把这里改成 false 并**翻面断言**（见上方注释）。本常量是「已知边界」的显式锚点。
   const FAIL_OPEN_KNOWN = true;
-  // ⚠️ v0.2.5（🔴-R3′）：凭据形态从「回显 nonce 的前缀」改为「**正文绑定标签**」，
-  //    故本段的输入改为「**已知正确凭据**」（= 插件已能算出让**该正文**通过的标签，
-  //    即等价于「插件拿到了 nonce」）。**语义未变**：仍是「拿到凭据 ⇒ 该形态可达」。
   const mkPayload = () => JSON.stringify({
     checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [],
     ok: true, runCompleted: true, phase: 'plugin-integration', resultChannel: 'fd3',
   });
-  /** 不自称通道形态的伪造正文（形态 D 的「不触发判据 D」子形态）。 */
-  const mkPayloadNoChannel = () => JSON.stringify({
-    checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [],
-    ok: true, runCompleted: true, phase: 'plugin-integration',
-  });
   const nonce = createProbeNonce(randomBytes).value;
   const forgedLine = `${probeResultLine(nonce, mkPayload())}\n`;
-  const forgedNoChannel = `${probeResultLine(nonce, mkPayloadNoChannel())}\n`;
-  const run = (stdout, resultFd, reportedChannel = null) => {
+  const run = (stdout, resultFd) => {
     const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly', runCompleted: false };
-    interpretProbeStdout(r, stdout, { resultFd, nonce, reportedChannel });
+    interpretProbeStdout(r, stdout, { resultFd, nonce });
     return r;
   };
 
   // ① 形态 C：伪造写 **fd3**、探针**来不及 emit** ⇒ 当前被采信（**已知边界**，批 2 必修）
   {
     const r = run('', forgedLine);
-    eq('R26 残留②（fail-open·形态 C）：**给定插件已拿到凭据** + 伪造写 fd3 + 探针未 emit ⇒ 当前**被采信**（批 2 必修：不得回退）',
+    eq('R26 残留②（fail-open·形态 C）：**给定插件已拿到 nonce** + 伪造写 fd3 + 探针未 emit ⇒ 当前**被采信**（批 2 必修：不得回退）',
       true, r.ok === true);
     eq('R26 残留②：形态 C 无任何篡改证据（`checks` 里只有伪造项）', 0,
       r.checks.filter((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK).length);
   }
-  // ② 形态 D：伪造写 **stdout**、探针**来不及 emit**、且报告**不自称**走 fd3 ⇒ **同样**被采信
-  //    ⇒ 证明「写对通道」不是使能条件（评审复评 §二-② 的实测结论）
-  //    （⚠️ 若报告**自称**走 fd3，则由判据 D 判出——见 ②b）
+  // ② 形态 D：伪造写 **stdout**、探针**来不及 emit** ⇒ **v0.2.5 起不再被采信**（🔴-R3′ 的修法）
+  //    判据：报告**自称**走 fd3（`resultChannel === 'fd3'`）而**宿主侧 fd3 为空**、stdout 却有
+  //    匹配 nonce 的结果行 ⇒ 通道被重定向 ⇒ 判 `plugin.protocol_injection`、不采信任何一条。
+  //    ⚠️ 与形态 C 的分工：C 把伪造行写进 **fd3 本身**（宿主侧"有内容"）⇒ 本判据**不**命中，
+  //    仍属批 2 残留边界。⇒「写对通道」不是使能条件，但**「自称的通道与宿主侧观测矛盾」**是铁证。
   {
-    const r = run(forgedNoChannel, '');
-    eq('R26 残留②（fail-open·形态 D）：**给定已拿到凭据** + 伪造写 **stdout** + 报告**不自称** fd3 + 探针未 emit ⇒ **同样**被采信',
-      true, r.ok === true);
-    eq('R26 残留②：C/D 两形态**同判**（⇒ 通道选择不是关键，写对 fd3 不是使能条件）', true,
-      run('', forgedLine).ok === run(forgedNoChannel, '').ok);
-  }
-  // ②b 🔴-R3′（v0.2.5 **收口**）：同样的「伪造写 stdout + 探针未 emit」，但报告**自称**走 fd3
-  //     ⇒ 判据 D（通道重定向：宿主**实际**从 fd3 读到空 + 报告自述 fd3）命中 ⇒ 判篡改、不采信。
-  //     这是本轮唯一让该形态**从 GREEN 变 RED** 的判据（依据是宿主侧观测，压退出码无效）。
-  {
-    const r = run(forgedLine, '', 'fd3');
-    eq('🔴-R3′ 判据 D：报告自称 fd3 + 宿主实际 fd3 为空 + stdout 有结果行 ⇒ 判 plugin.protocol_injection', true,
-      r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK && c.status === 'fail'));
-    eq('🔴-R3′ 判据 D：命中即**不采信任何一条**（ok≠true / 完成位 false / checks 只剩篡改证据）', 'false|false|1',
-      `${r.ok === true}|${r.runCompleted}|${r.checks.length}`);
-    eq('🔴-R3′ 判据 D：hostFatal 为空（插件侧，不甩锅上游）', 0, r.hostFatal.length);
-    eq('🔴-R3′ 判据 D：归因 PLUGIN_REGRESSION（不放行）', 'PLUGIN_REGRESSION', attributeFailure(r, channel, 'dev'));
-    // 反向护栏（防过度修正）：**降级**形态（报告自称 stdout-degraded）**不得**被本判据误伤
-    const degraded = run(forgedLine, '', 'stdout-degraded');
-    eq('🔴-R3′ 判据 D 反向护栏：报告自称 stdout-degraded（合法降级）⇒ **不**触发判据 D', false,
-      degraded.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    const r = run(forgedLine, '');
+    eq('R26 残留②（形态 D，v0.2.5 起收窄）：自称 fd3 + 宿主侧 fd3 为空 + stdout 有匹配 nonce 行 ⇒ **不得**被采信',
+      false, r.ok === true);
+    eq('R26 残留②：形态 D 判 plugin.protocol_injection（宿主侧通道观测交叉校验）', true,
+      r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('R26 残留②：C/D 两形态**不再同判**（C 仍属批 2 残留边界；D 已被宿主侧观测收窄）', false,
+      run('', forgedLine).ok === run(forgedLine, '').ok);
   }
   // ③ 对照（防线**生效**形态）：探针 emit（fd3 有真报告）+ stdout 出现伪造行 ⇒ 判篡改、不放行
   {
@@ -1866,27 +1843,12 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
     eq('R26 残留② 对照：命中即不放行（ok=false / 完成位 false）', 'false|false', `${r.ok}|${r.runCompleted}`);
   }
   // ④ 机理源码守卫：隔离判定必须仍是「fd3 有没有内容」（回退逻辑的**成因**；批 2 会改这一行）
-  //    ⚠️ 本轮（v0.2.5）**不动**它——评审明确：改「永不回退 stdout」会与 [9.14] 的已知边界断言
-  //    直接冲突（离线 6 条 + attribution 3 条变红）。🔴-R3′ 的收口走**正交**的判据 D + 凭据改造。
   {
     const hostCode = codeOnly(readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8'));
     eq('R26 残留② 源码守卫：隔离判定 = 「fd3 有没有内容」（`isolated` 由通道文本长度推出）', true,
       /isolated = channelText\.trim\(\)\.length > 0/.test(hostCode));
     eq('R26 残留② 源码守卫：`markers` 在通道为空时**回退 stdout**（fail-open 的落点，批 2 改此处）', true,
       /markers = isolated \? matchingOnChannel : matchingOnStdout/.test(hostCode));
-    // 🔴-R3′（v0.2.5）新增：判据 D 必须在源码里（删掉即红——本段的 ②b 行为断言也随之红）
-    eq('🔴-R3′ 源码守卫：判据 D（通道重定向）在 interpretProbeStdout 内（报告自称 fd3 + 宿主实际 fd3 空）', true,
-      /channelRedirectEvidence = reportedChannel === RESULT_CHANNEL_FD3/.test(hostCode)
-      && /&& !isolated/.test(hostCode));
-    // ⚠️ 用**原始源码**（不是 codeOnly）：`codeOnly` 会去掉字符串字面量的文本，而这里要守的
-    //    正是那条人读证据的**措辞锚点**（删掉 push 即红）。
-    const hostRaw = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
-    eq('🔴-R3′ 源码守卫：判据 D 的证据进 injectionEvidence（⇒ 不采信任何一条）', true,
-      /injectionEvidence\.push\('报告自称走 fd3/.test(hostRaw));
-    eq('🔴-R3′ 源码守卫：判据 D 的输入含 reportedChannel（报告自述通道形态）', true,
-      /options\.reportedChannel/.test(hostCode));
-    eq('🔴-R3′ 源码守卫：reportedChannel 由 reportedChannelOf() 在**解释之前**取（宿主侧快照）', true,
-      /reportedChannel: reportedChannelOf\(resultFd, stdout, nonce\.value\)/.test(hostRaw));
   }
   // ⑤ 「已知边界不得静默」：RISKS / REDO-PROPOSAL 必须登记该边界，且写明批 2 的首要目标
   {
@@ -1896,21 +1858,15 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
       r26Row.includes('fail-open') && r26Row.includes('回退信任 stdout'));
     eq('R26 残留②：RISKS 写明使能条件 =「探针是否来得及 emit」（而非「写对通道」）', true,
       r26Row.includes('通道选择不是关键') && r26Row.includes('来得及 emit'));
-    // 🔴-R3′（评审 §二 归因修正）：**不得**再写「唯一有效的腿 = nonce 保密性」——
-    // 通道重定向形态（插件把 fd3 换成自己的文件 ⇒ 探针**亲自**把凭据写进插件文件）
-    // **主动绕过**了保密性 ⇒ 那句话会误导批 2 优先级（以为保住 nonce 就够）。
-    // ⚠️ 判据要**去掉删除线片段**（`~~旧口径~~` 是「已作废」的显式标注，保留它是必要的）；
-    //    只有**活的**断言句才违规（如「当前唯一有效的腿 = nonce 保密性」）。
-    const r26Live = r26Row.replace(/~~[\s\S]*?~~/g, '');
-    // 旧口径原话是「当前**唯一有效**的那条腿是 **nonce 保密性**」——删掉「唯一有效」这个说法即收口。
-    eq('🔴-R3′ 口径：RISKS R26 的**活口径**不再写「唯一有效」（会误导批 2 优先级）', false,
-      /唯一\*{0,2}有效/.test(r26Live));
-    eq('🔴-R3′ 口径：RISKS R26 的活口径**显式更正**为「nonce 保密性不是唯一防线」', true,
-      r26Live.includes('nonce 保密性不是唯一防线'));
-    eq('🔴-R3′ 口径：RISKS R26 写明「凭据由探针亲自交出 ⇒ 保密性被主动绕过」的通道重定向形态', true,
-      r26Row.includes('通道重定向') && r26Row.includes('主动'));
     eq('R26 残留②：RISKS 写明批 2 首要目标（永不回退 stdout）', true,
-      r26Row.includes('永不回退 stdout'));
+      r26Row.includes('nonce 保密性') && r26Row.includes('永不回退 stdout'));
+    // 🔴-R3′ 4.2 归因更正（v0.2.7）：RISKS 的**活口径**（去掉删除线片段）**不得**再声称
+    // 「nonce 保密性是**唯一**防线」——通道重定向形态会**主动**绕过它（凭据由探针亲自交出）。
+    const r26Live = r26Row.replace(/~~[\s\S]*?~~/g, '');
+    eq('🔴-R3′ 口径更正：RISKS R26 活口径不再写「唯一有效」（会误导批 2 优先级）', false,
+      /唯一\*{0,2}有效/.test(r26Live));
+    eq('🔴-R3′ 口径更正：RISKS R26 活口径写明「nonce 保密性不是唯一防线」+ 凭据不可迁移', true,
+      r26Live.includes('nonce 保密性不是唯一防线') && r26Live.includes('不可迁移'));
     const redo = readText(path.join(ROOT, 'docs/REDO-PROPOSAL.md'), 'utf8');
     eq('R26 残留②：REDO-PROPOSAL 批 2 立项说明含「独立 fd 且永不回退 stdout」（首要目标）', true,
       redo.includes('永不回退 stdout') && redo.includes('首要目标'));
@@ -1919,155 +1875,338 @@ console.log('  [9.14] R26 残留边界②（fail-open）：探针未 emit 时回
   eq('R26 残留②：本段为「已知边界」的显式锚点（批 2 落地后必须翻面为「不得被采信」）', true, FAIL_OPEN_KNOWN);
 }
 
-// ---- 9.15. 🔴-R3′（v0.2.5）：**通道重定向** —— 报告自称 fd3 而宿主实际 fd3 为空 ----
-// 为什么单列（评审第 3 次回转 · 上限轮，实测 R3′）：插件把 fd3 **换成自己的文件**
-// （`closeSync(3)` + `openSync(...)` 拿回同一 fd 号）⇒ 探针（**不知情**）把**带凭据的真报告**
-// 写进**插件的文件** ⇒ 插件在 `exit` 钩子里**合法读出**凭据 ⇒ 再伪造绿卡 + 压 `process.exitCode = 0`。
-// 旧实现（结果行**回显 nonce**）下判 **`GREEN` 放行**（`1a09a83` / `6b700eb` 均复现）。
-// ⇒ **归因修正**：该形态**不需要**插件提前拿到 nonce——凭据是探针**亲自**交出的
-//   ⇒ R26 不得再写「**唯一**有效的腿 = nonce 保密性」（会误导批 2 优先级）。
-// 收口两条**并集**（均不依赖批 2、与 [9.14] 的已知边界**正交**）：
-//   C′ 结果行**不回显 nonce**，改**正文绑定**认证标签（凭据**不可迁移**）；
-//   D  判据 D（通道重定向）：报告自称 fd3 + 宿主**实际**从 fd3 读到空 + stdout 出现结果行。
-console.log('  [9.15] 🔴-R3′ 通道重定向（fd3 被换成插件的文件）：判据 D + 凭据不可迁移');
+// ---- 9.15. 🔴-R3′（评审复评，收窄后的活口）：结果通道**重定向** + 压退出码 ⇒ 宿主侧通道观测交叉校验 ----
+// 为什么单列（评审 §3）：`plugin.exit_code_mismatch` 的判据是「报告 `ok=true` 而退出码非 0」——
+// 但**退出码与报告同属探针进程的可写状态**：插件在 `'exit'` 钩子里 `process.exitCode = 0` 即可压掉。
+// 完整形态（本仓夹具 `plugin-channel-redirect-plugin`，真宿主实测）：
+//   ① `closeSync(3)` + `openSync(<file>)` ⇒ **fd3 被换成普通文件**（宿主侧管道读端只见 EOF）；
+//   ② 探针收尾把**真报告**写进那个文件 ⇒ 插件在 `'exit'` 钩子里读回它，**连 nonce 前缀一起拿到**
+//      （不必反读 env / argv —— 探针自己把凭据写给了它）；
+//   ③ 用该前缀把全绿卡写进 **stdout**，并压 `process.exitCode = 0`。
+// ⇒ 旧实现三条防线全失效：`isolated=false` ⇒ 回退信任 stdout（伪造行成为唯一 marker）；
+//   退出码被压成 0 ⇒ 退出码交叉不命中 ⇒ **GREEN 放行**（真缺陷 `registry.exact` 被绿卡掩盖）。
+//
+// 收口判据（**宿主侧通道观测**）：报告**自称**走 fd3 而**宿主侧该通道无任何内容**、且 stdout
+// 反而出现**匹配 nonce** 的结果行 ⇒ 判 `plugin.protocol_injection`、**不采信任何一条**。
+// 为什么这条腿插件压不掉：它**只依赖宿主进程看到的东西**（管道读端为空），不依赖探针自报、
+// 也不依赖退出码 ⇒ 防线从「报告 + 退出码」两条信道升级为「+ **宿主侧通道观测**」三条。
+console.log('  [9.15] 🔴-R3′：通道重定向 + 压退出码（宿主侧通道观测交叉校验）');
 {
-  const hostRaw = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
-  // 变异：关掉判据 D（用于「删判据即红」的自证）
-  const mutatedD = hostRaw.replace(
-    'const channelRedirectEvidence = reportedChannel === RESULT_CHANNEL_FD3',
-    'const channelRedirectEvidence = false && reportedChannel === RESULT_CHANNEL_FD3',
-  );
-  eq('🔴-R3′ 变异自证：D 变异确实改动了装配器源码（否则下面的自证空转）', true, mutatedD !== hostRaw);
-  // 动态 import 变异版装配器（与 runOfflineProbeWithSources 同机制：连带 contract.mjs 拷进临时目录）
-  const mutatedDir = mkdtempSync(path.join(tmpdir(), 'dsh-r3p-host-'));
-  let mutatedHost = null;
-  try {
-    writeFileSync(path.join(mutatedDir, 'host.mjs'), mutatedD);
-    copyFileSync(path.join(ROOT, 'src/harness/contract.mjs'), path.join(mutatedDir, 'contract.mjs'));
-    mutatedHost = await import(pathToFileURL(path.join(mutatedDir, 'host.mjs')).href);
-  } finally {
-    rmSync(mutatedDir, { recursive: true, force: true });
-  }
-
-  // 合成输入：**有效凭据**（= 插件已能算出让该正文通过的标签，等价于「拿到了 nonce」）
-  // + 报告**自称**走 fd3 + 宿主**实际**从 fd3 读到空 + stdout 出现结果行。
-  const nonce = createProbeNonce(randomBytes).value;
-  const greenBody = JSON.stringify({
+  const mkPayload = (channel = 'fd3') => JSON.stringify({
     checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [],
-    ok: true, runCompleted: true, phase: 'plugin-integration', resultChannel: 'fd3',
+    ok: true, runCompleted: true, phase: 'plugin-integration', resultChannel: channel,
   });
-  const forged = `${probeResultLine(nonce, greenBody)}\n`;
-  const runWith = (hostMod) => {
+  const nonce = createProbeNonce(randomBytes).value;
+  const line = (payload) => `${probeResultLine(nonce, payload)}\n`;
+  const run = (stdout, resultFd) => {
     const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly', runCompleted: false };
-    hostMod.interpretProbeStdout(r, forged, { resultFd: '', nonce, reportedChannel: 'fd3' });
+    interpretProbeStdout(r, stdout, { resultFd, nonce });
     return r;
   };
-  // ① 生产口径：判据 D 命中 ⇒ 不放行
+  const hit = (r) => r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK);
+
+  // ① 正向（可证伪）：自称 fd3 + 宿主侧 fd3 为空 + stdout 有匹配 nonce 行 ⇒ 必须命中
   {
-    const r = runWith({ interpretProbeStdout });
-    eq('🔴-R3′ 判据 D：报告自称 fd3 + 宿主实际 fd3 为空 + stdout 有结果行 ⇒ 判 plugin.protocol_injection', true,
-      r.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK && c.status === 'fail'));
-    eq('🔴-R3′ 判据 D：命中 ⇒ 不采信任何一条（ok≠true / 完成位 false / checks 只剩篡改证据）', 'false|false|1',
-      `${r.ok === true}|${r.runCompleted}|${r.checks.length}`);
-    eq('🔴-R3′ 判据 D：hostFatal 为空（插件侧，不甩锅上游）', 0, r.hostFatal.length);
-    eq('🔴-R3′ 判据 D：归因 PLUGIN_REGRESSION（不放行）', 'PLUGIN_REGRESSION', attributeFailure(r, channel, 'dev'));
+    const r = run(line(mkPayload()), '');
+    eq('🔴-R3′ 正向：自称走 fd3 而**宿主侧 fd3 为空** + stdout 出现匹配 nonce 的结果行 ⇒ 判 plugin.protocol_injection', true, hit(r));
+    eq('🔴-R3′ 正向：命中即不放行（ok=false / 完成位 false）', 'false|false', `${r.ok}|${r.runCompleted}`);
+    eq('🔴-R3′ 正向：hostFatal 为空（插件侧错误不进判据字段）', 0, r.hostFatal.length);
   }
-  // ② 变异自证（**删判据即红**）：D 关掉后**同一输入**被采信 ⇒ 证明 D 是承重的（不是装饰）。
-  //    ⚠️ 该输入用「**凭据对任意正文都有效**」模拟**旧口径**（结果行回显 nonce ⇒ 偷到凭据即可
-  //    伪造任何正文）。故本项同时是「旧实现为何判 GREEN」的机理自证：
-  //    D 关 + 凭据可迁移 ⇔ `1a09a83` / `6b700eb` 的行为。
+  // ② 反向护栏 a（防过度修正）：**健康路径**——自称 fd3 且宿主侧 fd3 确实有报告 ⇒ **不得**命中
   {
-    const r = runWith(mutatedHost);
-    eq('🔴-R3′ 变异自证：关掉判据 D ⇒ 同一输入**被采信**（ok=true / 完成位 true）——证明 D 承重', 'true|true',
-      `${r.ok === true}|${r.runCompleted === true}`);
-    eq('🔴-R3′ 变异自证：关掉判据 D 后无任何篡改证据（这正是旧实现放行的机理）', 0,
-      r.checks.filter((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK).length);
+    const r = run('', line(mkPayload()));
+    eq('🔴-R3′ 反向 a：自称 fd3 且**宿主侧 fd3 有内容**（正常路径）⇒ 不误报', false, hit(r));
+    eq('🔴-R3′ 反向 a：正常路径仍被采信（ok=true）', true, r.ok === true);
   }
-  // ②c 变异自证（**凭据回退即红/即绿**，两条腿各自承重）——「回退即红」的可执行证据。
-  //     A) 把探针的凭据回退成**旧口径**（结果行回显 nonce）+ 判据 D 仍在 ⇒ 仍 **RED**（D 独立兜住）；
-  //     B) 凭据回退 + 判据 D 关掉 ⇒ **复现旧实现的 GREEN 放行**（`1a09a83` / `6b700eb` 的行为）。
-  //     两条一起证明：**凭据改造**与**判据 D** 各自都是承重的，缺一条即回到放行级假绿。
+  // ③ 反向护栏 b：老探针 / 合成 payload **无** `resultChannel` 字段 ⇒ 不追溯判（向后兼容，不制造假红）
   {
-    const probeRaw = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
-    const legacyProbe = probeRaw.replace(
-      'const payload = `${probeResultLine(nonceValue, body)}\\n`;',
-      'const payload = `${nonceValue ? PROBE_RESULT_MARKER + nonceValue + \':\' : PROBE_RESULT_MARKER}${body}\\n`;',
-    );
-    eq('🔴-R3′ 变异自证：凭据回退变异确实改动了探针源码（否则下面的自证空转）', true, legacyProbe !== probeRaw);
-    const fixture = path.join(ROOT, 'tests/fixtures', 'plugin-fd3-redirect-plugin.mjs');
-    // A) 只回退凭据（判据 D 仍在）⇒ D 独立兜住，仍不放行
-    const a = await runOfflineProbeWithSources({ probeSource: legacyProbe, pluginPath: fixture, expectedTools: ['demo_echo'] });
-    eq('🔴-R3′ 变异回退 A（凭据回退成旧口径，D 仍在）：仍**不得**判通过（D 独立兜住）', false, a.result.ok === true);
-    eq('🔴-R3′ 变异回退 A：失败项含 plugin.protocol_injection（判据 D）', true,
-      a.result.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK && c.status === 'fail'));
-    // B) 凭据回退（探针**与**宿主都回退成「回显 nonce 前缀」）+ 判据 D 关掉 ⇒ 复现旧实现的放行
-    //    （证明「两条腿都承重」）。⚠️ 必须**两侧同时**回退：只回退探针一侧时，宿主仍按标签校验
-    //    ⇒ 伪造行仍被判伪造（那正是「正文绑定」在起作用）。
-    const legacyHost = mutatedD.replace(
-      'return { ok: tag === probeReportTag(nonce, body), body };',
-      'return { ok: tag === nonce, body };',
-    );
-    eq('🔴-R3′ 变异自证：宿主凭据校验回退变异确实改动了源码（否则 B 自证空转）', true, legacyHost !== mutatedD);
-    const b = await runOfflineProbeWithSources({ probeSource: legacyProbe, pluginPath: fixture, expectedTools: ['demo_echo'], hostSource: legacyHost });
-    eq('🔴-R3′ 变异回退 B（凭据回退 + D 关掉）：**复现旧实现的 GREEN 放行**（这就是 🔴-R3′ 的机理）', true,
-      b.result.ok === true);
-    eq('🔴-R3′ 变异回退 B：该形态下无任何篡改证据（与 `6b700eb` 的实测一致）', 0,
-      b.result.checks.filter((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK).length);
+    const legacy = JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true });
+    const r = run(line(legacy), '');
+    eq('🔴-R3′ 反向 b：老探针无 resultChannel 字段 ⇒ 本判据不误判（向后兼容）', false, hit(r));
+  }
+  // ④ 反向护栏 c：**降级**形态（自称 stdout-degraded）⇒ 由降级路径处理，不由本判据判
+  {
+    const r = run(line(mkPayload('stdout-degraded')), '');
+    eq('🔴-R3′ 反向 c：自称 stdout-degraded（降级形态）⇒ 不由本判据判（降级有独立归因路径）', false, hit(r));
+  }
+  // ⑤ 边界（**不越权承诺**）：伪造行写进 **fd3 本身**（自称 fd3 且宿主侧 fd3 有内容）⇒ 本判据不命中
+  //    那需要批 2 的「独立 fd 且永不回退 stdout」——把边界固化成断言，修好即红。
+  {
+    const r = run('', line(mkPayload()));
+    eq('🔴-R3′ 边界：伪造行写进 **fd3 本身**（自称与观测一致）⇒ 本判据不命中（批 2 残留边界，不越权承诺）',
+      false, hit(r));
   }
 
-  // ③ 真协议（离线探针 + 假宿主）：R3′ 夹具必须 RED / 不放行 / hostFatal 为空
+  // ⑥ 行为级（**真协议**跑夹具）：两种形态都必须 RED / 判插件侧 / hostFatal 为空
   {
-    const r = runOfflineProbe({
-      pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-fd3-redirect-plugin.mjs'),
-      expectedTools: ['demo_echo'],
-    });
-    const failed = r.result.checks.filter((c) => c.status === 'fail').map((c) => c.name);
-    eq('🔴-R3′ 真协议：**不得**判通过（ok≠true）——旧实现此处 GREEN 放行', false, r.result.ok === true);
-    eq('🔴-R3′ 真协议：归因 PLUGIN_REGRESSION + 完成位 false', 'PLUGIN_REGRESSION|false',
-      `${r.attribution}|${r.result.runCompleted}`);
-    eq('🔴-R3′ 真协议：失败项含 plugin.protocol_injection（判据 D，依据宿主侧对 fd3 的实际观测）', true,
-      failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
-    eq('🔴-R3′ 真协议：hostFatal 为空（插件侧错误不进判据字段）', 0, r.result.hostFatal.length);
-    eq('🔴-R3′ 真协议：压 process.exitCode=0 无效（夹具确实压了退出码）', 0, r.exit.status);
+    const fixture = path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs');
+    for (const [mode, label] of [['all', 'R3′（重定向 + 压退出码）'], ['no-squelch', 'R3 主形态（只重定向）']]) {
+      process.env.DSH_CHANNEL_REDIRECT_MODE = mode;
+      const r = runOfflineProbe({ pluginPath: fixture, expectedTools: ['demo_echo'] });
+      const failed = r.result.checks.filter((c) => c.status === 'fail').map((c) => c.name);
+      eq(`🔴-R3′ 行为（${label}）：归因 PLUGIN_REGRESSION（不甩锅上游）`, 'PLUGIN_REGRESSION', r.attribution);
+      eq(`🔴-R3′ 行为（${label}）：**不得**判通过（ok=false）`, false, r.result.ok === true);
+      eq(`🔴-R3′ 行为（${label}）：失败项含 plugin.protocol_injection`, true, failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+      eq(`🔴-R3′ 行为（${label}）：hostFatal 为空（插件侧错误不进判据字段）`, 0, r.result.hostFatal.length);
+    }
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
   }
-  // ④ 反向护栏（防过度修正）：健康插件仍 17/17 全绿 + 跑完 + 不降级
+
+  // ⑦ 变异自证（**回退即红**，两条腿各自独立成立）
   {
-    const healthy = runOfflineProbe({
+    const fixture = path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs');
+    const hostSrc = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
+    const mutatedHost = hostSrc.replace(
+      'channelRedirectEvidence = !isolated && stdoutMarkers.length > 0',
+      'channelRedirectEvidence = false && !isolated && stdoutMarkers.length > 0');
+    eq('🔴-R3′ 变异自证：变异（关掉宿主侧通道观测）确实改动了源码', true, mutatedHost !== hostSrc);
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'all';
+    const off = await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ['demo_echo'], hostSource: mutatedHost });
+    // 🔴-R3′ 4.2（本轮并集）：**只**关掉判据 D 已**不再**复现假绿——**凭据改造**（正文绑定标签）
+    // 独立兜住（偷到的标签配自造正文 ⇒ 凭据无效 ⇒ 判 `plugin.probe_result_forged`）。
+    // ⇒ 两条腿**并集**：缺任一条仍不放行（比单腿更强，故本断言断言「仍不放行」）。
+    eq('🔴-R3′ 变异回退（并集）：**只**关判据 D ⇒ 仍**不得**假绿（凭据改造独立兜住）', false, off.result.ok === true);
+    eq('🔴-R3′ 变异回退（并集）：此时失败项为 plugin.probe_result_forged（凭据无效）', true,
+      off.result.checks.some((c) => c.name === PLUGIN_PROBE_FORGED_RESULT_CHECK));
+    // 只重定向（不压退出码）的形态在变异下仍由**退出码交叉**兜住 ⇒ 三条腿互相独立
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'no-squelch';
+    const offNoSquelch = await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ['demo_echo'], hostSource: mutatedHost });
+    eq('🔴-R3′ 变异回退：R3 主形态（不压退出码）在变异下仍不放行', false, offNoSquelch.result.ok === true);
+    eq('🔴-R3′ 变异回退：此时失败项落在插件侧（凭据无效 / 抢跑退出，名单取自唯一事实源）', true,
+      offNoSquelch.result.checks.filter((c) => c.status === 'fail')
+        .every((c) => PLUGIN_SIDE_CHECKS.includes(c.name)));
+    // ⑧b **双回退**（判据 D 关掉 + 凭据退回旧口径）⇒ **复现旧实现的 GREEN 放行**
+    //     （这正是 `1a09a83` / `6b700eb` 的行为 ⇒ 「两条腿都承重」的可执行证据）。
+    {
+      const probeRawForR3 = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+      const legacyProbe = probeRawForR3.replace(
+        'const payload = `${probeResultLine(nonceValue, body)}\\n`;',
+        'const payload = `${nonceValue ? PROBE_RESULT_MARKER + nonceValue + \':\' : PROBE_RESULT_MARKER}${body}\\n`;',
+      );
+      const legacyHost = mutatedHost.replace(
+        'return { ok: tag === probeReportTag(nonce, body), body };',
+        'return { ok: tag === nonce, body };',
+      );
+      eq('🔴-R3′ 双回退自证：两处变异确实改动了源码', true, legacyProbe !== probeRawForR3 && legacyHost !== mutatedHost);
+      // ⚠️ 形态必须回到 `all`（压退出码）——否则退出码交叉会独立兜住，拿不到「旧实现的 GREEN」对照。
+      process.env.DSH_CHANNEL_REDIRECT_MODE = 'all';
+      const both = await runOfflineProbeWithSources({ pluginPath: fixture, expectedTools: ['demo_echo'], probeSource: legacyProbe, hostSource: legacyHost });
+      eq('🔴-R3′ 双回退：判据 D 关掉 + 凭据退回旧口径 ⇒ **复现旧实现的 GREEN 放行**（ok=true）', true,
+        both.result.ok === true);
+      eq('🔴-R3′ 双回退：该形态下真缺陷 registry.exact 被绿卡掩盖（17/17 全 pass）', '17|0',
+        `${both.result.checks.filter((c) => c.status === 'pass').length}|${both.result.checks.filter((c) => c.status === 'fail').length}`);
+    }
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+  }
+
+  // ⑧ 源码守卫（判据的落点与用词，改名 / 回退即红）
+  {
+    const hostCode = codeOnly(readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8'));
+    eq('🔴-R3′ 源码守卫：判据用**唯一事实源**常量 RESULT_CHANNEL_FD3（不写裸字面量）', true,
+      /claimedChannel === RESULT_CHANNEL_FD3/.test(hostCode));
+    eq('🔴-R3′ 源码守卫：判据依赖**宿主侧观测**（宿主侧 fd3 为空 + stdout 有结果行）', true,
+      /!isolated && stdoutMarkers.length > 0/.test(hostCode));
+    eq('🔴-R3′ 源码守卫：判据落进 injectionEvidence（与结构不变量同一条不采信路径）', true,
+      /claimedChannel === RESULT_CHANNEL_FD3[\s\S]{0,400}?injectionEvidence\.push\(/.test(hostCode));
+    eq('🔴-R3′ 落点 check 已登记进 PLUGIN_SIDE_CHECKS（否则归因退化成 UNKNOWN）', true,
+      PLUGIN_SIDE_CHECKS.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+  }
+
+  // ⑨ 夹具自检（否则上面的行为断言空转）
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'utf8');
+    eq('🔴-R3′ 夹具：真的关掉 fd 3 再把同一 fd 号指向普通文件（通道重定向）', true,
+      /closeSync\(3\)/.test(src) && /openSync\(REDIRECT_PATH/.test(src));
+    eq('🔴-R3′ 夹具：真的在 exit 钩子里读回探针写进文件的**真报告**（凭据来自探针自报，不必反读 env/argv）', true,
+      /readFileSync\(REDIRECT_PATH/.test(src));
+    eq('🔴-R3′ 夹具：真的把绿卡写进 **stdout**（伪造结果行）', true, /writeSync\(1,/.test(src));
+    eq('🔴-R3′ 夹具：两段式（all = 重定向 + 压退出码；no-squelch = 只重定向）', true,
+      /DSH_CHANNEL_REDIRECT_MODE/.test(src) && /mode === 'all' \|\| claimDegrade\) process\.exitCode = 0/.test(src));
+    eq('🔴-R3′ 夹具：真缺陷（多注册 demo_extra ⇒ registry.exact 应红，绿卡不得掩盖它）', true,
+      /demo_extra/.test(src));
+    eq('🔴-R3′ 夹具：自述期望 hostFatal 为空（不变量写在夹具里）', true, src.includes('hostFatal[]'));
+    eq('🔴-R3′ 夹具：自述口径不越权（残留边界指向批 2 / REDO-PROPOSAL）', true,
+      src.includes('进程级对抗') && src.includes('REDO-PROPOSAL'));
+  }
+}
+
+// ---- 9.16. 🔴-R3 附带（评审「下一步要求 ③」）：**自报降级 ⇒ 甩锅上游** ----
+// 为什么单列（评审 §2.5 附带发现）：插件 `closeSync(3)` / 直接伪造一条
+// `resultChannel: 'stdout-degraded'` 的报告 ⇒ 宿主按「环境没有 fd3」处理 ⇒ 落 `hostFatal[]`
+// ⇒ `UPSTREAM_DRIFT` / **AMBER（甩锅上游）**：插件 tamper 被报成环境/上游问题，**修错方向**。
+// 收口与「通道重定向」同源：宿主侧 **fd3 能力独立实测**（`probeFd3Capability()`）——
+// 实测可用却自报不可用 = 自报与事实矛盾 = 通道在插件代码运行期间被关闭/替换。
+console.log('  [9.16] 🔴-R3 附带：自报降级甩锅上游（宿主侧 fd3 能力实测交叉校验）');
+{
+  const hostSrcForDegrade = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
+  const hostCodeForDegrade = codeOnly(hostSrcForDegrade);
+  // 源码守卫：宿主侧能力实测 + 判据前提
+  eq('🔴-R3③ 源码守卫：装配器提供宿主侧 fd3 能力实测（probeFd3Capability）', true,
+    /export function probeFd3Capability\(\)/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：生产路径把实测值交给解释器（fd3Usable）', true,
+    /fd3Usable: probeFd3Capability\(\)/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：生产路径声明「宿主确实提供了 fd3」（fd3Provided: true）', true,
+    /fd3Provided: true/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：判据 = 自报降级 ∧ 宿主侧实测可用 ∧ 确实提供了 fd3', true,
+    /result\.resultChannelDegraded && fd3Usable === true && fd3Provided !== false/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：能力实测**记忆化**（每进程只测一次，不重复起子进程）', true,
+    /fd3CapabilityCache !== undefined/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：spawn 失败 / 超时 ⇒ 返回 null（「测不出来」而非「不可用」，避免判据静默失效）', true,
+    /if \(run\.error\) \{[\s\S]{0,140}fd3CapabilityCache = null;/.test(hostSrcForDegrade));
+  eq('🔴-R3③ 源码守卫：协议注入落点抽成单一函数 markProtocolInjection（三条判据共用）', true,
+    /function markProtocolInjection\(result, evidence\)/.test(hostCodeForDegrade));
+  eq('🔴-R3③ 源码守卫：三处判据都走该落点（≥3 次调用；各自实现必然漏清某个字段）', true,
+    (hostCodeForDegrade.match(/markProtocolInjection\(result,/g) ?? []).length >= 3);
+  eq('🔴-R3③：probeFd3Capability 在公共导出面（接入方可自检环境能力）', true,
+    /probeFd3Capability/.test(readText(path.join(ROOT, 'src/index.mjs'), 'utf8')));
+
+  // 判据级（可证伪正反两条 + 反向护栏）
+  {
+    const nonce = createProbeNonce(randomBytes).value;
+    const mk = (extra) => JSON.stringify({ checks: [{ name: 'host.tools_ready', status: 'pass' }], errors: [], hostFatal: [], ok: true, runCompleted: true, ...extra });
+    const run = (extra, opts = {}) => {
+      const r = { checks: [], errors: [], hostFatal: [], phase: 'host-assembly' };
+      interpretProbeStdout(r, `${probeResultLine(nonce, mk(extra))}\n`, { resultFd: '', nonce, ...opts });
+      return r;
+    };
+    const degraded = { resultChannel: 'stdout-degraded', resultChannelAtStart: 'stdout-degraded' };
+    // ① 正向：自报降级 + 宿主侧实测可用且确实提供了 fd3 ⇒ 必须判篡改（**不**甩锅上游）
+    const fake = run(degraded, { fd3Usable: true, fd3Provided: true });
+    eq('🔴-R3③ 正向：自报降级 + 宿主侧实测可用 ⇒ 判 plugin.protocol_injection', true,
+      fake.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 正向：**不得**落 hostFatal[]（不再把插件 tamper 报成环境/上游问题）', 0, fake.hostFatal.length);
+    eq('🔴-R3③ 正向：归因 PLUGIN_REGRESSION（**不得** UPSTREAM_DRIFT）', 'PLUGIN_REGRESSION',
+      attributeFailure(fake, channel, 'dev'));
+    eq('🔴-R3③ 正向：不采信任何一条（checks 只留篡改证据 + 完成位 false）', '1|false',
+      `${fake.checks.length}|${fake.runCompleted}`);
+    // ② 反向护栏 a（**真**降级）：宿主**未提供** fd3（离线台 noResultChannel 形态）⇒ 不误判篡改
+    const realByUnprovided = run(degraded, { fd3Usable: true, fd3Provided: false });
+    eq('🔴-R3③ 反向 a：宿主未提供 fd3（真降级）⇒ 不误判篡改', false,
+      realByUnprovided.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 反向 a：真降级仍落 hostFatal[] ⇒ UPSTREAM_DRIFT（AMBER，不放行）', '1|UPSTREAM_DRIFT',
+      `${realByUnprovided.hostFatal.length}|${attributeFailure(realByUnprovided, channel, 'dev')}`);
+    // ③ 反向护栏 b（能力实测不可用）⇒ 真降级，不误判
+    const realByCapability = run(degraded, { fd3Usable: false, fd3Provided: true });
+    eq('🔴-R3③ 反向 b：能力实测不可用 ⇒ 真降级，不误判篡改', false,
+      realByCapability.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    // ④ 反向护栏 c：老装配器 / 合成输入**未传**新选项 ⇒ 判据不启用（向后兼容，不制造假红）
+    const legacyOpts = run(degraded, {});
+    eq('🔴-R3③ 反向 c：未传 fd3Usable/fd3Provided（老装配器 / 合成输入）⇒ 判据不启用（向后兼容）', false,
+      legacyOpts.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 反向 c：兼容路径行为与 v0.2.3 一致（仍落 hostFatal[]）', 1, legacyOpts.hostFatal.length);
+  }
+
+  // 行为级（离线探针回归台：假宿主 + 真实探针 + 真实装配器实现）三形态 A/B
+  {
+    const fixture = path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs');
+    const probeOf = (mode) => {
+      process.env.DSH_CHANNEL_REDIRECT_MODE = mode;
+      const r = runOfflineProbe({ pluginPath: fixture, expectedTools: ['demo_echo'] });
+      return { r, failed: r.result.checks.filter((c) => c.status === 'fail').map((c) => c.name) };
+    };
+    const noSquelch = probeOf('no-squelch');
+    eq('🔴-R3③ 行为（主形态，不压退出码）：判 plugin.protocol_injection', true,
+      noSquelch.failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+    const all = probeOf('all');
+    eq('🔴-R3③ 行为（重定向 + 压退出码）：**不得**假绿（ok=false）', false, all.r.result.ok === true);
+    eq('🔴-R3③ 行为（压退出码）：判 plugin.protocol_injection（宿主侧观测压不掉）', true,
+      all.failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+    const degradeClaim = probeOf('degrade-claim');
+    eq('🔴-R3③ 行为（自报降级甩锅）：归因**不得** UPSTREAM_DRIFT', 'PLUGIN_REGRESSION', degradeClaim.r.attribution);
+    eq('🔴-R3③ 行为（自报降级甩锅）：hostFatal 为空（插件 tamper 不报成环境/上游问题）', 0,
+      degradeClaim.r.result.hostFatal.length);
+    eq('🔴-R3③ 行为（自报降级甩锅）：判 plugin.protocol_injection', true,
+      degradeClaim.failed.includes(PLUGIN_PROTOCOL_INJECTION_CHECK));
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+  }
+
+  // 反向护栏（防过度修正）：**真**降级（回归台故意不给 fd3）仍按环境限制处理
+  {
+    const realDegrade = runOfflineProbe({
       pluginPath: path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'),
       expectedTools: ['demo_echo', 'demo_status'],
+      noResultChannel: true,
     });
-    eq('🔴-R3′ 反向护栏：健康插件仍 17/17 全绿 + 跑完 + 无宿主侧信号', '17|true|0',
-      `${healthy.result.checks.filter((c) => c.status === 'pass').length}|${healthy.result.runCompleted}|${healthy.result.hostFatal.length}`);
-    eq('🔴-R3′ 反向护栏：健康插件 ok=true（新判据不误伤正常路径）', true, healthy.result.ok === true);
+    eq('🔴-R3③ 反向护栏：真降级（宿主未提供 fd3）不误判为篡改', false,
+      realDegrade.result.checks.some((c) => c.name === PLUGIN_PROTOCOL_INJECTION_CHECK));
+    eq('🔴-R3③ 反向护栏：真降级仍判 UPSTREAM_DRIFT + hostFatal 非空（AMBER，不放行）', 'UPSTREAM_DRIFT|1',
+      `${realDegrade.attribution}|${realDegrade.result.hostFatal.length}`);
+    const healthy = runOfflineProbe({ pluginPath: path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), expectedTools: ['demo_echo', 'demo_status'] });
+    eq('🔴-R3③ 反向护栏：健康插件同代码下仍 17/17 全绿（防过度修正）', '17|0|true',
+      `${healthy.result.checks.filter((c) => c.status === 'pass').length}|${healthy.result.checks.filter((c) => c.status === 'fail').length}|${healthy.result.ok === true}`);
   }
-  // ⑤ 夹具自检（否则上面的真协议断言空转）：必须真的做那四步
+
+  // 变异回退（**回退即红**）：关掉「自报降级 vs 宿主侧实测」判据 ⇒ 必须复现「**甩锅上游**」
   {
-    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-fd3-redirect-plugin.mjs'), 'utf8');
-    eq('🔴-R3′ 夹具：真的把 fd3 关掉再 openSync 拿回同一 fd 号', true,
-      /closeSync\(3\)/.test(src) && /openSync\(GRAB_PATH, 'w'\)/.test(src));
-    eq('🔴-R3′ 夹具：真的在 exit 钩子里从**被重定向的文件**读回探针的真报告行', true,
-      /process\.on\('exit'/.test(src) && /readFileSync\(GRAB_PATH/.test(src));
-    eq('🔴-R3′ 夹具：真的用读到的凭据伪造绿卡 + 自称 resultChannel=fd3', true,
-      /resultChannel: 'fd3'/.test(src) && /ok: true/.test(src));
-    eq('🔴-R3′ 夹具：真的压 process.exitCode=0（验证「压退出码无效」）', true,
-      /process\.exitCode = 0/.test(src));
-    eq('🔴-R3′ 夹具：进闸门（真宿主）且期望不得 GREEN', true,
-      /plugin-fd3-redirect-plugin\|plugin\.protocol_injection/.test(readText(path.join(ROOT, 'tests/gate_plugin_side.sh'), 'utf8')));
-    eq('🔴-R3′ 夹具：自述口径不越权（残留边界指向进程隔离）', true,
-      src.includes('进程隔离') && src.includes('REDO-PROPOSAL'));
+    const mutated = hostSrcForDegrade.replace(
+      'if (result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {',
+      'if (false && result.resultChannelDegraded && fd3Usable === true && fd3Provided !== false) {');
+    eq('🔴-R3③ 变异自证：回退变异确实改动了源码', true, mutated !== hostSrcForDegrade);
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'degrade-claim';
+    const rBack = await runOfflineProbeWithSources({
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'),
+      expectedTools: ['demo_echo'],
+      hostSource: mutated,
+    });
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+    // 🔴-R3′ 4.2（本轮并集）：**只**关掉「自报降级 vs 宿主侧实测」判据已**不再**复现甩锅上游——
+    // 判据 D（stdout 结果行凭据无效）与降级判据**同一条不采信路径**，前者独立兜住。
+    // ⇒ 断言「仍不放行 + 仍不甩锅上游」（比单腿更强）；双回退才复现甩锅上游。
+    eq('🔴-R3③ 变异回退（并集）：**只**关该判据 ⇒ 归因仍**不得** UPSTREAM_DRIFT', 'PLUGIN_REGRESSION', rBack.attribution);
+    eq('🔴-R3③ 变异回退（并集）：hostFatal 仍为空（插件 tamper 不报成环境/上游问题）', 0, rBack.result.hostFatal.length);
+    // 双回退：关该判据 + 关判据 D ⇒ 复现「甩锅上游」（AMBER / hostFatal 非空）
+    {
+      const mutatedBoth = mutated.replace(
+        'channelRedirectEvidence = !isolated && stdoutMarkers.length > 0',
+        'channelRedirectEvidence = false && !isolated && stdoutMarkers.length > 0');
+      // 凭据也退回旧口径（否则「偷到的标签」验不过 ⇒ 走不到降级判据那一层）。
+      const probeRawForR3b = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
+      const legacyProbeB = probeRawForR3b.replace(
+        'const payload = `${probeResultLine(nonceValue, body)}\\n`;',
+        'const payload = `${nonceValue ? PROBE_RESULT_MARKER + nonceValue + \':\' : PROBE_RESULT_MARKER}${body}\\n`;',
+      );
+      const legacyHostB = mutatedBoth.replace(
+        'return { ok: tag === probeReportTag(nonce, body), body };',
+        'return { ok: tag === nonce, body };',
+      );
+      eq('🔴-R3③ 双回退自证：变异确实改动了源码', true,
+        mutatedBoth !== mutated && legacyProbeB !== probeRawForR3b && legacyHostB !== mutatedBoth);
+      process.env.DSH_CHANNEL_REDIRECT_MODE = 'degrade-claim';
+      const rBoth = await runOfflineProbeWithSources({
+        pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'),
+        expectedTools: ['demo_echo'],
+        probeSource: legacyProbeB,
+        hostSource: legacyHostB,
+      });
+      delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+      eq('🔴-R3③ 双回退：关该判据 + 关判据 D ⇒ 复现「**甩锅上游**」（UPSTREAM_DRIFT / AMBER）', 'UPSTREAM_DRIFT', rBoth.attribution);
+      eq('🔴-R3③ 双回退：此时 hostFatal 非空（责任被推给环境）', true, rBoth.result.hostFatal.length > 0);
+    }
   }
-  // ⑥ 凭据形态守卫：结果行**不得**回显 nonce（回显 = 保密性成为唯一腿，R3′ 的原成因）
+
+  // 报告层：降级的**两种成因**必须分开说（否则人会把「插件篡改通道」读成「环境限制」）
   {
-    const probeSrc = readText(path.join(ROOT, 'src/harness/probe-template.mjs'), 'utf8');
-    eq('🔴-R3′ 源码守卫：探针结果行用正文绑定标签（probeResultLine(nonceValue, body)）', true,
-      /probeResultLine\(nonceValue, body\)/.test(probeSrc));
-    eq('🔴-R3′ 源码守卫：探针不再拼「nonce 前缀」（回显 nonce 即 R3′ 原成因）', false,
-      /probeResultPrefix/.test(probeSrc));
-    const contractSrc = readText(path.join(ROOT, 'src/harness/contract.mjs'), 'utf8');
-    eq('🔴-R3′ 源码守卫：probeResultLine 的形态 = 标签 + 正文（`__DSH_PROBE__<tag>:<body>`）', true,
-      /return nonce \? `\$\{PROBE_RESULT_MARKER\}\$\{probeReportTag\(nonce, body\)\}:\$\{body\}`/.test(contractSrc));
-    eq('🔴-R3′ 源码守卫：标签用 HMAC-SHA256 绑定正文（不是简单拼接）', true,
-      /createHmac\('sha256', String\(nonce\)\)\.update\(String\(body\)\)/.test(contractSrc));
+    const chBase = { channel: 'stable', label: '稳定版通道', line: 'x', status: 'fail', lamp: '❌', checksPassed: 0, checksSkipped: 0, checksTotal: 1, durationMs: 1, failedChecks: [], errors: [], hostFatal: [], attributionReasons: [] };
+    const secOf = (c) => buildSecondary({ generatedAt: 'T', plugin: 'p', channels: [c], summary: { total: 1, passed: 0, failed: 1, upstreamDrift: [], pluginRegression: ['stable'], unknown: [], verdict: 'RED' } });
+    const tampered = secOf({ ...chBase, attribution: 'PLUGIN_REGRESSION', resultChannel: 'stdout-degraded', resultChannelDegraded: true, checks: [{ name: PLUGIN_PROTOCOL_INJECTION_CHECK, status: 'fail', detail: 'x' }] });
+    const realDegradeSec = secOf({ ...chBase, attribution: 'UPSTREAM_DRIFT', resultChannel: 'stdout-degraded', resultChannelDegraded: true, checks: [] });
+    eq('🔴-R3③ 报告层：自报降级（实测可用）⇒ 风险描述点明「自报与事实矛盾」', true,
+      tampered.risks[0].description.includes('自报与事实矛盾'));
+    eq('🔴-R3③ 报告层：自报降级 ⇒ 规避动作指向**插件侧**（不要关 fd3 / 不要伪造 resultChannel）', true,
+      tampered.risks[0].mitigation.includes('插件侧'));
+    eq('🔴-R3③ 报告层：真降级 ⇒ 仍按**环境限制**说（不含「自报与事实矛盾」）', false,
+      realDegradeSec.risks[0].description.includes('自报与事实矛盾'));
+    eq('🔴-R3③ 报告层：两种成因的判据里都看得见 protocolInjection 标记', true,
+      tampered.risks[0].reasons.some((r) => r === 'protocolInjection=true') && realDegradeSec.risks[0].reasons.some((r) => r === 'protocolInjection=false'));
+  }
+
+  // 夹具自检：第三形态必须真的做出来（否则上面的行为断言空转）
+  {
+    const src = readText(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'utf8');
+    eq('🔴-R3③ 夹具：含 degrade-claim 形态（自报降级甩锅上游）', true, /degrade-claim/.test(src));
+    eq('🔴-R3③ 夹具：该形态真的伪造 resultChannel=stdout-degraded', true,
+      /resultChannel: claimDegrade \? 'stdout-degraded' : 'fd3'/.test(src));
+    eq('🔴-R3③ 夹具：该形态自述「甩锅上游 / 修错方向」的口径', true, src.includes('甩锅上游') && src.includes('修错方向'));
   }
 }
 

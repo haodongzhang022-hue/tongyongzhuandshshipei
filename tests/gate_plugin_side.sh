@@ -26,7 +26,7 @@
 # | `plugin-host-tamper-poc-plugin` | **§3 反例固化**（反读 nonce + 写 fd3 + 摘 exit 钩子 + `exit(0)` 抢跑） | `plugin.probe_result_forged` + `plugin.abnormal_termination` | **false** |
 # | `plugin-exit-hook-tamper-plugin` | **批 1.5 第 8 项**：只摘出口③ 的 `exit` 钩子（其余健康） | `plugin.process_defense_tampered` | true |
 # | `plugin-stringify-tamper-plugin` | 🔴 必修-4：猴子补丁 `JSON.stringify` 伪造绿卡（同族：同进程 + 共用输出面） | `registry.exact` | true |
-# | `plugin-fd3-redirect-plugin` | **🔴-R3′（v0.2.5）**：把 **fd3 换成自己的文件** ⇒ 探针（不知情）把**带凭据的真报告**写进插件文件 ⇒ 插件读出凭据后伪造绿卡 + 压 `process.exitCode=0` | `plugin.protocol_injection` | **false** |
+# | `plugin-channel-redirect-plugin` | 🔴-R3′：**结果通道重定向**（fd3 → 文件）+ 压 `process.exitCode`（宿主侧通道观测交叉校验） | `plugin.protocol_injection` | **false** |
 # | `plugin-sync-loop-plugin` | R24：`apply()` 内同步死循环（宿主二次终止） | `plugin.abnormal_termination` | **false** |
 # | `demo-plugin`（健康） | —— | 无（必须 GREEN 17/17） | true |
 #
@@ -143,13 +143,16 @@ NEGATIVE_CASES=(
   # nonce 前缀照样匹配）。收口 = 探针**加载期捕获引用** + 装配器**退出码交叉**（两道并集）。
   # 本形态下探针的**真报告**仍被判出 ⇒ 失败项精确留在真缺陷 `registry.exact` 上。
   "plugin-stringify-tamper-plugin|registry.exact|true|true|registry.exact"
-  # 🔴-R3′（v0.2.5 收口）：**通道重定向**形态——插件把 fd3 换成自己的文件，
-  # 探针（不知情）把**带凭据的真报告**写进插件文件 ⇒ 插件在 `exit` 钩子里读出凭据后伪造绿卡，
-  # 并**压 `process.exitCode = 0`**（故不能靠退出码交叉兜住）。旧实现判 **GREEN 放行**。
-  # 现在由**判据 D**（报告自称 fd3 + 宿主**实际**从 fd3 读到空 + stdout 出现结果行）判出：
-  # 依据是**宿主侧对 fd3 的实际观测** ⇒ 压退出码 / 换通道都无效。
-  # 期望失败项 = `plugin.protocol_injection`（唯一），完成位 false，无 pass 项（真报告没到宿主手里）。
-  "plugin-fd3-redirect-plugin|plugin.protocol_injection|false|false|plugin.protocol_injection"
+  # 🔴-R3′（评审复评，收窄后的活口）：**结果通道重定向 + 压退出码**。同源活口的两个出口都走这条：
+  #   · `all`（默认，= R3′）：`closeSync(3)` + `openSync(<file>)` 把 fd3 换成普通文件（宿主侧管道
+  #     只见 EOF）；探针收尾把**真报告**写进文件 ⇒ 插件在 `exit` 钩子里读回它（**连 nonce 前缀
+  #     一起拿到**）⇒ 用该前缀把绿卡写进 stdout ⇒ 再压 `process.exitCode = 0` 压掉退出码交叉；
+  #   · `no-squelch`（= R3 主形态）：只重定向、不压退出码。
+  # 收口判据 = **宿主侧通道观测**（报告自称 fd3 而宿主侧 fd3 为空 + stdout 有匹配 nonce 行）——
+  # 只依赖宿主进程看到的东西 ⇒ 插件压不掉。期望：判 `plugin.protocol_injection`、不采信任何一条
+  # （故**无 pass 项**、完成位 false）、hostFatal 为空。
+  # ⚠️ 期望**不得** GREEN —— 这条断言正是「退出码交叉不是唯一兜底」的可执行证据。
+  "plugin-channel-redirect-plugin|plugin.protocol_injection|false|false|plugin.protocol_injection"
   # ⚠️ `plugin-sync-loop-plugin`（R24）**不在**本清单：它的缺陷只在**有界 timeout** 下成立
   # （默认 timeoutMs=600s 时 3s 循环会正常跑完——那本身不是缺陷）。该形态由下方**专用 R24 段**
   # 用 `runHostProbe({ timeoutMs: 1000 })` 断言（含收口时间与 `probeExit.signal`）。
@@ -203,6 +206,38 @@ for entry in "${NEGATIVE_CASES[@]}"; do
   ' "$out" "$fixture" "$expectedCheck" "$expectedCompleted" "$expectsPass" "$expectedFails" "$PLUGIN_SIDE_CHECKS_JSON"
   if [[ $? -eq 0 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
 done
+
+# ---- 🔴-R3 附带（评审「下一步要求 ③」）：**自报降级 ⇒ 甩锅上游**（真宿主，单独一段） ----
+# 为什么单列（不能塞进上面的负例循环）：本形态需要**逐夹具的环境变量**
+# （`DSH_CHANNEL_REDIRECT_MODE=degrade-claim`），而负例循环的每一行只给「夹具 | 期望项 | 完成位」。
+# 形态：重定向 fd3 **+ 伪造报告自称 `resultChannel: 'stdout-degraded'`**（=「本环境没有 fd3」）
+# ⇒ 旧实现下宿主落 `hostFatal[]` ⇒ `UPSTREAM_DRIFT` / **AMBER（甩锅上游）**：
+# 插件 tamper 被报成环境/上游问题，**修错方向**。
+# 收口 = 宿主侧 **fd3 能力独立实测**（`probeFd3Capability()`，真宿主下真的起子进程）：
+# 实测可用却自报不可用 = 自报与事实矛盾 ⇒ 判插件侧 `plugin.protocol_injection`。
+echo
+echo "▶ 🔴-R3 附带：自报降级甩锅上游（宿主侧 fd3 能力实测）"
+DEGRADE_OUT="$(DSH_CHANNEL_REDIRECT_MODE=degrade-claim "$NODE_BIN" "$ROOT/src/cli.mjs" verify --channel "$CHANNEL" \
+    --plugin "$ROOT/tests/fixtures/plugin-channel-redirect-plugin.mjs" --tools demo_echo \
+    --json "$WORK/verify-degrade-claim.json" > /dev/null 2>&1; echo "exit=$?")"
+if [[ "$DEGRADE_OUT" == "exit=0" ]]; then
+  bad "🔴-R3③ 自报降级形态被误判为通过（甩锅/放行级失效）"
+else
+  "$NODE_BIN" -e '
+    const r = require(process.argv[1]);
+    const c = r.channels[0] ?? {};
+    const failed = (c.checks ?? []).filter((x) => x.status === "fail").map((x) => x.name);
+    const bad = [];
+    if (c.attribution !== "PLUGIN_REGRESSION") bad.push("归因不是 PLUGIN_REGRESSION（实得 " + c.attribution + "）——插件 tamper 被甩给上游");
+    if ((c.hostFatal ?? []).length !== 0) bad.push("hostFatal 非空（自报降级不得落环境/上游信号）：" + JSON.stringify(c.hostFatal));
+    if (r.summary.verdict === "AMBER") bad.push("判决为 AMBER（甩锅上游）");
+    if (!failed.includes("plugin.protocol_injection")) bad.push("失败项不含 plugin.protocol_injection（实得：" + failed.join(",") + "）");
+    if (c.runCompleted !== false) bad.push("完成位应为 false（不采信任何一条）");
+    if (bad.length) { console.error("❌ 🔴-R3③ 闸门失败：" + bad.join("；")); process.exit(1); }
+    console.log("✅ 自报降级甩锅：PLUGIN_REGRESSION / hostFatal 为空 / verdict=" + r.summary.verdict + " / 失败项=[" + failed.join(",") + "]");
+  ' "$WORK/verify-degrade-claim.json"
+  if [[ $? -eq 0 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); fi
+fi
 
 # ---- R24：同步死循环 → 宿主**二次终止**（`killSignal: 'SIGKILL'`） ----
 # 为什么单列（评审复评 R24）：探针的看门狗 / 信号处理器都是事件循环上的回调，插件 `apply()`

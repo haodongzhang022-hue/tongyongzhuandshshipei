@@ -194,6 +194,21 @@ export function probeResultLine(nonce, body) {
 }
 
 /**
+ * **旧口径**（v0.2.5 前的凭据形态）：把 nonce 本身回显成前缀 `__DSH_PROBE__<nonce>:`。
+ *
+ * ⚠️ 保留仅为**向后兼容与变异反证**（离线回归用它构造「旧实现」的输入，证明
+ * 「凭据回退 ⇒ 复现放行级假绿」）。**生产路径不得使用**——它依赖 **nonce 保密性**这一条腿，
+ * 而通道重定向形态（插件把 fd3 换成自己的文件）会**主动绕过**保密性（🔴-R3′）。
+ *
+ * @deprecated 用 {@link probeResultLine}（正文绑定标签，凭据不可迁移）。
+ * @param {string} nonce nonce 值
+ * @returns {string} `__DSH_PROBE__<nonce>:` 前缀
+ */
+export function probeResultPrefix(nonce) {
+  return `${PROBE_RESULT_MARKER}${nonce}:`;
+}
+
+/**
  * 宿主/环境侧致命信号的**日志前缀**（探针与装配器拼人类可读 `errors[]` 时使用）。
  *
  * ⚠️ 纪律（评审 🔴-C）：此前缀**只许用于人读日志，绝不可作为归因判据的文本扫描目标**。
@@ -366,8 +381,23 @@ export const PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK = 'plugin.process_defense_tam
  * ⇒ **≥2 条即铁证是篡改**（无需知道谁写的）；配合结果通道隔离（`spawnSync` 的 fd3，
  * 见 `host.mjs`）后，**stdout 里出现的任何结果行都是篡改证据**（第二条独立证据链）。
  *
+ * ## 🔴-R3′（评审复评，收窄后的活口）：**宿主侧通道观测**交叉校验
+ * 上一条（结构不变量 / 通道隔离）依赖「fd3 **有没有内容**」⇒ 插件 `closeSync(3)` 后
+ * `openSync(<file>)` 把 fd3 换成普通文件时：宿主侧管道只见 EOF ⇒ `isolated=false` ⇒
+ * 装配器**回退信任 stdout**；探针收尾把**真报告**写进那个文件 ⇒ 插件在 `'exit'` 钩子里读回它
+ * （**连 nonce 前缀一起拿到**，不必反读 env / argv）⇒ 用该前缀把绿卡写进 stdout，并压
+ * `process.exitCode = 0` 压掉退出码交叉 ⇒ 旧实现下 **GREEN 放行**（真缺陷被绿卡掩盖）。
+ *
+ * 收口判据：报告**自称**走 fd3（`resultChannel === 'fd3'`）而**宿主侧该通道无任何内容**、
+ * 且 stdout 反而出现**匹配 nonce** 的结果行 ⇒ 通道被重定向 ⇒ 判本项、**不采信任何一条**。
+ * 这条腿**只依赖宿主进程看到的东西**（管道读端为空），不依赖探针自报、也不依赖退出码
+ * ⇒ 插件从探针进程内压不掉；防线因此从「报告 + 退出码」两条信道升级为
+ * 「报告 + 退出码 + **宿主侧通道观测**」三条。
+ *
  * ⚠️ 口径（与 {@link HOST_FATAL_FIELD} 的收窄一致）：本项判的是**装配器可见的输出通道**；
  * 插件若同时让探针整个进程消失，则由出口③④ 或相位信标归因（见 R21）。
+ * **残留边界**（不越权承诺）：把伪造行写进 **fd3 本身**（自称与宿主侧观测一致）仍不可区分
+ * ⇒ 需批 2 的「独立 fd 且永不回退 stdout」（见 `docs/REDO-PROPOSAL.md`）。
  */
 export const PLUGIN_PROTOCOL_INJECTION_CHECK = 'plugin.protocol_injection';
 

@@ -26,7 +26,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomBytes } from 'node:crypto';
-import { interpretProbeStdout, probeSpawnOptions, reportedChannelOf } from '../src/harness/host.mjs';
+import { interpretProbeStdout, probeFd3Capability, probeSpawnOptions } from '../src/harness/host.mjs';
 import { PROBE_PHASE, createProbeNonce } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { loadChannels } from '../src/harness/host.mjs';
@@ -127,7 +127,7 @@ export async function runOfflineProbeWithSources(options) {
   try {
     materializeWorkDir(work, probeSource);
     // 装配器：默认用仓库实现；给了 hostSource 就拷一份变异版（连带 contract.mjs）后动态 import。
-    let host = { interpretProbeStdout, probeSpawnOptions };
+    let host = { interpretProbeStdout, probeSpawnOptions, probeFd3Capability };
     if (typeof hostSource === 'string') {
       writeFileSync(path.join(hostDir, 'host.mjs'), hostSource);
       cpSync(path.join(ROOT, 'src', 'harness', 'contract.mjs'), path.join(hostDir, 'contract.mjs'));
@@ -148,11 +148,12 @@ export async function runOfflineProbeWithSources(options) {
     };
     result.probeExit = { status: probeRun.status ?? null, signal: probeRun.signal ?? null };
     result.durationMs = Date.now() - startedAt;
-    // `reportedChannel`（🔴-R3′ 判据 D）：与生产路径同构 —— 宿主侧在解释前先取「报告自述的通道」。
+    // 🔴-R3：与**生产路径**同构——把宿主侧 fd3 能力实测一并交给解释器（缺它则依赖它的判据不启用）
     host.interpretProbeStdout(result, `${probeRun.stdout ?? ''}`, {
       resultFd: `${probeRun.output?.[3] ?? ''}`,
       nonce: nonce.value,
-      reportedChannel: reportedChannelOf(`${probeRun.output?.[3] ?? ''}`, `${probeRun.stdout ?? ''}`, nonce.value),
+      fd3Usable: typeof host.probeFd3Capability === 'function' ? host.probeFd3Capability() : null,
+      fd3Provided: true,
     });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');
@@ -233,7 +234,11 @@ export function runOfflineProbe(options) {
     interpretProbeStdout(result, stdout, {
       resultFd,
       nonce: stdinUnreadable ? null : nonce.value,
-      reportedChannel: stdinUnreadable ? null : reportedChannelOf(resultFd, stdout, nonce.value),
+      // 🔴-R3：宿主侧 fd3 能力**实测**（与生产路径同构）——通道形态的判据不得只信探针自报。
+      fd3Usable: probeFd3Capability(),
+      // `noResultChannel` 形态**故意**不给 fd3（`stdio[3] = 'ignore'`）⇒ 探针自报降级是**事实**，
+      // 不是篡改 ⇒ 显式声明「宿主没提供 fd3」，让依赖该前提的判据不启用（否则回归台自己会误报）。
+      fd3Provided: !noResultChannel,
     });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');

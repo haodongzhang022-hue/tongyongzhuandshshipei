@@ -221,7 +221,7 @@ node /path/to/hub/src/cli.mjs watch --contract-from ./verify.json --markdown
 | `plugin.run_incomplete` | ④ `run()` 被拖住 | 插件挂住事件循环，或 `apply()` 返回一个**永不 resolve** 的 Promise（无异常、无退出） | `PLUGIN_REGRESSION` |
 | `plugin.abnormal_termination` | 边界 | **不可捕获**终止（`SIGKILL` / OOM / 原生 `abort`）——探针来不及写报告，装配器按**相位信标**归因 | `PLUGIN_REGRESSION` |
 | `plugin.process_defense_tampered` | ⑤ 防线被静音 / 被顶替 / 出口钩子被摘 | 插件抢占 `setUncaughtExceptionCaptureCallback`（真实形态：Sentry / APM / 错误上报库）、摘掉 `uncaughtException` 监听器，或**用自己的回调顶替**探针的 ⇒ 探针兜底被**静音**、后台抛错不可见、完成位仍真 → **假绿放行**；**另含摘掉出口③ 的 `exit` 钩子**（批 1.5：钩子具名登记 + 身份检查覆盖 `'exit'`，此前**不可判定**）。探针收尾**四重**自检（API 调用台账 + **身份检查** + 独占 API 检测 + 行为级 canary；**不得**用 `has()\|\|listenerCount>0`——插件顶替后该式**假阳性**）判本项 | `PLUGIN_REGRESSION` |
-| `plugin.protocol_injection` | ⑥ 结果通道被注入 / 被关闭 / 被重定向 | 插件向探针的**结果通道**写入伪造结果（抢首位 / 多结果行 / 在结果走独立通道时仍写 stdout）；或**在插件代码运行期间把 fd3 关掉/替换**（早探测可写 → 收尾不可写）；或**把 fd3 换成自己的文件**（报告**自称**走 fd3 而宿主**实际**从 fd3 读到空、stdout 却出现结果行，🔴-R3′）⇒ 真报告被顶替 → 装配器 `interpretProbeStdout()` 判本项（结构不变量 + 通道隔离 + 通道重定向，**防放行级假绿**） | `PLUGIN_REGRESSION` |
+| `plugin.protocol_injection` | ⑥ 结果通道被注入 / 被关闭 / **被重定向** | 插件向探针的**结果通道**写入伪造结果（抢首位 / 多结果行 / 在结果走独立通道时仍写 stdout）；**在插件代码运行期间把 fd3 关掉/替换**（早探测可写 → 收尾不可写）；或**把 fd3 换成普通文件**（`closeSync(3)` + `openSync(<file>)`）后再用从真报告里抄到的 nonce 前缀把绿卡写进 stdout（🔴-R3′：报告**自称**走 fd3 而**宿主侧该通道无内容** ⇒ **宿主侧通道观测**交叉校验命中）⇒ 装配器 `interpretProbeStdout()` 判本项（结构不变量 + 通道隔离 + 宿主侧观测，**防放行级假绿**） | `PLUGIN_REGRESSION` |
 | `plugin.probe_result_forged` | 🆕 侧信道 | 探针输出面里出现**无 nonce / nonce 不匹配**的结构化结果行（插件自造绿卡 / 甩锅上游）；由**装配器**判定（与 ⑥ 是**两条独立证据链**） | `PLUGIN_REGRESSION` |
 | `plugin.exit_code_mismatch` | 🔴 必修-4 退出码交叉 | 报告自称通过（`ok=true`）但探针**进程退出码非 0**（或带终止信号）⇒ **两个独立产物互相矛盾**即篡改（退出码由探针内存算出、不经序列化；报告字节可被插件的 `JSON.stringify` 替换）⇒ 由**装配器**判定（与探针侧「加载期捕获引用」是**两道并集**） | `PLUGIN_REGRESSION` |
 
@@ -309,13 +309,12 @@ captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收�
 |---|---|
 | 缺口 | 插件若往 stdout 写一行 `__DSH_PROBE__{...}`，就能**自造一张绿卡**（真实缺陷被掩盖）；写 `hostFatal:[...]` 可把责任甩给上游（判 `UPSTREAM_DRIFT`） |
 | 显式前提 | 本中台的归因防线以「**插件为可信代码**（非恶意）」为**显式前提**（`docs/RISKS.md` R26）。越出该前提时，防线退化为**尽力而为**。⇒ 本中台是**验收**工具，**不是沙箱**；**不得**在缺少该前提时宣称「报告可信」 |
-| nonce 带外通道 | 宿主每次运行生成**随机** nonce，经 **stdin** 下发（探针读完即 `close(0)`；**不进 argv / env** ⇒ 不落 `/proc/self/environ`、不出现在 `ps` 里） |
-| 凭据（v0.2.5 起） | 结果行 `__DSH_PROBE__<tag>:{json}`，`tag = HMAC(nonce, json)`（**不回显 nonce**）；宿主用**自己已知的 nonce** 重算并逐字比对 ⇒ **凭据不可迁移**（读到真报告也伪造不出新正文） |
-| 判定 | 出现裸 `__DSH_PROBE__` / 标签不符 ⇒ 判**伪造**：落插件侧 check `plugin.probe_result_forged`，`ok` 必为 false（**不放行**） |
-| 通道重定向（🔴-R3′，v0.2.5） | 插件把 fd3 **换成自己的文件** ⇒ 探针（不知情）把**真报告**写进插件文件 ⇒ 插件读出凭据后伪造。判据：报告**自称**走 fd3 而宿主**实际**从 fd3 读到空、stdout 却出现结果行 ⇒ 判 `plugin.protocol_injection`、**不采信任何一条**（依据宿主侧观测 ⇒ 压退出码无效） |
+| nonce 带外通道 | 宿主每次运行生成**随机** nonce，经 **stdin** 下发（探针读完即 `close(0)`；**不进 argv / env** ⇒ 不落 `/proc/self/environ`、不出现在 `ps` 里）；探针输出 `__DSH_PROBE__<nonce>:{json}`；宿主**只认带该 nonce 的行** |
+| 判定 | 出现裸 `__DSH_PROBE__`（无 nonce / 不匹配）⇒ 判**伪造**：落插件侧 check `plugin.probe_result_forged`，`ok` 必为 false（**不放行**） |
 | 加载期捕获引用（🔴 必修-4，v0.2.3） | 探针在**模块加载期**捕获 `JSON.stringify` 引用（`const STRINGIFY = JSON.stringify`）且**只用**捕获值 ⇒ 插件在 `apply()` 里猴子补丁 `JSON.stringify` **不被探针采用**（实测：`plugin-stringify-tamper-plugin` 由「绿卡被采信」变为「真缺陷照常判出」） |
 | 退出码交叉（🔴 必修-4，v0.2.3） | 装配器无条件记录探针退出实况；**报告自称 `ok=true` 而退出码非 0**（或带终止信号）⇒ 内部矛盾 ⇒ 判插件侧 `plugin.exit_code_mismatch`、不放行。两个独立产物（退出码不经序列化 / 报告字节可被替换）互相矛盾即证据 |
-| 残留边界 | **凭据保密性不是唯一防线**（R26-R3′：通道重定向形态会**主动**绕过它——凭据由探针**亲自**交出）；同进程同 uid 下，**恶意**插件仍可篡改**其它**全局 / 直接读探针内存 / **同时**改退出码（`process.exitCode`）后伪造——`JSON.stringify` 这一形态已由上面的「加载期捕获 + 退出码交叉」收口（R29），但**逐点补不可穷尽**；nonce **不经** env / argv 下发（那两条读取面已实测收窄）。根治需**进程隔离**（结构性重做，**批 2 已立项在办**，见 R29）——本项**不越权承诺**。一页方案见 [`docs/REDO-PROPOSAL.md`](REDO-PROPOSAL.md) |
+| 宿主侧通道观测（🔴-R3′，v0.2.5） | 报告**自称**走 `fd3`（`resultChannel === 'fd3'`）而**宿主侧该通道无任何内容**、stdout 反而出现**匹配 nonce** 的结果行 ⇒ 通道被**重定向**（插件把 fd3 换成文件、从真报告里抄 nonce 前缀）⇒ 判 `plugin.protocol_injection`、**不采信任何一条**。⚠️ 本判据**只依赖宿主进程看到的东西**（管道读端为空）⇒ 插件压不掉（退出码交叉只能把门槛抬一层：压 `process.exitCode` 即可绕过）|
+| 残留边界 | 同进程同 uid 下，**恶意**插件仍可篡改**其它**全局 / 直接读探针内存 / **同时**改退出码（`process.exitCode`）后伪造——`JSON.stringify` 这一形态已由上面的「加载期捕获 + 退出码交叉」收口（R29），但**逐点补不可穷尽**；nonce **不经** env / argv 下发（那两条读取面已实测收窄）。根治需**进程隔离**（结构性重做，**批 2 已立项在办**，见 R29）——本项**不越权承诺**。一页方案见 [`docs/REDO-PROPOSAL.md`](REDO-PROPOSAL.md) |
 
 > 结论（给接入方）：**不要**在 `apply()` 里往 stdout 写探针协议行（`__DSH_PROBE__` / `__DSH_PROBE_PHASE__`）。
 > 正常插件不需要关心 nonce——它是宿主与探针之间的带外协议，对插件透明。
