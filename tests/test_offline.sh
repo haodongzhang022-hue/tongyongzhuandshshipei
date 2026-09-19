@@ -1027,6 +1027,86 @@ console.log(JSON.stringify([...keys].sort()) !== JSON.stringify(keys) ? 'lexicog
 assert "🟡自证②：链式合并保留未声明通道 ≠「全部取最新再合成」" "chain-keeps-undeclared" "$(echo "$SELF" | sed -n 1p)"
 assert "🟡自证③：字典序确实会把迁移分片排错（故必须用显式 orderAt）" "lexicographic-is-wrong" "$(echo "$SELF" | sed -n 2p)"
 
+echo "  [24] 基线「地铁/坐标轴」模型：每通道一条线路 + 各自出发点 + 显式前向携带（v0.3.1）"
+# 为什么补：`composeChain()` 是**单轴**——某通道在某周期之后不再出现时，它的旧值会被
+# **无限前向携带**，且**没有任何字段**表达「这条线在 X 之后就没有站点了」（实测：legacy 在
+# 03-02 后再无站点，到 03-10 仍以 03-02 的值参与当前基线）。本节断言全部是**语义级**
+# （不是「函数在不在」），并配**变异自证**（防恒真）。
+OUT="$("$NODE_BIN" --input-type=module -e "
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { segmentStore, settleSegment, resolveBaseline, composeChain, composeMetro, renderMetro, isUsableStation } from '$ROOT/src/watch/baseline.mjs';
+const dir = mkdtempSync(path.join(tmpdir(), 'dsh-metro-'));
+const store = segmentStore({ hubRoot: dir });
+const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
+
+// 场景：三条线，出发点都在 03-02；legacy 在 03-05 起停运；stable 在 03-10 起停运；dev 一路推到 03-10
+settleSegment({ store, key:'2026-03-02', run:{ at:'2026-03-02T01:10:00Z', orderAt:'2026-03-02T01:10:00Z', channels:[{channel:'stable',ok:true,contract:C('s1')},{channel:'dev',ok:true,contract:C('d1')},{channel:'legacy',ok:true,contract:C('L1')}] } });
+settleSegment({ store, key:'2026-03-05', run:{ at:'2026-03-05T01:10:00Z', orderAt:'2026-03-05T01:10:00Z', channels:[{channel:'stable',ok:true,contract:C('s2')},{channel:'dev',ok:true,contract:C('d2')}] } });
+settleSegment({ store, key:'2026-03-10', run:{ at:'2026-03-10T01:10:00Z', orderAt:'2026-03-10T01:10:00Z', channels:[{channel:'dev',ok:true,contract:C('d3')}] } });
+
+const r = resolveBaseline({ hubRoot:dir });
+const metro = r.metro;
+
+// ① 出发点：每条线**各自**的起点站（不是全局首周期）
+console.log(JSON.stringify(metro.origin));
+// ② 站点序列：只有**显式声明**才算站（legacy 只 1 站、stable 2 站、dev 3 站）
+console.log(JSON.stringify({ legacy:metro.lines.legacy.stations.length, stable:metro.lines.stable.stations.length, dev:metro.lines.dev.stations.length }));
+// ③ 末站（当前基线取值来源）
+console.log(JSON.stringify(metro.perChannel));
+// ④ 前向携带**显式化**：末站之后无站点的线，被点名 + 记 from→to（这正是单轴看不见的）
+console.log(JSON.stringify(Object.keys(metro.carried).sort()));
+console.log(metro.carried.legacy.from + '->' + metro.carried.legacy.to);
+// ⑤ 已停运线（末站不在链尾）
+console.log(JSON.stringify(metro.endedLines.slice().sort()));
+// ⑥ 🚇 与单轴取值**一致**（地铁视图是严格上位，不改取值语义）
+console.log(String(JSON.stringify(metro.contracts) === JSON.stringify(composeChain(store.list().map((k) => ({ periodKey:k, ...store.load(k) }))).contracts)));
+// ⑦ 空壳契约（无任何指纹字段）不算站点 ⇒ 不得凭空多站
+console.log(String(isUsableStation({})) + '|' + String(isUsableStation({ configProjection:'x' })));
+// ⑧ 渲染面：线路图含出发点列 + 停运标记
+const md = renderMetro(metro);
+console.log(String(md.includes('出发点')) + '|' + String(md.includes('已停运')) + '|' + String(md.includes('前向携带')));
+// ⑨ 单一分片（只有出发点那期）⇒ 无停运、无携带
+const dir2 = mkdtempSync(path.join(tmpdir(), 'dsh-metro2-'));
+const s2 = segmentStore({ hubRoot:dir2 });
+settleSegment({ store:s2, key:'2026-04-01', run:{ at:'2026-04-01T01:10:00Z', orderAt:'2026-04-01T01:10:00Z', channels:[{channel:'dev',ok:true,contract:C('x')}] } });
+const m2 = resolveBaseline({ hubRoot:dir2 }).metro;
+console.log(JSON.stringify(m2.endedLines) + '|' + JSON.stringify(m2.carried));
+rmSync(dir, { recursive:true, force:true });
+rmSync(dir2, { recursive:true, force:true });
+")"
+# 键序 = 线路首次出现在链上的先后（与 composeChain 同序），不是字母序
+assert "🚇 出发点：每条线**各自**的起点站（皆 03-02；键序=首次出现序）" '{"stable":"2026-03-02","dev":"2026-03-02","legacy":"2026-03-02"}' "$(echo "$OUT" | sed -n 1p)"
+assert "🚇 站点序列：只有**显式声明**才算站（legacy 1 / stable 2 / dev 3）" '{"legacy":1,"stable":2,"dev":3}' "$(echo "$OUT" | sed -n 2p)"
+assert "🚇 末站：当前基线取值来源（dev=03-10 / stable=03-05 / legacy=03-02）" '{"stable":"2026-03-05","dev":"2026-03-10","legacy":"2026-03-02"}' "$(echo "$OUT" | sed -n 3p)"
+assert "🚇 前向携带**显式化**：停运线被点名（单轴看不见）" '["legacy","stable"]' "$(echo "$OUT" | sed -n 4p)"
+assert "🚇 前向携带记 from→to（legacy 从 03-02 携带到 03-10）" '2026-03-02->2026-03-10' "$(echo "$OUT" | sed -n 5p)"
+assert "🚇 已停运线 = 末站不在链尾（legacy + stable）" '["legacy","stable"]' "$(echo "$OUT" | sed -n 6p)"
+assert "🚇 与单轴 composeChain **取值一致**（严格上位，不改取值语义）" "true" "$(echo "$OUT" | sed -n 7p)"
+assert "🚇 空壳契约（无指纹字段）不算站点（防凭空多站）" "false|true" "$(echo "$OUT" | sed -n 8p)"
+assert "🚇 渲染面：含出发点列 + 停运标记 + 前向携带告警" "true|true|true" "$(echo "$OUT" | sed -n 9p)"
+assert "🚇 单一分片 ⇒ 无停运、无携带（反证非恒真）" "[]|{}" "$(echo "$OUT" | sed -n 10p)"
+
+# 守卫自证：确认这些断言不是恒真——① 把「站点=显式声明」改成「站点=一切出现过的通道」
+# （即单轴语义：未声明也顶一个站）⇒ 站点数必变；② 把 endedLines 判据改成恒空 ⇒ 第 6 行必变。
+SELF="$("$NODE_BIN" --input-type=module -e "
+import { composeMetro } from '$ROOT/src/watch/baseline.mjs';
+const C = (t) => ({ configProjection:t });
+const segs = [
+  { periodKey:'2026-03-02', orderAt:'2026-03-02T01:10:00Z', baseline:{ stable:C('s1'), dev:C('d1'), legacy:C('L1') } },
+  { periodKey:'2026-03-05', orderAt:'2026-03-05T01:10:00Z', baseline:{ stable:C('s2'), dev:C('d2') } },
+  { periodKey:'2026-03-10', orderAt:'2026-03-10T01:10:00Z', baseline:{ dev:C('d3') } },
+];
+const m = composeMetro(segs);
+// ① 站点数只算显式声明（legacy 不应因'出现过'而在 03-05 多一个站）
+console.log(m.lines.legacy.stations.length === 1 ? 'explicit-only' : 'BROKEN');
+// ② 停运判据：必须点名 legacy（若判据恒空则这里为 BROKEN）
+console.log(m.endedLines.includes('legacy') ? 'ended-detected' : 'BROKEN');
+")"
+assert "🟡自证①：站点只算**显式声明**（否则单轴语义会凭空给 legacy 多站）" "explicit-only" "$(echo "$SELF" | sed -n 1p)"
+assert "🟡自证②：停运判据真的点名 legacy（非恒空）" "ended-detected" "$(echo "$SELF" | sed -n 2p)"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

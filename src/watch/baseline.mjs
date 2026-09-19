@@ -26,7 +26,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { HUB_ROOT } from '../harness/host.mjs';
-import { isUsableContract, mergeContracts } from './upstream.mjs';
+import { CONTRACT_FIELDS, isUsableContract, mergeContracts } from './upstream.mjs';
 
 /** 分片目录（相对 hub 根）。 */
 export const SEGMENT_DIR = 'registry/contract-snapshots/segments';
@@ -231,21 +231,24 @@ export function composeChain(segments) {
  * @returns {{contracts:object, chain:string[], perChannel:object, segments:object[], legacyLatest:object|null}}
  */
 export function resolveBaseline(options = {}) {
-  const store = segmentStore({ hubRoot: options.hubRoot ?? HUB_ROOT });
+  const hubRoot = options.hubRoot ?? HUB_ROOT;
+  const store = segmentStore({ hubRoot });
   const segments = store.list().map((key) => ({ periodKey: key, ...store.load(key) }));
   const composed = composeChain(segments);
+  const metro = composeMetro(segments);
   let legacyLatest = null;
   if (options.includeLegacyLatest !== false) {
-    const legacy = legacySnapshot({ hubRoot: options.hubRoot ?? HUB_ROOT }).load();
+    const legacy = legacySnapshot({ hubRoot }).load();
     if (legacy && isUsableContract(legacy.contracts) && Object.keys(legacy.contracts).length > 0) {
       // 历史遗留按「更早」处理：先合遗留，再合分片链（分片优先，防倒退）
       legacyLatest = legacy.contracts;
       const contracts = mergeContracts(legacy.contracts, composed.contracts);
-      for (const channel of Object.keys(composed.contracts)) composed.perChannel[channel] = composed.perChannel[channel];
-      return { contracts, chain: composed.chain, perChannel: composed.perChannel, segments, legacyLatest };
+      // 遗留基线只补「分片链未声明的通道」⇒ 它与线路图里的「出发点」语义一致（不覆盖分片末站）
+      const metroContracts = mergeContracts(legacy.contracts, metro.contracts);
+      return { contracts, chain: composed.chain, perChannel: composed.perChannel, segments, metro, metroContracts, legacyLatest };
     }
   }
-  return { ...composed, segments, legacyLatest };
+  return { ...composed, segments, metro, metroContracts: metro.contracts, legacyLatest };
 }
 
 /**
@@ -303,4 +306,119 @@ export function migrateLegacyLatest(options = {}) {
     candidates: [],
   });
   return { migrated: true, key, channels: Object.keys(legacy.contracts) };
+}
+
+/**
+ * 判定一份契约是否是**有效站点**：必须含至少一个契约指纹字段（字段名取自 `CONTRACT_FIELDS`，唯一事实源）。
+ *
+ * 为什么不用 `isUsableContract()` 直接判：它只要求「非空对象」，而空壳对象（`{}` 之外、
+ * 但**没有任何指纹字段**）不算站点——否则一个畸形分片会凭空**多出一个站**，把线路图污染。
+ *
+ * @param {object} contract 契约快照
+ * @returns {boolean}
+ */
+export function isUsableStation(contract) {
+  if (!isUsableContract(contract)) return false;
+  return CONTRACT_FIELDS.some((field) => contract[field] !== undefined && contract[field] !== null);
+}
+
+/**
+ * 地铁/坐标轴模型：把 `composeChain()` 的**单轴**链条升级为**每通道一条线路**。
+ *
+ * ## 为什么需要它（用户口径「以坐标轴的形式、或者叫以地铁的形式来合并」）
+ * `composeChain()` 是**单轴**：所有通道挤在**同一条**周期轴上，靠「后周期覆盖自己声明过的
+ * 通道」推进。这解决「连起来=最新版」，但留下一个**语义缺口**：
+ * **某通道在某周期之后不再出现时，它的旧值会被无限前向携带**（实测：`legacy` 在 03-02 后再无站点，
+ * 到 03-10 仍以 03-02 的值参与当前基线），且**没有任何字段表达「这条线在 X 之后就没有站点了」**。
+ *
+ * ## 地铁模型的三个概念（对应需求原话）
+ * - **线路（line）** = 一个通道（`stable` / `dev` / `legacy`…）。每条线**各自独立推进**。
+ * - **出发点（origin）** = 该线**首次**出现在链上的那个分片（它的起点站）。**这是关键**：
+ *   合并不是「全部取最新」，而是**从各自出发点**沿该线自己的站点推进；
+ * - **站点（station）** = 该线在某个分片上**显式声明**的契约快照（`{periodKey, at, contract}`）。
+ *   只有**显式声明**才是站点；**未声明 ≠ 站点**（这正是把「前向携带」显式化的地方）。
+ *
+ * ## 与 `composeChain()` 的关系（不越权、不改判据）
+ * - `composeChain()` 保留（B4 与离线 [23] 仍用它）；`composeMetro()` 是它的**严格上位**：
+ *   把「未声明通道被静默前向携带」变成**显式的 `carried`（`from`→`to`）+ `endedLines` 可审计字段**；
+ * - 两者**契约取值一致**（都是「沿站点推进后各线最新站点」），差别只在**可观测性**：
+ *   `composeMetro()` 额外给出每线的出发点、站点序列、末站，以及**已停运线**（`endedLines`）。
+ * - ⚠️ 本函数**不参与** `attributionDetail()`；它是**人类排障视图（advice）**，不回灌归因判据。
+ *
+ * @param {object[]} segments 分片数组（`{periodKey, baseline, orderAt?, settledAt?, firstRunAt?, mode?}`）
+ * @returns {{contracts:object, lines:object, origin:object, perChannel:object, carried:object, endedLines:string[], chain:string[]}} 合并结果
+ */
+export function composeMetro(segments) {
+  const ordered = [...(segments ?? [])]
+    .filter((s) => isUsableContract(s?.baseline))
+    .sort((a, b) => segmentOrderAt(a) - segmentOrderAt(b) || String(a.periodKey).localeCompare(String(b.periodKey)));
+
+  /** @type {Record<string, object>} 每条线（通道）的线路图 */
+  const lines = {};
+  /** @type {string[]} 线路出现顺序（= 首次出现在链上的先后）——保持与 `composeChain()` 相同的键序 */
+  const lineOrder = [];
+  const chain = [];
+  for (const segment of ordered) {
+    for (const channel of Object.keys(segment.baseline)) {
+      const contract = segment.baseline[channel];
+      if (!isUsableStation(contract)) continue;
+      if (!lines[channel]) {
+        // 出发点 = 该线首次出现在链上的分片（起点站）
+        lines[channel] = { origin: segment.periodKey, originAt: segmentOrderAt(segment), stations: [], endedAt: null, ended: false };
+        lineOrder.push(channel);
+      }
+      lines[channel].stations.push({ periodKey: segment.periodKey, at: segmentOrderAt(segment), contract });
+    }
+    if (Object.keys(segment.baseline).length > 0) chain.push(segment.periodKey);
+  }
+
+  const contracts = {};
+  const origin = {};
+  const perChannel = {};
+  const carried = {};
+  const endedLines = [];
+  const lastChainKey = chain[chain.length - 1] ?? null;
+  for (const channel of lineOrder) {
+    const line = lines[channel];
+    const terminal = line.stations[line.stations.length - 1];
+    contracts[channel] = terminal.contract;
+    origin[channel] = line.origin;
+    perChannel[channel] = terminal.periodKey;
+    // 「已停运线」= 末站不在链尾分片上（该线之后还有别的周期在推进，但它自己没有站点）
+    // ⇒ 当前基线里的该通道值，是**从末站前向携带**过来的（显式可见，不再静默）
+    if (lastChainKey && terminal.periodKey !== lastChainKey) {
+      line.ended = true;
+      line.endedAt = terminal.periodKey;
+      carried[channel] = { from: terminal.periodKey, to: lastChainKey, stops: line.stations.length };
+      endedLines.push(channel);
+    }
+  }
+  return { contracts, lines, origin, perChannel, carried, endedLines, chain };
+}
+
+/**
+ * 地铁视图渲染成 Markdown（人类排障用，advice 面，不回灌归因判据）。
+ *
+ * @param {object} metro {@link composeMetro} 的返回值
+ * @returns {string} Markdown
+ */
+export function renderMetro(metro) {
+  const rows = Object.entries(metro?.lines ?? {}).map(([channel, line]) => {
+    const stops = line.stations.map((s) => s.periodKey).join(' → ');
+    const flag = line.ended ? '🟡 已停运' : '✅ 在跑';
+    return `| ${channel} | ${line.origin} | ${stops} | ${line.stations.length} | ${line.endedAt ?? '—'} | ${flag} |`;
+  });
+  const carriedLines = Object.entries(metro?.carried ?? {})
+    .map(([channel, info]) => `- \`${channel}\`：末站 ${info.from}，之后 ${info.to} 等周期**无该线站点** ⇒ 当前基线仍在**前向携带**其末站值（显式可见，不再静默）`);
+  return [
+    '### 🚇 基线线路图（每通道一条线，从各自出发点推进）',
+    '',
+    '| 线路(通道) | 出发点 | 站点序列（早→晚） | 站点数 | 末站 | 状态 |',
+    '|---|---|---|---|---|---|',
+    ...(rows.length > 0 ? rows : ['| — | — | — | 0 | — | — |']),
+    '',
+    ...(carriedLines.length > 0 ? ['**⚠️ 前向携带（已显式化，不再静默）**：', ...carriedLines, ''] : []),
+    ...(metro?.endedLines?.length > 0 ? [`**已停运线**：${metro.endedLines.join(', ')}（末站之后链上仍有其他周期推进）`, ''] : []),
+    '> 说明：`composeMetro()` 是**人类排障视图**（advice），**不参与** `attributionDetail()` 归因判据。',
+  ].join('\n');
 }

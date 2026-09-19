@@ -31,6 +31,7 @@ import {
   migrateLegacyLatest,
   periodKey,
   resolveBaseline,
+  renderMetro,
   segmentStore,
   settleSegment,
 } from './watch/baseline.mjs';
@@ -193,6 +194,8 @@ function cmdVerify(args) {
       note: 'verify 不写基线；写基线请用 `dsh-adapt settle`（一天一个基线）',
       chain: baseline.chain,
       perChannel: baseline.perChannel,
+      // 🚇 地铁视图（每通道一条线路：出发点 / 站点 / 末站 / 前向携带）——人类排障用
+      metro: describeMetro(baseline.metro),
       channels: report.channels.filter((c) => c.ok).map((c) => c.channel),
     },
   };
@@ -204,6 +207,34 @@ function cmdVerify(args) {
   else console.log(JSON.stringify(output, null, 2));
 
   process.exit(report.summary.verdict === 'GREEN' ? 0 : 1);
+}
+
+/**
+ * 把地铁视图压成**可序列化摘要**（不含契约正文，避免报告膨胀）。
+ *
+ * 语义：每通道 = 一条线路；`origin` = 出发点，`stations` = 站点序列，`endedAt` = 末站。
+ * `carried` 显式列出「末站之后无该线站点、当前基线仍在前向携带」的通道——这正是
+ * 单轴 `composeChain()` **看不见**的偏差（未声明通道被静默携带）。
+ *
+ * ⚠️ 本摘要是**人类排障面（advice）**，不参与 `attributionDetail()` 归因判据。
+ *
+ * @param {object} metro {@link composeMetro} 的返回值
+ * @returns {object} 摘要
+ */
+function describeMetro(metro) {
+  return {
+    lines: Object.fromEntries(Object.entries(metro?.lines ?? {}).map(([channel, line]) => [channel, {
+      origin: line.origin,
+      stations: line.stations.map((station) => station.periodKey),
+      stationCount: line.stations.length,
+      endedAt: line.endedAt ?? null,
+      ended: line.ended === true,
+    }])),
+    origin: metro?.origin ?? {},
+    perChannel: metro?.perChannel ?? {},
+    carried: metro?.carried ?? {},
+    endedLines: metro?.endedLines ?? [],
+  };
 }
 
 /**
@@ -227,6 +258,8 @@ function cmdBaseline(args) {
       candidates: (seg.candidates ?? []).length,
       ignored: seg.ignored ?? [],
     })),
+    // 🚇 地铁视图：每通道一条线路（不参与归因判据，纯人类排障面）
+    metro: describeMetro(resolved.metro),
     legacyLatestUsed: resolved.legacyLatest !== null,
     segmentDir: store.dir,
     ...(migration ? { migration } : {}),
@@ -247,6 +280,8 @@ function cmdBaseline(args) {
       '| 周期 | 模式 | 通道 | 候选数 | 被忽略（取最早） |',
       '|---|---|---|---|---|',
       ...resolved.segments.map((seg) => `| ${seg.periodKey} | ${seg.mode ?? '—'} | ${Object.keys(seg.baseline ?? {}).join(', ') || '—'} | ${(seg.candidates ?? []).length} | ${(seg.ignored ?? []).join(', ') || '—'} |`),
+      '',
+      renderMetro(resolved.metro),
     ].filter(Boolean).join('\n'));
   } else console.log(JSON.stringify(output, null, 2));
   process.exit(0);

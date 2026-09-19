@@ -180,5 +180,20 @@ console.log('  [B5] 结算语义（10:00 结算 ⇒ 周期键 = 结算点日期�
     periodKeyForDay(local(2, 10, 0), { settleHour: 12 }));
 }
 
+// ---- B6. 地铁视图是 advice 面：不得回灌归因判据 ----
+console.log('  [B6] 地铁视图（composeMetro）不得参与归因判据（advice 面）');
+{
+  const triageSrc = readFileSync(path.join(ROOT, 'src/triage/index.mjs'), 'utf8');
+  // 归因判据的唯一执行体：attributionDetail() 的函数体内不得出现 metro 相关调用
+  const attrBody = functionBody(runnerSrc, 'export function attributionDetail(') ?? '';
+  eq('B6 attributionDetail 不含 composeMetro(', false, callsIn(attrBody, 'composeMetro'));
+  eq('B6 attributionDetail 不含 metro 相关读取', false, /\bmetro\b/.test(attrBody));
+  // 反向：确认 metro 能力**确实存在**且被 CLI 接入（防「没写 ⇒ 断言恒真」）
+  eq('B6 反证：baseline.mjs 确实导出了 composeMetro（说明不是「没实现」）', true, /export function composeMetro\(/.test(readFileSync(path.join(ROOT, 'src/watch/baseline.mjs'), 'utf8')));
+  eq('B6 反证：CLI 确实把 metro 接入输出（describeMetro/renderMetro）', true, callsIn(cliSrc, 'describeMetro') && callsIn(cliSrc, 'renderMetro'));
+  // triage（advice 面）也不得把 metro 当判据
+  eq('B6 triage（advice 面）不含 composeMetro 判据', false, callsIn(triageSrc, 'composeMetro'));
+}
+
 console.log(`\n发布面自检（基线守卫）：${pass} 项通过 / ${fail} 项失败`);
 process.exit(fail === 0 ? 0 : 1);
