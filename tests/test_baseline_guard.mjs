@@ -25,13 +25,16 @@
  * - B1 变异：在 `cmdVerify` 里插一行 `snapshot.save({})` → 必须命中；
  *   把 `settleSegment(` 挪到 `cmdVerify` **之外** → B1 不误报（反证「定位到函数体」非「全文找」）。
  * - B3 变异：往 push 段插一行 settle → 必须命中。
+ * - **B7**：每日基线是**条件触发**（未变化即跳过，不多一站）——判据用真函数真跑，
+ *   并守住「比对面不得取本次 `--from` 报告」（自己跟自己比 ⇒ 永远无变化 ⇒ 首个站台落不下来）。
+ *   CI 侧：crontab 10:00 段必须经 `--changed-only` 条件门。自证：摘掉条件门 ⇒ 判据命中。
  *
  * 退出码：0 = 全绿；1 = 有失败。
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_SETTLE_HOUR, periodKeyForDay } from '../src/watch/baseline.mjs';
+import { DEFAULT_SETTLE_HOUR, detectBaselineChange, periodKeyForDay, settleSegment } from '../src/watch/baseline.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -178,6 +181,114 @@ console.log('  [B5] 结算语义（10:00 结算 ⇒ 周期键 = 结算点日期�
     periodKeyForDay(local(2, 10, 0), { settleHour: 0 }));
   eq('🟡B5 守卫自证：settleHour=12（正午结算）时 03-02 10:00 → 当日 03-02（与 10 点口径不同）', '2026-03-02',
     periodKeyForDay(local(2, 10, 0), { settleHour: 12 }));
+}
+
+// ---- B6. 地铁视图是 advice 面：不得回灌归因判据 ----
+console.log('  [B6] 地铁视图（composeMetro）不得参与归因判据（advice 面）');
+{
+  const triageSrc = readFileSync(path.join(ROOT, 'src/triage/index.mjs'), 'utf8');
+  const baselineSrc = readFileSync(path.join(ROOT, 'src/watch/baseline.mjs'), 'utf8');
+  // 归因判据的**唯一执行体**在 src/verify/runner.mjs（`attributionDetail`），不是 triage。
+  // ⚠️ 旧写法把 `runnerSrc` 的函数体拿去比、只看了 triage 的调用名 —— `metro` 字样根本不在这两份
+  // 里 ⇒ 断言**恒真**（评审指出）。现在改为：**定位真实函数体**（括号配平，文件正确）+ 全仓扫描消费方。
+  const attrBody = functionBody(runnerSrc, 'export function attributionDetail(');
+  eq('B6 定位 attributionDetail 函数体（防「定位失败 ⇒ 断言空转」）', true, typeof attrBody === 'string' && attrBody.length > 0);
+  eq('B6 attributionDetail（verify/runner.mjs）不含 composeMetro(', false, callsIn(attrBody, 'composeMetro'));
+  eq('B6 attributionDetail（verify/runner.mjs）不含 metro 相关读取', false, /\bmetro\b/i.test(attrBody));
+  eq('B6 attributeFailure（归因出口）不含 metro 判据',
+    false, /\bmetro\b/i.test(functionBody(runnerSrc, 'export function attributeFailure(') ?? ''));
+  // 反向：确认 metro 能力**确实存在**且被 CLI 接入（防「没写 ⇒ 断言恒真」）
+  eq('B6 反证：baseline.mjs 确实导出了 composeMetro（说明不是「没实现」）', true, /export function composeMetro\(/.test(baselineSrc));
+  eq('B6 反证：CLI 确实把 metro 接入输出（describeMetro/renderMetro）', true, callsIn(cliSrc, 'describeMetro') && callsIn(cliSrc, 'renderMetro'));
+  // 反向定位自证：故意把函数体换成含 metro 的原文 ⇒ 判据必须命中（证明上面两条不是恒真）
+  // 自证：把「注入 metro 的」函数体喂给同一判据，必须**判否**（证明上面两条不是恒真）
+  eq('🟡B6 守卫自证：注入 metro 的 attributionDetail 会被判否',
+    true, /\bmetro\b/i.test(`${attrBody ?? ''}\nmetro;`));
+  // triage（advice 面）也不得把 metro 当判据
+  eq('B6 triage（advice 面）不含 composeMetro 判据', false, callsIn(triageSrc, 'composeMetro'));
+  // 归因/探针模块（verify、detect、triage）内**不得**把 composeMetro 当判据
+  eq('B6 归因/探针模块（verify、detect、triage）内**不得**出现 composeMetro 调用', false,
+    ['src/verify/runner.mjs', 'src/detect/flavor.mjs', 'src/triage/index.mjs'].some((rel) => callsIn(readFileSync(path.join(ROOT, rel), 'utf8'), 'composeMetro')));
+}
+
+// ---- B7. 每日基线是**条件触发**：未变化即跳过（不落盘、不新增站台） ----
+console.log('  [B7] 每日基线条件触发（未变化即跳过；空跑日期不留站台）');
+{
+  // 判据全是**行为型**（跑真函数），不是「字串在不在」——防假绿。
+  // ① 未变化 ⇒ changed=false
+  const same = detectBaselineChange({
+    previous: { stable: { a: 1 }, dev: { a: 1 } },
+    baseline: { dev: { a: 1 }, stable: { a: 1 } },
+  });
+  eq('B7 契约逐键相同（含键序不同）⇒ 判「无变化」', false, same.changed);
+  // ② 真变化 ⇒ changed=true
+  eq('B7 已声明通道契约变了 ⇒ 判「有变化」', true,
+    detectBaselineChange({ previous: { dev: { a: 1 } }, baseline: { dev: { a: 2 } } }).changed);
+  // ③ 新增通道 ⇒ changed=true
+  eq('B7 新增通道 ⇒ 判「有变化」', true,
+    detectBaselineChange({ previous: { dev: { a: 1 } }, baseline: { dev: { a: 1 }, stable: { b: 2 } } }).changed);
+  // ④ 首次结算（空基线）⇒ 必须 changed=true（否则第一个站台永远落不下来）
+  eq('B7 空基线（首次结算）⇒ 判「有变化」（否则站台永远落不下）', true,
+    detectBaselineChange({ previous: null, baseline: { dev: { a: 1 } } }).changed);
+  // ⑤ 无候选 ⇒ 不得判成「有变化」（否则空报告也能推进基线 = 假绿）
+  eq('B7 无候选（未跑验收）⇒ 判「无变化」（空报告不得推进基线）', false,
+    detectBaselineChange({ previous: { dev: { a: 1 } }, baseline: {} }).changed);
+  // ⑥ 候选缺席某通道 **不**判成变更（未声明 ≠ 值消失；链式合并本来就前向携带）
+  eq('B7 候选缺席某通道 ⇒ 不判成「有变化」（未声明 ≠ 值消失）', false,
+    detectBaselineChange({ previous: { stable: { a: 1 } }, baseline: { stable: { a: 1 } } }).changed);
+
+  // ⑦ `settleSegment` 端到端：未变化 ⇒ written=false **且不追加候选台账**（零副作用）
+  const segs = new Map();
+  const store = {
+    dir: '/tmp/seg',
+    list: () => [...segs.keys()],
+    load: (k) => (segs.has(k) ? segs.get(k) : null),
+    save: (k, patch) => { const next = { ...(segs.get(k) ?? {}), ...patch, periodKey: k }; segs.set(k, next); return next; },
+  };
+  const channels = [{ channel: 'dev', ok: true, contract: { a: 1 } }];
+  const first = settleSegment({ store, key: '2026-04-01', run: { at: '2026-04-01T02:00:00Z', channels } });
+  eq('B7 settle 首次：落盘（站台建立）', true, first.written);
+  const before = JSON.stringify(segs.get('2026-04-01'));
+  // 空候选（本周期什么都没声明）⇒ **不建立站台**：分片里没有该周期键
+  //（cmdSettle 的 `--changed-only` 早已把这种情形挡在结算之前，这里是第二道兜底）
+  const again = settleSegment({ store, key: '2026-04-02', run: { at: '2026-04-02T02:00:00Z', channels: [] } });
+  eq('B7 settle 空候选：不建立站台（无该周期分片）', false, segs.has('2026-04-02'));
+  eq('B7 settle 空候选：不改动已有站台', before, JSON.stringify(segs.get('2026-04-01')));
+  // 变化则**新周期**落站；再跑同一份 ⇒ 幂等不落盘、不新增候选台账
+  const rolled = settleSegment({ store, key: '2026-04-03', run: { at: '2026-04-03T02:00:00Z', channels } });
+  eq('B7 settle 有候选且变化 ⇒ 新周期落盘（站台推进）', true, rolled.written);
+  const candBefore = (segs.get('2026-04-03').candidates ?? []).length;
+  const idem = settleSegment({ store, key: '2026-04-03', run: { at: '2026-04-03T02:00:00Z', channels } });
+  eq('B7 settle 同周期同身份重跑 ⇒ 幂等不落盘', false, idem.materiallyChanged);
+  eq('B7 settle 同周期同身份重跑 ⇒ 不新增候选台账', candBefore, (segs.get('2026-04-03').candidates ?? []).length);
+
+  // ⑧ 版本号：幂等重跑不涨、内容变了才涨（可观测但零副作用）
+  const v0 = segs.get('2026-04-01').baselineVersion ?? 0;
+  settleSegment({ store, key: '2026-04-01', run: { at: '2026-04-01T02:00:00Z', channels } });
+  eq('B7 幂等重跑：baselineVersion 不涨', v0, segs.get('2026-04-01').baselineVersion ?? 0);
+
+  // ⑨ `cmdSettle` 必须真的**接上**条件触发：函数体里出现 detectBaselineChange + force + changed-only
+  const settleBody = functionBody(cliSrc, 'function cmdSettle(') ?? '';
+  eq('B7 cmdSettle 接上变化判定（detectBaselineChange）', true, callsIn(settleBody, 'detectBaselineChange'));
+  eq('B7 cmdSettle 有 --force 逃生门（人工补站台）', true, /args\.force/.test(settleBody));
+  eq('B7 cmdSettle 有 --changed-only 只判不写出口', true, /changed-only/.test(settleBody));
+  eq('B7 cmdSettle 未变化 ⇒ 跳过结算（不调 settleSegment）', true, /settleSkipped\s*\?/.test(settleBody));
+
+  // ⑩ CI 接线：crontab 10:00 段必须走**条件门**（changed-only），不得无脑结算
+  const cronIdxB7 = cnbSrc.search(/"crontab: 0 10 \* \* \*":/);
+  const cronB7 = cronIdxB7 === -1 ? '' : cnbSrc.slice(cronIdxB7, cnbSrc.indexOf('"crontab: 30 3', cronIdxB7) === -1 ? undefined : cnbSrc.indexOf('"crontab: 30 3', cronIdxB7));
+  eq('B7 crontab 10:00 段有条件门 --changed-only', true, /changed-only/.test(cronB7));
+  eq('B7 crontab 10:00 段有「未变化即退出」分支', true, /CHANGED/.test(cronB7));
+  // 守卫自证（防恒真）：把条件门从 crontab 段摘掉 ⇒ 判据必须命中
+  const withoutGate = cnbSrc.replace(/--changed-only/g, '--mode day');
+  const cronB7b = cronIdxB7 === -1 ? '' : withoutGate.slice(cronIdxB7, withoutGate.indexOf('"crontab: 30 3', cronIdxB7) === -1 ? undefined : withoutGate.indexOf('"crontab: 30 3', cronIdxB7));
+  eq('🟡B7 守卫自证：摘掉 --changed-only ⇒ 判据命中（非恒真）', false, /changed-only/.test(cronB7b));
+
+  // ⑪ 假绿反证：`--from` 报告**不得**被当成比对面（自己跟自己比 ⇒ 永远「无变化」）
+  eq('B7 比对面不取本次 --from 报告（防「自己跟自己比」的假无变化）', false,
+    /args\.from\s*\)\s*\n?\s*:\s*undefined/.test(functionBody(cliSrc, 'function cmdSettle(') ?? ''));
+  eq('B7 cmdSettle 比对面优先取 resolveBaseline 派生基线', true,
+    /resolvedBefore\.contracts/.test(settleBody));
 }
 
 console.log(`\n发布面自检（基线守卫）：${pass} 项通过 / ${fail} 项失败`);

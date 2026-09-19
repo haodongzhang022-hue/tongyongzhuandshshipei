@@ -27,10 +27,13 @@ import { buildSecondary, toMarkdown } from './report/secondary.mjs';
 import { diffContracts, watchUpstream } from './watch/upstream.mjs';
 import {
   DEFAULT_SETTLE_HOUR,
+  contractFingerprint,
+  detectBaselineChange,
   legacySnapshot,
   migrateLegacyLatest,
   periodKey,
   resolveBaseline,
+  renderMetro,
   segmentStore,
   settleSegment,
 } from './watch/baseline.mjs';
@@ -41,10 +44,12 @@ import { VERSION } from './version.mjs';
 export const ALL_CHANNELS = ['stable', 'dev', 'legacy'];
 
 /** 已知布尔开关（其余 `--key value` 视为带值参数）。 */
-const BOOLEAN_FLAGS = new Set(['offline', 'markdown', 'help', 'prune-cache', 'dry-run', 'migrate']);
+const BOOLEAN_FLAGS = new Set(['offline', 'markdown', 'help', 'prune-cache', 'dry-run', 'migrate',
+  // 结算的**条件触发**开关（每日基线不是必然落一版：没变化就跳过）
+  'force', 'changed-only', 'changed']);
 
 /** 已知带值参数（未知的 `--key` 显式报错，避免拼错参数被静默忽略）。 */
-const VALUE_KEYS = new Set(['channel', 'plugin', 'tools', 'json', 'contract-from', 'from', 'mode', 'release', 'at', 'settle-hour']);
+const VALUE_KEYS = new Set(['channel', 'plugin', 'tools', 'json', 'contract-from', 'from', 'mode', 'release', 'at', 'settle-hour', 'changed-from']);
 
 /**
  * 解析 `--key value` / `--key=value` / `--flag` 形式的参数。
@@ -124,6 +129,8 @@ function usage() {
     '  dsh-adapt watch  [--json <out>] [--markdown]         # 上游变更侦测 + 自动归因影响面',
     '  dsh-adapt settle --from <verify.json>                # ★ 结算周期基线（唯一写基线的地方）',
     '        [--mode day|release] [--release <版本标识>] [--at <ISO>] [--settle-hour 10] [--dry-run]',
+    '        # 未变化即「跳过」（不动基线、也不新增站台）——每日基线是**条件触发**',
+    '        [--force] [--changed-only] [--changed 0|1]',
     '  dsh-adapt baseline [--migrate] [--json <out>]        # 看当前基线链（+ 一次性迁移遗留 latest.json）',
     '  dsh-adapt report --plugin <path> --tools a,b [--channel stable|dev|legacy|all] [--markdown]',
     '  dsh-adapt cache  [--prune-cache]                     # 宿主依赖缓存维护（默认保留当前钉版指纹）',
@@ -193,6 +200,8 @@ function cmdVerify(args) {
       note: 'verify 不写基线；写基线请用 `dsh-adapt settle`（一天一个基线）',
       chain: baseline.chain,
       perChannel: baseline.perChannel,
+      // 🚇 地铁视图（每通道一条线路：出发点 / 站点 / 末站 / 前向携带）——人类排障用
+      metro: describeMetro(baseline.metro),
       channels: report.channels.filter((c) => c.ok).map((c) => c.channel),
     },
   };
@@ -204,6 +213,41 @@ function cmdVerify(args) {
   else console.log(JSON.stringify(output, null, 2));
 
   process.exit(report.summary.verdict === 'GREEN' ? 0 : 1);
+}
+
+/**
+ * 把地铁视图压成**可序列化摘要**（不含契约正文，避免报告膨胀）。
+ *
+ * 语义：每通道 = 一条线路；`origin` = 出发点，`stations` = 站点序列（**指纹齐全**才算站），
+ * `terminal` = 取值来源（可能落在空壳快照上），`shallowStations` = 画不出站的半截快照。
+ * `carried` 显式列出「末站之后无该线站点、当前基线仍在前向携带」的通道——这正是
+ * 单轴 `composeChain()` **看不见**的偏差（未声明通道被静默携带）。
+ *
+ * ⚠️ 本摘要是**人类排障面（advice）**，不参与 `attributionDetail()` 归因判据。
+ *
+ * @param {object} metro {@link composeMetro} 的返回值
+ * @returns {object} 摘要
+ */
+function describeMetro(metro) {
+  return {
+    lines: Object.fromEntries(Object.entries(metro?.lines ?? {}).map(([channel, line]) => [channel, {
+      origin: line.origin,
+      // 站点 = **指纹齐全**的显式声明（更严的注解面判据）；空壳快照见 shallowStations
+      stations: line.stations.map((station) => station.periodKey),
+      stationCount: line.stations.length,
+      shallowStations: line.shallowStations ?? [],
+      // 末站 = **取值来源**（可能落在空壳快照上）⇒ 与 perChannel 同源，不因画不出站而漂移
+      terminal: line.terminalPeriodKey ?? null,
+      endedAt: line.endedAt ?? null,
+      ended: line.ended === true,
+    }])),
+    origin: metro?.origin ?? {},
+    perChannel: metro?.perChannel ?? {},
+    carried: metro?.carried ?? {},
+    endedLines: metro?.endedLines ?? [],
+    // 空壳快照通道（非空但无指纹字段）：画不出站，但**仍是取值来源** ⇒ 显式暴露
+    shallowChannels: Object.keys(metro?.shallowStations ?? {}),
+  };
 }
 
 /**
@@ -227,6 +271,8 @@ function cmdBaseline(args) {
       candidates: (seg.candidates ?? []).length,
       ignored: seg.ignored ?? [],
     })),
+    // 🚇 地铁视图：每通道一条线路（不参与归因判据，纯人类排障面）
+    metro: describeMetro(resolved.metro),
     legacyLatestUsed: resolved.legacyLatest !== null,
     segmentDir: store.dir,
     ...(migration ? { migration } : {}),
@@ -247,6 +293,8 @@ function cmdBaseline(args) {
       '| 周期 | 模式 | 通道 | 候选数 | 被忽略（取最早） |',
       '|---|---|---|---|---|',
       ...resolved.segments.map((seg) => `| ${seg.periodKey} | ${seg.mode ?? '—'} | ${Object.keys(seg.baseline ?? {}).join(', ') || '—'} | ${(seg.candidates ?? []).length} | ${(seg.ignored ?? []).join(', ') || '—'} |`),
+      '',
+      renderMetro(resolved.metro),
     ].filter(Boolean).join('\n'));
   } else console.log(JSON.stringify(output, null, 2));
   process.exit(0);
@@ -262,7 +310,21 @@ function cmdBaseline(args) {
  * - 每周期写**独立分片** `registry/contract-snapshots/segments/<key>.json`，**不合并到主线**；
  * - `--dry-run` 只看会写什么，不落盘。
  *
- * 退出码：0 = 已结算（或幂等无变化）；2 = 用法错误；3 = 运行时异常。
+ * 🚦 **条件触发（本命令最重要的一条口径）**：
+ * 「每日基线」**不是每天都落一版**。有些日子上游没发版、契约没变，
+ * 那就既不改基线、也不新增站台（站台 = 该通道在某分片上**显式声明**的快照）。
+ * 判定 = 本次有效候选 vs **当前基线（链式合并后）**，用 `contractFingerprint()` 比对：
+ * 完全相同 ⇒ `skipped`（不动文件），有新增/变更/消失 ⇒ 照常结算。
+ * 这样「地铁线路图」只在**真有变化**时才多一站，空跑的日期不留站台。
+ *
+ * - `--changed-only` / `--changed 1`：**只判不写**（退出码当信号，供 CI 做条件门）；
+ * - `--force`：无视变化判定，强制结算（人工补站台时用）；
+ * - `--changed-from <verify.json>`：显式指定「比对对象」的验收报告；
+ *   缺省即 `--from` 的那份（同一次采集同时当「候选」和「比对面」——才是真判据；
+ *   拿上一次的陈旧产物当比对面会得到假「已变化」）。
+ *
+ * 退出码：0 = 已结算 / 未变化而跳过 / 幂等无变化；1 = `--changed-only` 判定为**有变化**；
+ * 2 = 用法错误；3 = 运行时异常。
  *
  * @param {object} args 已解析参数
  */
@@ -277,17 +339,61 @@ function cmdSettle(args) {
   });
   const store = segmentStore({ hubRoot: HUB_ROOT });
   const report = readVerificationReports(args);
-  const settled = settleSegment({
-    store,
-    key,
-    dryRun: Boolean(args['dry-run']),
-    run: { at, mode, orderAt: at, source: args['from'] ?? null, channels: report.channels },
-  });
+  // 变化判定：拿「当前基线（链式合并后）」与本次候选逐键比对指纹。
+  // 注意 `baseline` 为空时（首次结算）**必须**算「有变化」——否则永远落不下第一个站台。
+  const resolvedBefore = resolveBaseline({ hubRoot: HUB_ROOT });
+  const accepted = {};
+  for (const channel of report.channels ?? []) {
+    if (channel?.ok === true && channel.channel && channel.contract && Object.keys(channel.contract).length > 0) {
+      accepted[channel.channel] = channel.contract;
+    }
+  }
+  // ⚠️ 比对面**必须是「上次的基线」**，不能拿本次 `--from` 报告——那是**本次候选本身**，
+  // 自己跟自己比永远「无变化」（实测踩到：新仓首次结算被判成「未变化」而跳过，站台永远落不下来）。
+  // 默认比对面 = `resolveBaseline()` 派生的当前基线（链式合并后）；
+  // 仅当显式给了 `--changed-from` 才改用那份报告（用于「拿别处的快照当比对面」的场景）。
+  const changedFrom = typeof args['changed-from'] === 'string' ? readContractsFromReport(args['changed-from']) : null;
+  const comparison = changedFrom ?? (Object.keys(resolvedBefore.contracts).length > 0 ? resolvedBefore.contracts : null);
+  const change = detectBaselineChange({ previous: comparison, baseline: accepted });
+  const force = Boolean(args.force);
+  const changedOnly = Boolean(args['changed-only']) || args.changed === '1' || args.changed === true;
+
+  // 条件触发的三种出口：
+  // ① `--changed-only`：只判不写（CI 的条件门用它决定「要不要跑结算这一段」）；
+  // ② 已变化 / `--force`：照常结算；
+  // ③ 未变化：**跳过**——不改基线、不新增站台、不落盘（也不追加候选台账）。
+  if (changedOnly) {
+    console.log(JSON.stringify({
+      periodKey: key,
+      mode,
+      changed: change.changed,
+      reason: change.reason,
+      addedChannels: change.addedChannels,
+      removedChannels: change.removedChannels,
+      comparedWith: comparison === null ? '（空基线：首次结算 ⇒ 视为有变化）' : '当前基线（链式合并后）',
+      hasCandidates: Object.keys(accepted).length > 0,
+    }, null, 2));
+    process.exit(change.changed ? 1 : 0);
+  }
+  const settleSkipped = !force && !change.changed;
+  const settled = settleSkipped
+    ? { key, baseline: resolvedBefore.contracts, ignored: [], written: false, materiallyChanged: false, candidates: [], firstRunAt: null }
+    : settleSegment({
+      store,
+      key,
+      dryRun: Boolean(args['dry-run']),
+      run: { at, mode, orderAt: at, source: args.from ?? null, channels: report.channels },
+    });
   const resolved = resolveBaseline({ hubRoot: HUB_ROOT });
   const output = {
     periodKey: key,
     mode,
     dryRun: Boolean(args['dry-run']),
+    skipped: settleSkipped,
+    changed: change.changed,
+    changeReason: change.reason,
+    addedChannels: change.addedChannels,
+    removedChannels: change.removedChannels,
     written: settled.written,
     baselineChannels: Object.keys(settled.baseline ?? {}),
     ignored: settled.ignored,
@@ -299,14 +405,21 @@ function cmdSettle(args) {
   };
   if (args.markdown) {
     console.log([
-      `## 契约基线结算（${key}）`,
+      settleSkipped
+        ? `## 契约基线结算（${key}）—— ⏭ 跳过（基线未变化）`
+        : `## 契约基线结算（${key}）`,
       '',
       `- 模式：${mode}｜链：${resolved.chain.join(' → ') || '（空）'}`,
-      `- 本次纳入通道：${Object.keys(settled.baseline ?? {}).join(', ') || '（无有效候选）'}`,
-      `- 同周期被忽略的候选（取最早）：${settled.ignored.join(', ') || '无'}`,
-      `- 落盘：${settled.written && !args['dry-run'] ? '是' : '否（dry-run 或幂等）'}`,
+      `- 变化判定：${change.changed ? '✅ 有变化' : '⏭ 无变化'}（${change.reason}）`,
+      change.addedChannels.length ? `- 新增通道：${change.addedChannels.join(', ')}` : '',
+      change.removedChannels.length ? `- 候选里缺失（不判为变更）：${change.removedChannels.join(', ')}` : '',
+      settleSkipped
+        ? '- 落盘：否（**未变化即跳过**：不改基线、不新增站台 —— 每日基线是按条件触发的，不是必然）'
+        : `- 本次纳入通道：${Object.keys(settled.baseline ?? {}).join(', ') || '（无有效候选）'}`,
+      settleSkipped ? '' : `- 同周期被忽略的候选（取最早）：${settled.ignored.join(', ') || '无'}`,
+      settleSkipped ? '' : `- 落盘：${settled.written && !args['dry-run'] ? '是' : '否（dry-run 或幂等）'}`,
       `- 分片目录：\`${store.dir}\``,
-    ].join('\n'));
+    ].filter(Boolean).join('\n'));
   } else console.log(JSON.stringify(output, null, 2));
   process.exit(0);
 }

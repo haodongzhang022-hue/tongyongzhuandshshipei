@@ -24,6 +24,7 @@
 | 补 `output.render`、尊重 `exec.signal` | 适配器统一处理 |
 | 写双版本适配验收脚本 | `verify --channel stable|dev` |
 | 盯上游发版 | `watch` + crontab 每日扫 |
+| 基线被每一步 push 顶上 | `settle` 每日结算 + **条件触发**（没变化就跳过） |
 
 ---
 
@@ -48,9 +49,9 @@
 ✅ stable  (0.1.5-rc.2)      17/17 检查通过   flavor=modern
 ✅ dev     (0.1.6-alpha.2)   17/17 检查通过   flavor=modern
 ✅ legacy  (0.1.1-rc.2)      17/17 检查通过   flavor=legacy
-✅ 离线单测 229 项 + 归因离线回归 654 项 + 发布面自检 51 项 + 归因端到端回归 191 项 + 基线分段守卫 27 项
+✅ 离线单测 264 项 + 归因离线回归 654 项 + 发布面自检 51 项 + 归因端到端回归 191 项 + 基线守卫 58 项
 
-✅ 离线单测 229 项 + 归因离线回归 654 项 + 发布面自检 51 项 + 归因端到端回归 191 项 + 基线分段守卫 27 项
+✅ **每日基线是条件触发**：契约没变化的日子**跳过**（不改基线、不新增站台）
 ✅ 负例插件被正确拦下（保留名冲突显式上报，不静默失效）
 ✅ 插件写错代码（未初始化字段 / 抛错 getter）→ 判插件且 `hostFatal[]` 为空（插件侧错误不进判据字段——**前提：探针进程内防线未被插件干预**，见 `docs/RISKS.md` R22/R23）
 ✅ 上游漂移侦测可用（基线只在通道 ok 时更新，失败不覆盖）
@@ -83,7 +84,7 @@ export function apply(ctx) {
 node src/cli.mjs matrix                                  # 看通道矩阵
 node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs --tools demo_echo,demo_status --markdown
 node src/cli.mjs watch                                   # 上游有没有发新版
-bash tests/test_offline.sh                               # 离线单测（229 项，秒级）
+bash tests/test_offline.sh                               # 离线单测（264 项，秒级）
 node tests/test_attribution.mjs                          # 归因离线回归（654 项，秒级）
 node tests/test_exports.mjs                              # 发布面自检（exports 全解析 + 模板拷贝可用）
 ```

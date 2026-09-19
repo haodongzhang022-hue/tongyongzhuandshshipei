@@ -1027,6 +1027,212 @@ console.log(JSON.stringify([...keys].sort()) !== JSON.stringify(keys) ? 'lexicog
 assert "🟡自证②：链式合并保留未声明通道 ≠「全部取最新再合成」" "chain-keeps-undeclared" "$(echo "$SELF" | sed -n 1p)"
 assert "🟡自证③：字典序确实会把迁移分片排错（故必须用显式 orderAt）" "lexicographic-is-wrong" "$(echo "$SELF" | sed -n 2p)"
 
+echo "  [24] 基线「地铁/坐标轴」模型：每通道一条线路 + 各自出发点 + 显式前向携带（v0.3.1）"
+# 为什么补：`composeChain()` 是**单轴**——某通道在某周期之后不再出现时，它的旧值会被
+# **无限前向携带**，且**没有任何字段**表达「这条线在 X 之后就没有站点了」（实测：legacy 在
+# 03-02 后再无站点，到 03-10 仍以 03-02 的值参与当前基线）。本节断言全部是**语义级**
+# （不是「函数在不在」），并配**变异自证**（防恒真）。
+OUT="$("$NODE_BIN" --input-type=module -e "
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { segmentStore, settleSegment, resolveBaseline, composeChain, composeMetro, renderMetro, isUsableStation, hasContractFingerprint } from '$ROOT/src/watch/baseline.mjs';
+const dir = mkdtempSync(path.join(tmpdir(), 'dsh-metro-'));
+const store = segmentStore({ hubRoot: dir });
+const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
+
+// 场景：三条线，出发点都在 03-02；legacy 在 03-05 起停运；stable 在 03-10 起停运；dev 一路推到 03-10
+settleSegment({ store, key:'2026-03-02', run:{ at:'2026-03-02T01:10:00Z', orderAt:'2026-03-02T01:10:00Z', channels:[{channel:'stable',ok:true,contract:C('s1')},{channel:'dev',ok:true,contract:C('d1')},{channel:'legacy',ok:true,contract:C('L1')}] } });
+settleSegment({ store, key:'2026-03-05', run:{ at:'2026-03-05T01:10:00Z', orderAt:'2026-03-05T01:10:00Z', channels:[{channel:'stable',ok:true,contract:C('s2')},{channel:'dev',ok:true,contract:C('d2')}] } });
+settleSegment({ store, key:'2026-03-10', run:{ at:'2026-03-10T01:10:00Z', orderAt:'2026-03-10T01:10:00Z', channels:[{channel:'dev',ok:true,contract:C('d3')}] } });
+
+const r = resolveBaseline({ hubRoot:dir });
+const metro = r.metro;
+
+// ① 出发点：每条线**各自**的起点站（不是全局首周期）
+console.log(JSON.stringify(metro.origin));
+// ② 站点序列：只有**显式声明**才算站（legacy 只 1 站、stable 2 站、dev 3 站）
+console.log(JSON.stringify({ legacy:metro.lines.legacy.stations.length, stable:metro.lines.stable.stations.length, dev:metro.lines.dev.stations.length }));
+// ③ 末站（当前基线取值来源）
+console.log(JSON.stringify(metro.perChannel));
+// ④ 前向携带**显式化**：末站之后无站点的线，被点名 + 记 from→to（这正是单轴看不见的）
+console.log(JSON.stringify(Object.keys(metro.carried).sort()));
+console.log(metro.carried.legacy.from + '->' + metro.carried.legacy.to);
+// ⑤ 已停运线（末站不在链尾）
+console.log(JSON.stringify(metro.endedLines.slice().sort()));
+// ⑥ 🚇 与单轴取值**一致**（解耦：取值面与 composeChain 同口径）——**良好契约 + 畸形空壳都要比**
+const ordered = () => store.list().map((k) => ({ periodKey:k, ...store.load(k) }));
+console.log(String(JSON.stringify(composeMetro(ordered()).contracts) === JSON.stringify(composeChain(ordered()).contracts)));
+// ⑥b **分叉回归**（评审 critical）：畸形通道「非空但无指纹字段」+ 它**之前还有真实站点** ⇒
+//     地铁视图不得把该通道整个丢掉、也不得连带丢掉该线前面的真站（旧实现两处都错）
+const dirX = mkdtempSync(path.join(tmpdir(), 'dsh-metro-x-'));
+const sX = segmentStore({ hubRoot:dirX });
+settleSegment({ store:sX, key:'2026-05-01', run:{ at:'2026-05-01T01:10:00Z', orderAt:'2026-05-01T01:10:00Z', channels:[{channel:'legacy',ok:true,contract:C('L1')}] } });
+settleSegment({ store:sX, key:'2026-05-05', run:{ at:'2026-05-05T01:10:00Z', orderAt:'2026-05-05T01:10:00Z', channels:[{channel:'legacy',ok:true,contract:C('L2')}] } });
+// 手工注入「非空但无任何指纹字段」的畸形快照（模拟上游产出半截快照；这正是 R34 要暴露的场景）
+const seg = sX.load('2026-05-05');
+seg.baseline = { ...seg.baseline, legacy: { SHALLOW:{} } };
+sX.save('2026-05-05', { baseline: seg.baseline });
+const mX = resolveBaseline({ hubRoot:dirX }).metro;
+const cX = composeChain(sX.list().map((k) => ({ periodKey:k, ...sX.load(k) }))).contracts;
+console.log(String(JSON.stringify(mX.contracts) === JSON.stringify(cX)));
+console.log(JSON.stringify(mX.contracts.legacy));            // 空壳仍是取值
+console.log(String(mX.perChannel.legacy));                    // 取值来源仍指 05-05（不因画不出站而漂移）
+console.log(String(mX.lines.legacy.stations.length));         // 真站仍在（旧实现被 continue 连带丢掉）
+console.log(JSON.stringify(mX.lines.legacy.shallowStations)); // 空壳被显式注解（不隐身）
+// ⑦ 站点注解面判据：空壳不算站；**合法 null 值**（Object.hasOwn）算声明过
+console.log([String(isUsableStation({})), String(isUsableStation({ configProjection:'x' })), String(hasContractFingerprint({ configProjection:null }))].join('|'));
+// ⑧ 渲染面：线路图含出发点列 + 停运标记
+const md = renderMetro(metro);
+console.log(String(md.includes('出发点')) + '|' + String(md.includes('已停运')) + '|' + String(md.includes('前向携带')));
+const mdX = renderMetro(mX);
+console.log(String(mdX.includes('空壳快照')) + '|' + String(mdX.includes('仍参与取值')));
+// ⑨ 单一分片（只有出发点那期）⇒ 无停运、无携带
+const dir2 = mkdtempSync(path.join(tmpdir(), 'dsh-metro2-'));
+const s2 = segmentStore({ hubRoot:dir2 });
+settleSegment({ store:s2, key:'2026-04-01', run:{ at:'2026-04-01T01:10:00Z', orderAt:'2026-04-01T01:10:00Z', channels:[{channel:'dev',ok:true,contract:C('x')}] } });
+const m2 = resolveBaseline({ hubRoot:dir2 }).metro;
+console.log(JSON.stringify(m2.endedLines) + '|' + JSON.stringify(m2.carried));
+rmSync(dir, { recursive:true, force:true });
+rmSync(dir2, { recursive:true, force:true });
+")"
+# 键序 = 线路首次出现在链上的先后（与 composeChain 同序），不是字母序
+assert "🚇 出发点：每条线**各自**的起点站（皆 03-02；键序=首次出现序）" '{"stable":"2026-03-02","dev":"2026-03-02","legacy":"2026-03-02"}' "$(echo "$OUT" | sed -n 1p)"
+assert "🚇 站点序列：只有**显式声明**才算站（legacy 1 / stable 2 / dev 3）" '{"legacy":1,"stable":2,"dev":3}' "$(echo "$OUT" | sed -n 2p)"
+assert "🚇 末站：当前基线取值来源（dev=03-10 / stable=03-05 / legacy=03-02）" '{"stable":"2026-03-05","dev":"2026-03-10","legacy":"2026-03-02"}' "$(echo "$OUT" | sed -n 3p)"
+assert "🚇 前向携带**显式化**：停运线被点名（单轴看不见）" '["legacy","stable"]' "$(echo "$OUT" | sed -n 4p)"
+assert "🚇 前向携带记 from→to（legacy 从 03-02 携带到 03-10）" '2026-03-02->2026-03-10' "$(echo "$OUT" | sed -n 5p)"
+assert "🚇 已停运线 = 末站不在链尾（legacy + stable）" '["legacy","stable"]' "$(echo "$OUT" | sed -n 6p)"
+assert "🚇 与单轴 composeChain **取值逐键一致**（解耦：取值面同判据）" "true" "$(echo "$OUT" | sed -n 7p)"
+assert "🚇 **分叉回归**：畸形空壳通道不能被地铁视图丢掉（与链式取值一致）" "true" "$(echo "$OUT" | sed -n 8p)"
+assert "🚇 **分叉回归**：空壳仍是取值（不被 continue 掉）" '{"SHALLOW":{}}' "$(echo "$OUT" | sed -n 9p)"
+assert "🚇 **分叉回归**：取值来源仍指空壳分片（不因画不出站而漂移）" "2026-05-05" "$(echo "$OUT" | sed -n 10p)"
+assert "🚇 **分叉回归**：该线**前面的真站**不被连带丢掉（旧实现 continue 全丢）" "1" "$(echo "$OUT" | sed -n 11p)"
+assert "🚇 **分叉回归**：空壳快照被显式注解（不再隐身）" '["2026-05-05"]' "$(echo "$OUT" | sed -n 12p)"
+assert "🚇 站点注解判据：空壳不算站 / 有指纹算 / **合法 null 值算声明过**" "false|true|true" "$(echo "$OUT" | sed -n 13p)"
+assert "🚇 渲染面：含出发点列 + 停运标记 + 前向携带告警" "true|true|true" "$(echo "$OUT" | sed -n 14p)"
+assert "🚇 渲染面：空壳快照**可见**（画不出站但仍是取值来源）" "true|true" "$(echo "$OUT" | sed -n 15p)"
+assert "🚇 单一分片 ⇒ 无停运、无携带（反证非恒真）" "[]|{}" "$(echo "$OUT" | sed -n 16p)"
+
+# 守卫自证：确认这些断言不是恒真——① 把「站点=显式声明」改成「站点=一切出现过的通道」
+# （即单轴语义：未声明也顶一个站）⇒ 站点数必变；② 把 endedLines 判据改成恒空 ⇒ 第 6 行必变。
+SELF="$("$NODE_BIN" --input-type=module -e "
+import { composeMetro } from '$ROOT/src/watch/baseline.mjs';
+const C = (t) => ({ configProjection:t });
+const segs = [
+  { periodKey:'2026-03-02', orderAt:'2026-03-02T01:10:00Z', baseline:{ stable:C('s1'), dev:C('d1'), legacy:C('L1') } },
+  { periodKey:'2026-03-05', orderAt:'2026-03-05T01:10:00Z', baseline:{ stable:C('s2'), dev:C('d2') } },
+  { periodKey:'2026-03-10', orderAt:'2026-03-10T01:10:00Z', baseline:{ dev:C('d3') } },
+];
+const m = composeMetro(segs);
+// ① 站点数只算显式声明（legacy 不应因'出现过'而在 03-05 多一个站）
+console.log(m.lines.legacy.stations.length === 1 ? 'explicit-only' : 'BROKEN');
+// ② 停运判据：必须点名 legacy（若判据恒空则这里为 BROKEN）
+console.log(m.endedLines.includes('legacy') ? 'ended-detected' : 'BROKEN');
+// ③ **假绿自证**：把站点判据收紧成「必须有指纹字段」后，**取值**仍必须与链式合并相等
+//     （若取值也跟着收紧 ⇒ 分叉回来 ⇒ BROKEN；这正是评审 critical 的回归点）
+import { composeChain } from '$ROOT/src/watch/baseline.mjs';
+const malformed = [
+  { periodKey:'2026-05-01', orderAt:'2026-05-01T01:10:00Z', baseline:{ legacy:{ configProjection:'L1' } } },
+  { periodKey:'2026-05-05', orderAt:'2026-05-05T01:10:00Z', baseline:{ legacy:{ SHALLOW:{} } } },
+];
+const mm = composeMetro(malformed);
+const cc = composeChain(malformed);
+console.log(JSON.stringify(mm.contracts) === JSON.stringify(cc.contracts) ? 'contracts-decoupled' : 'BROKEN');
+console.log(mm.lines.legacy.stations.length === 1 && (mm.lines.legacy.shallowStations ?? []).length === 1 ? 'annotation-separated' : 'BROKEN');
+")
+"
+assert "🟡自证①：站点只算**显式声明**（否则单轴语义会凭空给 legacy 多站）" "explicit-only" "$(echo "$SELF" | sed -n 1p)"
+assert "🟡自证②：停运判据真的点名 legacy（非恒空）" "ended-detected" "$(echo "$SELF" | sed -n 2p)"
+assert "🟡自证③：取值与站点注解**解耦**（收紧站判据后 contracts 仍与链式相等）" "contracts-decoupled" "$(echo "$SELF" | sed -n 3p)"
+assert "🟡自证④：畸形场景下站点/空壳注解分离（1 真站 + 1 空壳）" "annotation-separated" "$(echo "$SELF" | sed -n 4p)"
+echo "  [25] 每日基线**条件触发**（未变化即跳过：不改基线、不新增站台）"
+# 为什么补：把「每日基线」实现成「每天都无脑结算」会立刻产生两个问题——
+#   ① 没变化的日子也在链上多一个站台 ⇒ 线路图被空站填满，「哪天真的变了」看不出来；
+#   ② 空跑的日期改写了分片文件 ⇒ CI 脏工作区 / 无意义 diff。
+# 用户点名：**有些日子没产生修改，基线不变就不需要触发**。
+# 本节断言全部是**语义级**（真跑函数），并配变异自证（防「没写 ⇒ 断言恒真」）。
+OUT="$("$NODE_BIN" --input-type=module -e "
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { periodKeyForDay, segmentStore, settleSegment, resolveBaseline, detectBaselineChange, contractFingerprint } from '$ROOT/src/watch/baseline.mjs';
+const dir = mkdtempSync(path.join(tmpdir(), 'dsh-cond-'));
+const store = segmentStore({ hubRoot: dir });
+const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
+const ch = (t) => [{ channel:'dev', ok:true, contract:C(t) }, { channel:'stable', ok:true, contract:C(t) }];
+
+// ① 首次结算（空基线）⇒ 必须判「有变化」（否则第一个站台永远落不下来）
+const first = detectBaselineChange({ previous:null, baseline:{ dev:C('v1') } });
+console.log(String(first.changed) + '|' + first.reason);
+
+// ② 逐键相同（且通道键序被打乱）⇒ 判「无变化」
+console.log(String(detectBaselineChange({ previous:{ stable:C('v1'), dev:C('v1') }, baseline:{ dev:C('v1'), stable:C('v1') } }).changed));
+
+// ③ 已声明通道的契约变了 ⇒ 判「有变化」
+console.log(String(detectBaselineChange({ previous:{ dev:C('v1') }, baseline:{ dev:C('v2') } }).changed));
+
+// ④ 候选缺席某通道 ⇒ **不**判成变更（未声明 ≠ 值消失；链式合并本来就前向携带）
+console.log(String(detectBaselineChange({ previous:{ stable:C('v1'), dev:C('v1') }, baseline:{ stable:C('v1') } }).changed));
+
+// ⑤ 无候选（空报告）⇒ 判「无变化」（空报告不得推进基线）
+console.log(String(detectBaselineChange({ previous:{ dev:C('v1') }, baseline:{} }).changed));
+
+// ⑥ 端到端：D1 有声明 ⇒ 落站；D2/D3 同契约 ⇒ 不算变化、不落盘 ⇒ 链上只有 D1 一站
+const K = (day) => periodKeyForDay(new Date('2026-05-' + day + 'T02:00:00+08:00'));  // 本地 10:00 ⇒ 落次日键，但**稳定可复现**
+const d1 = settleSegment({ store, key:K('05'), run:{ at:'2026-05-05T02:00:00+08:00', channels:ch('same') } });
+console.log('D1:' + String(d1.written));
+const cur = resolveBaseline({ hubRoot:dir }).contracts;
+const d2changed = detectBaselineChange({ previous:cur, baseline:Object.fromEntries(ch('same').map((c) => [c.channel, c.contract])) }).changed;
+const d3changed = detectBaselineChange({ previous:cur, baseline:Object.fromEntries(ch('same').map((c) => [c.channel, c.contract])) }).changed;
+console.log('D2:' + String(d2changed) + '|D3:' + String(d3changed));
+console.log(JSON.stringify(store.list()));
+
+// ⑦ D4 契约真的变了 ⇒ 判「有变化」并落新站 ⇒ 链推进到两站
+const d4c = detectBaselineChange({ previous:cur, baseline:{ dev:C('CHANGED'), stable:C('CHANGED') } });
+console.log('D4:' + String(d4c.changed) + '|' + d4c.reason);
+settleSegment({ store, key:K('08'), run:{ at:'2026-05-08T02:00:00+08:00', channels:ch('CHANGED') } });
+console.log(JSON.stringify(store.list()));
+
+// ⑧ 指纹与通道插入顺序无关（防「键序不同 ⇒ 假变化 ⇒ 每天多一站」）
+console.log(String(contractFingerprint({ a:C('x'), b:C('y') }) === contractFingerprint({ b:C('y'), a:C('x') })));
+
+// ⑨ 空候选的第二道兜底：不建立空站台（站台 = 该周期**显式声明**过的快照）
+const empty = settleSegment({ store, key:K('20'), run:{ at:'2026-05-20T02:00:00+08:00', channels:[] } });
+console.log('empty:' + String(empty.written) + '|' + String(store.list().includes(K('20'))));
+rmSync(dir, { recursive:true, force:true });
+")"
+assert "空基线（首次结算）⇒ 必须有变化，否则站台永远落不下" "true|首次结算（当前基线为空）" "$(echo "$OUT" | sed -n 1p)"
+assert "逐键相同（通道键序不同也算相同）⇒ 判无变化" "false" "$(echo "$OUT" | sed -n 2p)"
+assert "已声明通道的契约变了 ⇒ 判有变化" "true" "$(echo "$OUT" | sed -n 3p)"
+assert "候选缺席某通道 ⇒ 不判成变更（未声明 ≠ 值消失）" "false" "$(echo "$OUT" | sed -n 4p)"
+assert "无候选（空报告）⇒ 判无变化（空报告不得推进基线）" "false" "$(echo "$OUT" | sed -n 5p)"
+assert "D1 有声明 ⇒ 落站" "D1:true" "$(echo "$OUT" | sed -n 6p)"
+assert "D2/D3 契约没变 ⇒ 都不触发（每日基线按条件触发，不是必然）" "D2:false|D3:false" "$(echo "$OUT" | sed -n 7p)"
+assert "空跑的日期**不留站台**（链上只有真有声明的日期 ⇒ 恰好 1 站）" "1" "$(echo "$OUT" | sed -n 8p | tr -d '[]"' | tr ',' '\n' | grep -c .)"
+assert "D4 契约变了 ⇒ 触发，且原因写明「契约变更」" "D4:true|契约变更 dev, stable" "$(echo "$OUT" | sed -n 9p)"
+assert "真变化才推进一站（站点→下一站 ⇒ 恰好 2 站，而非天天一站）" "2" "$(echo "$OUT" | sed -n 10p | tr -d '[]"' | tr ',' '\n' | grep -c .)"
+assert "契约指纹与通道插入顺序无关（防假变化）" "true" "$(echo "$OUT" | sed -n 11p)"
+assert "空候选不建立空站台（第二道兜底）" "empty:false|false" "$(echo "$OUT" | sed -n 12p)"
+
+# 变异自证：确认上面不是恒真——把「逐键比对」退回「整体 JSON.stringify」，
+# 键序不同的同一份契约会被误判成「有变化」（即每天无脑多一站）。
+SELF="$("$NODE_BIN" --input-type=module -e "
+const C = (t) => ({ configProjection:t, reservedName:t, schemaSubset:t, outputShape:t });
+const prev = { stable:C('v1'), dev:C('v1') };
+const next = { dev:C('v1'), stable:C('v1') };
+// 整体 stringify：键序不同 ⇒ 假变化（这正是要避免的形态）
+console.log(JSON.stringify(prev) !== JSON.stringify(next) ? 'naive-json-false-positive' : 'BROKEN');
+// 排序指纹：键序无关 ⇒ 判等（正确形态）
+const fp = (o) => Object.keys(o).sort().map((k) => k + '=' + JSON.stringify(o[k])).join('|');
+console.log(fp(prev) === fp(next) ? 'sorted-fingerprint-stable' : 'BROKEN');
+// 反证：内容真的变了，排序指纹必须能看出来（防「指纹恒等」的空转）
+console.log(fp({ dev:C('v1') }) !== fp({ dev:C('v2') }) ? 'fingerprint-detects-change' : 'BROKEN');
+")"
+assert "🟡自证①：整体 stringify 会把键序不同误判成假变化（故必须用排序指纹）" "naive-json-false-positive" "$(echo "$SELF" | sed -n 1p)"
+assert "🟡自证②：排序指纹键序无关 ⇒ 判等（正确形态）" "sorted-fingerprint-stable" "$(echo "$SELF" | sed -n 2p)"
+assert "🟡自证③：排序指纹仍能看出真变化（非恒等空转）" "fingerprint-detects-change" "$(echo "$SELF" | sed -n 3p)"
+
 echo
 echo "▶ 离线单元测试结果：PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" -eq 0 ]]

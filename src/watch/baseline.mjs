@@ -26,7 +26,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { HUB_ROOT } from '../harness/host.mjs';
-import { isUsableContract, mergeContracts } from './upstream.mjs';
+import { CONTRACT_FIELDS, isUsableContract, mergeContracts } from './upstream.mjs';
 
 /** 分片目录（相对 hub 根）。 */
 export const SEGMENT_DIR = 'registry/contract-snapshots/segments';
@@ -161,6 +161,8 @@ export function settleSegment(options) {
 
   const record = {
     mode: options.run?.mode ?? 'day',
+    // 「内容真的变了才 +1」——幂等重跑 / 未变化跳过都不涨版本（零副作用但可观测）
+    baselineVersion: baselineVersion(previous, { baseline }),
     // 显式排序键：链式合并按它推进（不依赖 periodKey 字典序，见 segmentOrderAt）
     orderAt: options.run?.orderAt ?? previous?.orderAt ?? at,
     firstRunAt: previous?.firstRunAt ?? (Object.keys(accepted).length > 0 ? at : null),
@@ -172,11 +174,25 @@ export function settleSegment(options) {
   };
   // 无实质变化则不落盘（避免「什么都没变却改写文件」⇒ CI 脏工作区 / 无意义 diff）。
   // 「实质变化」= 该周期基线变了，或候选台账变长（新候选进来）。
+  //
+  // ⚠️ **空站台不落盘**（条件触发的第二道兜底）：本周期**没有任何声明**（`baseline` 为空）
+  // 时**不建立分片**——站台 = 「该周期**显式声明**过的契约快照」，空手声明不是站台。
+  // 否则每个空跑的日期都会在链上多一个空站（`baseline` 为 `{}`），线路图被噪声填满。
+  const stationless = !isUsableContract(baseline) || Object.keys(baseline).length === 0;
   const previousCandidates = (previous?.candidates ?? []).length;
-  const materiallyChanged = !hadBaseline || candidates.length !== previousCandidates
-    || JSON.stringify(baseline) !== JSON.stringify(previous?.baseline ?? {});
+  const materiallyChanged = !stationless && (!hadBaseline || candidates.length !== previousCandidates
+    || JSON.stringify(baseline) !== JSON.stringify(previous?.baseline ?? {}));
   const written = options.dryRun ? false : (materiallyChanged ? (store.save(key, record), true) : false);
-  return { key, baseline, ignored, written, materiallyChanged, candidates: record.candidates, firstRunAt: record.firstRunAt };
+  return {
+    key,
+    baseline,
+    ignored,
+    written,
+    materiallyChanged,
+    baselineVersion: record.baselineVersion,
+    candidates: record.candidates,
+    firstRunAt: record.firstRunAt,
+  };
 }
 
 /**
@@ -195,6 +211,96 @@ export function segmentOrderAt(segment) {
   const raw = segment?.orderAt ?? segment?.settledAt ?? segment?.firstRunAt ?? null;
   const ms = raw ? new Date(raw).getTime() : Number.NaN;
   return Number.isFinite(ms) ? ms : Infinity;
+}
+
+/**
+ * 契约集合的**稳定指纹**（排序键 ⇒ 与通道插入顺序无关）。
+ *
+ * 用「每通道各自的 JSON 指纹」而不是「整体 JSON.stringify」做比对：
+ * 通道顺序不同、`{}` 里键序不同都不该被判成「变化」——那会产生**假变更**，
+ * 让「每日基线」每天无脑多一站（正是本次要消掉的形态）。
+ *
+ * @param {object|null|undefined} contracts channel → contract
+ * @returns {string} 形如 `dev=<json>|stable=<json>` 的稳定指纹
+ */
+export function contractFingerprint(contracts) {
+  const entries = Object.entries(contracts ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  return entries.map(([channel, contract]) => `${channel}=${stableStringify(contract)}`).join('|');
+}
+
+/**
+ * 键序无关的 JSON 序列化（对象键**排序**后递归）。
+ *
+ * @param {unknown} value 任意值
+ * @returns {string} 稳定字符串
+ */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'undefined';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+/**
+ * 「基线是否有变化」的**唯一判据** —— 每日基线**按条件触发**的基础。
+ *
+ * 口径（用户点名）：
+ * - 有些日子上游没发版、契约没变 ⇒ **不改基线、也不新增站台**（跳过）；
+ * - 只有「本周期真的有显式声明」时才多一站，空跑的日期不留站台。
+ *
+ * 判据细节（防误判/防假绿）：
+ * - **新增通道** 或 **已声明通道的契约变了** ⇒ `changed = true`；
+ * - **候选里缺某通道**（`removedChannels`）**不算变更**——候选是「本周期**显式声明**的通道」，
+ *   缺席只代表「没声明」，不代表「上游删了契约」。链式合并本身会前向携带上一站的值
+ *   （这正是「未声明 ≠ 值消失」的口径）；若把缺席判成变更，每条线都会天天被前向携带，
+ *   等于把「静默携带」做成「显式变更」——那是另一种假绿。
+ *   ⚠️ 实现口径：**缺席可单独出现**（候选只声明了部分通道）⇒ 只要「共有通道逐个相同」
+ *   就判**未变化**（各线路保持原站台，不新增）；只有「新增通道 / 共有通道有变」才推进。
+ * - **空基线**（首次结算）⇒ `changed = true`，否则第一个站台永远落不下来。
+ *
+ * @param {{previous?:object|null, baseline?:object|null}} options 比对对象与本次候选
+ * @returns {{changed:boolean, reason:string, addedChannels:string[], removedChannels:string[]}}
+ */
+export function detectBaselineChange(options = {}) {
+  const previousHas = Object.keys(options.previous ?? {}).length > 0;
+  const nextHas = Object.keys(options.baseline ?? {}).length > 0;
+  const unknown = '无候选（未跑验收或全部通道未通过）';
+  if (!nextHas) return { changed: false, reason: unknown, addedChannels: [], removedChannels: [] };
+  const previous = options.previous ?? {};
+  const baseline = options.baseline ?? {};
+  const addedChannels = Object.keys(baseline).filter((channel) => !(channel in previous));
+  const removedChannels = Object.keys(previous).filter((channel) => !(channel in baseline));
+  if (!previousHas) {
+    return { changed: true, reason: '首次结算（当前基线为空）', addedChannels, removedChannels };
+  }
+  const shared = Object.keys(baseline).filter((channel) => channel in previous);
+  const altered = shared.filter((channel) => stableStringify(baseline[channel]) !== stableStringify(previous[channel]));
+  if (addedChannels.length === 0 && altered.length === 0) {
+    // 只看**共有通道**：缺席的通道不算变化（见上方口径）⇒ 链式合并保持原站台
+    return { changed: false, reason: '契约与当前基线（共有通道）逐键相同', addedChannels, removedChannels };
+  }
+  const parts = [];
+  if (addedChannels.length > 0) parts.push(`新增通道 ${addedChannels.join(', ')}`);
+  if (altered.length > 0) parts.push(`契约变更 ${altered.join(', ')}`);
+  return { changed: true, reason: parts.join('；'), addedChannels, removedChannels };
+}
+
+/**
+ * 在分片上维护「基线版本号」：**内容真的变了才 +1**。
+ *
+ * 用途：在不动基线内容的前提下，给「跳过」留一个**零副作用但可观测**的标记——
+ * 幂等重跑不涨版本、未变化跳过不涨版本、有变化结算才涨。
+ *
+ * @param {object|null} previous 已有分片
+ * @param {object} candidate 本次将写入的 `record`
+ * @returns {number} 新的版本号
+ */
+export function baselineVersion(previous, candidate) {
+  const prev = previous?.baselineVersion;
+  const base = Number.isInteger(prev) ? prev : 0;
+  const first = !(previous?.baseline ?? null) ? true : false;
+  if (first) return base; // 首次写入固定从 0 起（不依赖历史）
+  const changed = stableStringify(previous?.baseline ?? {}) !== stableStringify(candidate?.baseline ?? {});
+  return changed ? base + 1 : base;
 }
 
 /**
@@ -227,25 +333,32 @@ export function composeChain(segments) {
  * 这是**唯一**允许被称为「当前基线」的取值来源：`latest.json` 若有内容，仅作为
  * **尚未切片的历史遗留**参与链尾（见 `migrate`），不再是「每次运行改写的那份」。
  *
+ * `metro` 是**人类排障视图**（advice 面，见 {@link composeMetro}）：**只读取**，不参与归因判据、
+ * 也不参与本函数 `contracts` 的取值——取值仍**逐键等于** `composeChain()` 的结果。
+ *
  * @param {{hubRoot?:string, includeLegacyLatest?:boolean}} [options] 选项
- * @returns {{contracts:object, chain:string[], perChannel:object, segments:object[], legacyLatest:object|null}}
+ * @returns {{contracts:object, chain:string[], perChannel:object, segments:object[], metro:object, legacyLatest:object|null}}
  */
 export function resolveBaseline(options = {}) {
-  const store = segmentStore({ hubRoot: options.hubRoot ?? HUB_ROOT });
+  const hubRoot = options.hubRoot ?? HUB_ROOT;
+  const store = segmentStore({ hubRoot });
   const segments = store.list().map((key) => ({ periodKey: key, ...store.load(key) }));
   const composed = composeChain(segments);
+  const metro = composeMetro(segments);
   let legacyLatest = null;
   if (options.includeLegacyLatest !== false) {
-    const legacy = legacySnapshot({ hubRoot: options.hubRoot ?? HUB_ROOT }).load();
+    const legacy = legacySnapshot({ hubRoot }).load();
     if (legacy && isUsableContract(legacy.contracts) && Object.keys(legacy.contracts).length > 0) {
       // 历史遗留按「更早」处理：先合遗留，再合分片链（分片优先，防倒退）
       legacyLatest = legacy.contracts;
       const contracts = mergeContracts(legacy.contracts, composed.contracts);
-      for (const channel of Object.keys(composed.contracts)) composed.perChannel[channel] = composed.perChannel[channel];
-      return { contracts, chain: composed.chain, perChannel: composed.perChannel, segments, legacyLatest };
+      // ⚠️ 不再派生 `metroContracts`：它与 `contracts` 语义重叠、且比 `contracts` 少通道，
+      // 却没有任何消费方（易被误当第二事实源）。**唯一事实源 = `contracts`**；
+      // `metro` 只作注解面（出发点/站点/末站/前向携带），需要取值时取 `contracts`。
+      return { contracts, chain: composed.chain, perChannel: composed.perChannel, segments, metro, legacyLatest };
     }
   }
-  return { ...composed, segments, legacyLatest };
+  return { ...composed, segments, metro, legacyLatest };
 }
 
 /**
@@ -303,4 +416,177 @@ export function migrateLegacyLatest(options = {}) {
     candidates: [],
   });
   return { migrated: true, key, channels: Object.keys(legacy.contracts) };
+}
+
+/**
+ * 判定一份快照是否是**显式声明的契约值**（线路图上的「值站台」）。
+ *
+ * 判据 = 「非空对象」= `isUsableContract()`，**与 `composeChain()` 完全同口径**。
+ *
+ * 为什么必须同口径：`composeMetro().contracts` 与 `composeChain().contracts` 是同一件事的
+ * 两种视图，**取值必须逐键逐值相同**（离线 [24] ⑥ 的断言）。若这里额外收紧，
+ * 畸形/半截快照（正是 R34 要暴露的场景）会导致**报告说没站、基线里其实有值**。
+ *
+ * @param {object} contract 契约快照
+ * @returns {boolean}
+ */
+export function isUsableStation(contract) {
+  return isUsableContract(contract);
+}
+
+/**
+ * 判定一份快照是否**足以作为「站点」被记入线路图**（线路图**注解面**判据，**不参与取值**）。
+ *
+ * 为什么要与取值判据**解耦**：线路图是给人看的「出发点 / 站点序列 / 末站」，
+ * 一个畸形快照（非空、但**没有任何契约指纹字段**，如 `{ SHALLOW: {} }`）如果在图上
+ * 也记一个站，站序就被污染。但**它仍然是当前基线里的真实取值**——所以它必须：
+ * - **留在 `contracts` 里**（取值口径与 `composeChain()` 一致，走 {@link isUsableStation}）；
+ * - **不进入 `lines[].stations` 的站点序列**（只作为显式注解 `shallowStations` 记录）。
+ *
+ * 指纹字段名取自 `CONTRACT_FIELDS`（唯一事实源）。
+ * 用 `Object.hasOwn()` 判存在性：**合法 null 值**（`{configProjection:null}`）也算「声明过」，
+ * 不能被 `!== null` 误判成空壳。
+ *
+ * @param {object} snapshot 契约快照
+ * @returns {boolean}
+ */
+export function hasContractFingerprint(snapshot) {
+  if (!isUsableContract(snapshot)) return false;
+  return CONTRACT_FIELDS.some((field) => Object.hasOwn(snapshot, field));
+}
+
+/**
+ * 地铁/坐标轴模型：把 `composeChain()` 的**单轴**链条升级为**每通道一条线路**。
+ *
+ * ## 为什么需要它（用户口径「以坐标轴的形式、或者叫以地铁的形式来合并」）
+ * `composeChain()` 是**单轴**：所有通道挤在**同一条**周期轴上，靠「后周期覆盖自己声明过的
+ * 通道」推进。这解决「连起来=最新版」，但留下一个**语义缺口**：
+ * **某通道在某周期之后不再出现时，它的旧值会被无限前向携带**（实测：`legacy` 在 03-02 后再无站点，
+ * 到 03-10 仍以 03-02 的值参与当前基线），且**没有任何字段表达「这条线在 X 之后就没有站点了」**。
+ *
+ * ## 地铁模型的三个概念（对应需求原话）
+ * - **线路（line）** = 一个通道（`stable` / `dev` / `legacy`…）。每条线**各自独立推进**。
+ * - **出发点（origin）** = 该线**首次**出现在链上的那个分片（它的起点站）。**这是关键**：
+ *   合并不是「全部取最新」，而是**从各自出发点**沿该线自己的站点推进；
+ * - **站点（station）** = 该线在某个分片上**显式声明**的契约快照（`{periodKey, at, contract}`）。
+ *   只有**显式声明**才是站点；**未声明 ≠ 站点**（这正是把「前向携带」显式化的地方）。
+ *
+ * ## 与 `composeChain()` 的关系（**解耦**：取值面一致，注解面增强）
+ * `composeMetro()` 是 `composeChain()` 的**严格上位**，但「上位」只体现在**注解面**，取值面**逐键相同**：
+ *
+ * - **取值面（`contracts` / `perChannel`）**：判据 = {@link isUsableStation} = `isUsableContract()`，
+ *   与 `composeChain()` **同一判据、同一顺序、同一结果**。畸形/半截快照（非空但无指纹字段）
+ *   **照样留在取值里**，绝不因为「画不出站」而被丢掉（离线 [24] ⑥ 断言逐键相等）。
+ * - **注解面（`lines` / `origin` / `carried` / `endedLines` / `shallowStations`）**：
+ *   站点序列用更严的 {@link hasContractFingerprint}（必须含指纹字段）判定；不达标的快照
+ *   用 `shallowStations` **显式记录**——「图上没站、但值确实来自这里」不再隐身。
+ *
+ * ⇒ 两条判据**显式分离**，各自出现在文档与返回结构里；不存在「一个 continue 连带丢掉整条线」。
+ * - ⚠️ 本函数**不参与** `attributionDetail()`；它是**人类排障视图（advice）**，不回灌归因判据。
+ *
+ * @param {object[]} segments 分片数组（`{periodKey, baseline, orderAt?, settledAt?, firstRunAt?, mode?}`）
+ * @returns {{contracts:object, lines:object, origin:object, perChannel:object, carried:object, endedLines:string[], shallowStations:object, chain:string[]}} 合并结果
+ */
+export function composeMetro(segments) {
+  const ordered = [...(segments ?? [])]
+    .filter((s) => isUsableContract(s?.baseline))
+    .sort((a, b) => segmentOrderAt(a) - segmentOrderAt(b) || String(a.periodKey).localeCompare(String(b.periodKey)));
+
+  /** @type {Record<string, object>} 每条线（通道）的线路图（**注解面**：只记指纹齐全的站） */
+  const lines = {};
+  /** @type {string[]} 线路出现顺序（= 首次出现在链上的先后）——保持与 `composeChain()` 相同的键序 */
+  const lineOrder = [];
+  /** @type {Record<string, object[]>} 每通道「非空但无指纹字段」的快照 —— 不进站点序列，但**必须可见** */
+  const shallowStations = {};
+  const chain = [];
+  for (const segment of ordered) {
+    for (const channel of Object.keys(segment.baseline)) {
+      const contract = segment.baseline[channel];
+      // 取值面判据：与 composeChain 同口径（非空对象即算值）——不做 continue，
+      // 否则畸形通道会被**整个丢掉**，contracts 与链式合并分叉（评审 critical）。
+      if (!isUsableStation(contract)) continue;
+      if (!lines[channel]) {
+        // 出发点 = 该线首次出现在链上的分片（起点站）
+        lines[channel] = { origin: segment.periodKey, originAt: segmentOrderAt(segment), stations: [], endedAt: null, ended: false };
+        lineOrder.push(channel);
+      }
+      const station = { periodKey: segment.periodKey, at: segmentOrderAt(segment), contract };
+      if (hasContractFingerprint(contract)) {
+        lines[channel].stations.push(station);
+      } else {
+        // 注解面：非空但无指纹字段 ⇒ 不画站，但显式留痕（图上不再「凭空多站」，也不再「装作没值」）
+        (shallowStations[channel] ??= []).push(station);
+      }
+      // 末站的**唯一判据**：链上最后一个被接受的快照（不论指纹全不全）——必须是它，
+      // 否则「更晚的空壳分片」会被更早的真站盖住 ⇒ contracts 与 composeChain 分叉（评审 critical）。
+      lines[channel].terminal = station;
+    }
+    if (Object.keys(segment.baseline).length > 0) chain.push(segment.periodKey);
+  }
+
+  const contracts = {};
+  const origin = {};
+  const perChannel = {};
+  const carried = {};
+  const endedLines = [];
+  const lastChainKey = chain[chain.length - 1] ?? null;
+  for (const channel of lineOrder) {
+    const line = lines[channel];
+    // 末站（取值来源）= 链上**最后一个**被接受的快照（真站或空壳都算），
+    // 保证取值/来源周期与 composeChain **逐键一致**。
+    const shallow = shallowStations[channel] ?? [];
+    const terminal = line.terminal;
+    contracts[channel] = terminal.contract;
+    origin[channel] = line.origin;
+    perChannel[channel] = terminal.periodKey;
+    line.terminalPeriodKey = terminal.periodKey;
+    delete line.terminal;
+    // 「已停运线」= 末站不在链尾分片上（该线之后还有别的周期在推进，但它自己没有站点）
+    // ⇒ 当前基线里的该通道值，是**从末站前向携带**过来的（显式可见，不再静默）
+    if (lastChainKey && terminal.periodKey !== lastChainKey) {
+      line.ended = true;
+      line.endedAt = terminal.periodKey;
+      carried[channel] = { from: terminal.periodKey, to: lastChainKey, stops: line.stations.length, shallowStops: shallow.length };
+      endedLines.push(channel);
+    }
+    if (shallow.length > 0) {
+      line.shallowStations = shallow.map((s) => s.periodKey);
+    }
+  }
+  return { contracts, lines, origin, perChannel, carried, endedLines, shallowStations, chain };
+}
+
+/**
+ * 地铁视图渲染成 Markdown（人类排障用，advice 面，不回灌归因判据）。
+ *
+ * @param {object} metro {@link composeMetro} 的返回值
+ * @returns {string} Markdown
+ */
+export function renderMetro(metro) {
+  const rows = Object.entries(metro?.lines ?? {}).map(([channel, line]) => {
+    const stops = line.stations.map((s) => s.periodKey).join(' → ');
+    // 空壳站（非空但无指纹字段）单独标出：图上不画站，但**不能装作没值**
+    const shallow = (line.shallowStations ?? []).length > 0 ? `（另有空壳快照：${line.shallowStations.join(', ')}）` : '';
+    // 末站 = 取值来源（可能是空壳站，见 composeMetro 的解耦说明）
+    const terminal = line.terminalPeriodKey ?? line.endedAt ?? '—';
+    const flag = line.ended ? '🟡 已停运' : '✅ 在跑';
+    return `| ${channel} | ${line.origin} | ${stops || '—'}${shallow} | ${line.stations.length} | ${line.endedAt ?? terminal} | ${flag} |`;
+  });
+  const carriedLines = Object.entries(metro?.carried ?? {})
+    .map(([channel, info]) => `- \`${channel}\`：末站 ${info.from}，之后 ${info.to} 等周期**无该线站点** ⇒ 当前基线仍在**前向携带**其末站值（显式可见，不再静默）`);
+  const shallowLines = Object.entries(metro?.shallowStations ?? {})
+    .map(([channel, stations]) => `- \`${channel}\`：${stations.map((s) => s.periodKey).join(', ')} 的快照**非空但无任何契约指纹字段**（\`CONTRACT_FIELDS\`）⇒ **画不出站**，但**仍参与取值**（\`contracts\` 与 \`composeChain()\` 同口径）；需查上游为何产出半截快照`);
+  return [
+    '### 🚇 基线线路图（每通道一条线，从各自出发点推进）',
+    '',
+    '| 线路(通道) | 出发点 | 站点序列（早→晚） | 站点数 | 末站 | 状态 |',
+    '|---|---|---|---|---|---|',
+    ...(rows.length > 0 ? rows : ['| — | — | — | 0 | — | — |']),
+    '',
+    ...(shallowLines.length > 0 ? ['**⚠️ 空壳快照（画不出站，但仍是取值来源）**：', ...shallowLines, ''] : []),
+    ...(carriedLines.length > 0 ? ['**⚠️ 前向携带（已显式化，不再静默）**：', ...carriedLines, ''] : []),
+    ...(metro?.endedLines?.length > 0 ? [`**已停运线**：${metro.endedLines.join(', ')}（末站之后链上仍有其他周期推进）`, ''] : []),
+    '> 说明：`composeMetro()` 是**人类排障视图**（advice），**不参与** `attributionDetail()` 归因判据；',
+    '> **取值口径与 `composeChain()` 逐键一致**，站点序列则更严（只认指纹齐全的快照）。',
+  ].join('\n');
 }
