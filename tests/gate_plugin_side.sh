@@ -26,6 +26,7 @@
 # | `plugin-host-tamper-poc-plugin` | **§3 反例固化**（反读 nonce + 写 fd3 + 摘 exit 钩子 + `exit(0)` 抢跑） | `plugin.probe_result_forged` + `plugin.abnormal_termination` | **false** |
 # | `plugin-exit-hook-tamper-plugin` | **批 1.5 第 8 项**：只摘出口③ 的 `exit` 钩子（其余健康） | `plugin.process_defense_tampered` | true |
 # | `plugin-stringify-tamper-plugin` | 🔴 必修-4：猴子补丁 `JSON.stringify` 伪造绿卡（同族：同进程 + 共用输出面） | `registry.exact` | true |
+# | `plugin-fd3-redirect-plugin` | **🔴-R3′（v0.2.5）**：把 **fd3 换成自己的文件** ⇒ 探针（不知情）把**带凭据的真报告**写进插件文件 ⇒ 插件读出凭据后伪造绿卡 + 压 `process.exitCode=0` | `plugin.protocol_injection` | **false** |
 # | `plugin-sync-loop-plugin` | R24：`apply()` 内同步死循环（宿主二次终止） | `plugin.abnormal_termination` | **false** |
 # | `demo-plugin`（健康） | —— | 无（必须 GREEN 17/17） | true |
 #
@@ -142,6 +143,13 @@ NEGATIVE_CASES=(
   # nonce 前缀照样匹配）。收口 = 探针**加载期捕获引用** + 装配器**退出码交叉**（两道并集）。
   # 本形态下探针的**真报告**仍被判出 ⇒ 失败项精确留在真缺陷 `registry.exact` 上。
   "plugin-stringify-tamper-plugin|registry.exact|true|true|registry.exact"
+  # 🔴-R3′（v0.2.5 收口）：**通道重定向**形态——插件把 fd3 换成自己的文件，
+  # 探针（不知情）把**带凭据的真报告**写进插件文件 ⇒ 插件在 `exit` 钩子里读出凭据后伪造绿卡，
+  # 并**压 `process.exitCode = 0`**（故不能靠退出码交叉兜住）。旧实现判 **GREEN 放行**。
+  # 现在由**判据 D**（报告自称 fd3 + 宿主**实际**从 fd3 读到空 + stdout 出现结果行）判出：
+  # 依据是**宿主侧对 fd3 的实际观测** ⇒ 压退出码 / 换通道都无效。
+  # 期望失败项 = `plugin.protocol_injection`（唯一），完成位 false，无 pass 项（真报告没到宿主手里）。
+  "plugin-fd3-redirect-plugin|plugin.protocol_injection|false|false|plugin.protocol_injection"
   # ⚠️ `plugin-sync-loop-plugin`（R24）**不在**本清单：它的缺陷只在**有界 timeout** 下成立
   # （默认 timeoutMs=600s 时 3s 循环会正常跑完——那本身不是缺陷）。该形态由下方**专用 R24 段**
   # 用 `runHostProbe({ timeoutMs: 1000 })` 断言（含收口时间与 `probeExit.signal`）。

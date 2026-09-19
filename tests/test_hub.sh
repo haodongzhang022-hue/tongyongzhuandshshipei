@@ -250,7 +250,9 @@ check_doc_count "归因端到端回归" "$(count_of /tmp/e2e.log)" '归因端到
 check_doc_count "闸门项数" "$(count_of /tmp/gate.log)" '插件侧闸门 [0-9]+ 项' 'docs/ARCHITECTURE.md'
 # 负例份数：声明形如「插件侧闸门 23 项（17 负例 + R24 六条 + 防过度修正）」——`check_doc_count` 的
 # sed 只认「… 项」后缀，故这里单独取（口径与「逐处比对」一致：M5 行里该声明**每一处**都要对上）。
-NEG_FIXTURES="$(grep -cE '^  "(plugin|demo)-[a-z-]+\|' "$ROOT/tests/gate_plugin_side.sh")"
+# ⚠️ 模式必须含**数字**（v0.2.5）：新夹具 `plugin-fd3-redirect-plugin` 的名字里有 `fd3`，
+# 旧的 `[a-z-]+` 匹配不到它 ⇒ 闸门夹具**加了却不算数**（文档声明的份数永远追不上实际）。
+NEG_FIXTURES="$(grep -cE '^  "(plugin|demo)-[a-z0-9-]+\|' "$ROOT/tests/gate_plugin_side.sh")"
 NEG_DECLARED="$(grep -oE '插件侧闸门 [0-9]+ 项（[0-9]+ 负例' "$ROOT/docs/ARCHITECTURE.md" | sed -E 's/.*（([0-9]+) 负例$/\1/' | sort -u | tr '\n' ',')"
 if [[ -z "$NEG_DECLARED" ]]; then
   bad "docs/ARCHITECTURE.md 的「闸门负例份数」声明**缺失**"

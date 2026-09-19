@@ -26,7 +26,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomBytes } from 'node:crypto';
-import { interpretProbeStdout, probeSpawnOptions } from '../src/harness/host.mjs';
+import { interpretProbeStdout, probeSpawnOptions, reportedChannelOf } from '../src/harness/host.mjs';
 import { PROBE_PHASE, createProbeNonce } from '../src/harness/contract.mjs';
 import { attributeFailure, attributionDetail } from '../src/verify/runner.mjs';
 import { loadChannels } from '../src/harness/host.mjs';
@@ -148,7 +148,12 @@ export async function runOfflineProbeWithSources(options) {
     };
     result.probeExit = { status: probeRun.status ?? null, signal: probeRun.signal ?? null };
     result.durationMs = Date.now() - startedAt;
-    host.interpretProbeStdout(result, `${probeRun.stdout ?? ''}`, { resultFd: `${probeRun.output?.[3] ?? ''}`, nonce: nonce.value });
+    // `reportedChannel`（🔴-R3′ 判据 D）：与生产路径同构 —— 宿主侧在解释前先取「报告自述的通道」。
+    host.interpretProbeStdout(result, `${probeRun.stdout ?? ''}`, {
+      resultFd: `${probeRun.output?.[3] ?? ''}`,
+      nonce: nonce.value,
+      reportedChannel: reportedChannelOf(`${probeRun.output?.[3] ?? ''}`, `${probeRun.stdout ?? ''}`, nonce.value),
+    });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');
     return { result, attribution: detail.attribution, reasons: detail.reasons, exit: result.probeExit, stdout: `${probeRun.stdout ?? ''}`, resultFd: `${probeRun.output?.[3] ?? ''}`, stderr: `${probeRun.stderr ?? ''}` };
@@ -225,7 +230,11 @@ export function runOfflineProbe(options) {
     result.probeExit = exit;
     result.durationMs = Date.now() - startedAt;
     // stdinUnreadable：宿主侧同样按「无 nonce」解释（生产路径不会出现该形态，仅回归反证）
-    interpretProbeStdout(result, stdout, { resultFd, nonce: stdinUnreadable ? null : nonce.value });
+    interpretProbeStdout(result, stdout, {
+      resultFd,
+      nonce: stdinUnreadable ? null : nonce.value,
+      reportedChannel: stdinUnreadable ? null : reportedChannelOf(resultFd, stdout, nonce.value),
+    });
     const channel = loadChannels(ROOT).channels.stable;
     const detail = attributionDetail(result, channel, 'stable');
     return { result, attribution: detail.attribution, reasons: detail.reasons, exit, stdout, resultFd, stderr: `${probeRun.stderr ?? ''}` };

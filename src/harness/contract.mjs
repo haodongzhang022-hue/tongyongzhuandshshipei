@@ -15,6 +15,8 @@
  * @module dsh-adapt-hub/harness/contract
  */
 
+import { createHmac } from 'node:crypto';
+
 /**
  * 三条契约探测（字段名与 `watch/upstream.mjs` 的 `CONTRACT_FIELDS` 对齐）。
  *
@@ -79,17 +81,28 @@ export const CONTRACT_PROBES = [
 export const PROBE_PHASE_BEACON_PREFIX = '__DSH_PROBE_PHASE__';
 
 /**
- * 探针**结构化结果标记**（人读/日志用；判据实际走 {@link probeResultPrefix} 带 nonce 的形式）。
+ * 探针**结构化结果标记**（结果行的字面量前缀；凭据见 {@link probeReportTag}）。
  *
- * ⚠️ 纪律（🆕 侧信道 / 信任边界）：本字面量**不再**是「谁是探针」的唯一凭据——
- * 插件与探针**共用同一个 stdout**，插件只要 `process.stdout.write('__DSH_PROBE__{...}')`
- * 就能伪造一张绿卡（或反过来把责任甩给上游）。故真正的判据是**带 nonce 的前缀**
- * （{@link probeResultPrefix}）：宿主每次运行生成**随机** nonce，只认带该 nonce 的行。
+ * ⚠️ 纪律（侧信道 / 信任边界）：本字面量**不是**「谁是探针」的凭据——
+ * 插件与探针**共用同一个 stdout / 结果通道**，插件只要写一行
+ * `__DSH_PROBE__...` 就能伪造一张绿卡（或反过来把责任甩给上游）。
+ * 真正的凭据是**逐行认证标签**（{@link probeReportTag}）：宿主每次运行生成**随机** nonce
+ * （经 **stdin** 带外下发，见 {@link PROBE_NONCE_STDIN_CHANNEL}），探针把
+ * `HMAC(nonce, 报告正文)` 写进结果行；宿主用**自己已知的 nonce** 重算并逐字比对。
  *
- * 为什么「随机」而不是固定名：固定名（如 `__DSH_PROBE__`）等于没设防——插件照抄即可。
- * nonce 经**带外通道（stdin）**下发（见 {@link PROBE_NONCE_STDIN_CHANNEL}），
- * **不经 argv / env**（实测：env 通道可被 `/proc/self/environ` 反读、argv 通道出现在 `ps` 里，
- * 两者都让插件伪造出**被采信**的结果行）⇒ 这两条读取面都不成立。
+ * ## 为什么是「逐行认证标签」而不是「带 nonce 的前缀」（R3′ 收口，v0.2.5）
+ * 旧实现把 **nonce 本身**回显在结果行里（`__DSH_PROBE__<nonce>:{json}`）。这依赖
+ * **nonce 保密性**这一条腿，而它有一个**更强子形态**（评审实测 R3′，本仓已固化夹具）：
+ * 插件把 fd3 **换成自己的文件** ⇒ 探针（**不知情**）把**带 nonce 的真报告**写进插件的文件
+ * ⇒ 插件在 `exit` 钩子里**合法读出** nonce ⇒ 再伪造绿卡 ⇒ 旧实现判 **GREEN 放行**。
+ * 即：nonce 是探针**亲自交**到插件手里的，**保密性被主动绕过**——「保住 nonce 就够」不成立。
+ *
+ * 改为**逐行认证标签**后：结果行里**不再回显 nonce**（只有 `HMAC(nonce, 正文)` 的摘要），
+ * 插件即使读到了**真报告**的那一行，也只能得到「真正文」的标签——**换成正文本就验不过**
+ * （它没有 nonce，算不出新正文的标签）。⇒ 通道重定向不再能把 nonce 变成伪造能力。
+ *
+ * ⚠️ 残留（不越权承诺）：标签仍由**同进程**计算；能读探针内存 / 篡改任意全局的插件仍可绕过
+ * （见 `docs/RISKS.md` R29）。逐点补不可穷尽，根治需**进程隔离**（批 2）。
  */
 export const PROBE_RESULT_MARKER = '__DSH_PROBE__';
 
@@ -100,7 +113,9 @@ export const PROBE_RESULT_MARKER = '__DSH_PROBE__';
  * 1. 宿主生成一个随机 nonce `VALUE`（`randomBytes(16).toString('hex')`）；
  * 2. 宿主把 `VALUE + '\n'` 作为子进程的 **stdin** 输入（`stdio[0] = 'pipe'` + `input`）；
  * 3. 探针启动时 `readFileSync(0, 'utf8')` 读它，**读完立刻 `process.stdin.destroy()`**；
- * 4. 探针输出 `__DSH_PROBE__<VALUE>:{json}`；宿主只认带 `VALUE` 的那一行。
+ * 4. 探针输出 `__DSH_PROBE__<tag>:{json}`（`tag = HMAC(VALUE, json)`）；宿主用**自己已知的 VALUE**
+ *    重算 `tag` 并逐字比对，**只认标签相符的行**（v0.2.5 起；此前是把 VALUE 本身回显进结果行，
+ *    见 {@link probeReportTag} 的「为什么是正文绑定」）。
  *
  * ## 为什么走 stdin 而不是 argv / env（实测依据，不是偏好）
  * 本仓曾并行落地过一条 **env 通道**（随机环境变量名经 argv 传、值经 env 传，探针读到后
@@ -146,13 +161,36 @@ export function createProbeNonce(randomBytes) {
 }
 
 /**
- * 探针结构化结果的**带 nonce 前缀**（宿主只认它）。
+ * 探针结构化结果行的**逐行认证标签**（宿主只认带**有效标签**的行）。
  *
- * @param {string} nonce nonce 值
- * @returns {string} `__DSH_PROBE__<nonce>:` 前缀
+ * `tag = HMAC-SHA256(key = nonce, message = 报告正文)` 的十六进制摘要（取前 32 字符 = 128 bit）。
+ *
+ * ## 为什么是「正文绑定」而不是「回显 nonce」（R3′ 收口，v0.2.5）
+ * 见 {@link PROBE_RESULT_MARKER} 的说明：回显 nonce 依赖**保密性**，而「插件把 fd3 换成自己的
+ * 文件 ⇒ 探针把带 nonce 的真报告写进插件文件 ⇒ 插件读出 nonce」这条路径**绕过**了保密性。
+ * 正文绑定的标签给出的是**不可迁移**的凭据：读到真报告的那一行，只能得到**真正文**的标签；
+ * 伪造正文需要 nonce（插件没有）⇒ 伪造行验不过 ⇒ 不被采信（fail-closed）。
+ *
+ * @param {string} nonce nonce 值（宿主与探针各自持有；**不进结果行**）
+ * @param {string} body 报告正文（`JSON.stringify(out)` 的字节）
+ * @returns {string} 十六进制标签
  */
-export function probeResultPrefix(nonce) {
-  return `${PROBE_RESULT_MARKER}${nonce}:`;
+export function probeReportTag(nonce, body) {
+  return createHmac('sha256', String(nonce)).update(String(body)).digest('hex').slice(0, 32);
+}
+
+/**
+ * 探针结构化结果**行**（探针写出时用；宿主用 {@link probeReportTag} 校验）。
+ *
+ * 形态：`__DSH_PROBE__<tag>:<body>`（无 nonce 时退化为 `__DSH_PROBE__<body>`，
+ * 供离线单测 / 手工直跑——宿主侧按「无 nonce ⇒ 不可信/退化」处理，见 `interpretProbeStdout()`）。
+ *
+ * @param {string|null} nonce nonce 值（null = 无带外通道）
+ * @param {string} body 报告正文
+ * @returns {string} 结果行（不含换行）
+ */
+export function probeResultLine(nonce, body) {
+  return nonce ? `${PROBE_RESULT_MARKER}${probeReportTag(nonce, body)}:${body}` : `${PROBE_RESULT_MARKER}${body}`;
 }
 
 /**
@@ -338,8 +376,9 @@ export const PLUGIN_PROTOCOL_INJECTION_CHECK = 'plugin.protocol_injection';
  *
  * 为什么需要（🆕 侧信道 / 信任边界，见 `docs/RISKS.md` R26）：探针与插件**共用 stdout**，
  * 插件可以 `process.stdout.write('__DSH_PROBE__{...绿卡...}')` 自造一张绿卡；
- * 或写 `hostFatal:[...]` 把责任甩给上游。宿主按**带 nonce 的前缀**认报告后，
- * 「无 nonce 的 marker 行」就成了**伪造证据**——本 check 即该证据的落点（判插件侧、不放行）。
+ * 或写 `hostFatal:[...]` 把责任甩给上游。宿主按**逐行认证标签**（`HMAC(nonce, 正文)`，v0.2.5 起）
+ * 认报告后，「裸 marker / 标签不符的行」就成了**伪造证据**——本 check 即该证据的落点
+ * （判插件侧、不放行）。
  *
  * 与 {@link PLUGIN_PROCESS_DEFENSE_TAMPERED_CHECK} 的分工：那个判「探针自己的兜底被静音」，
  * 本项判「有人冒用探针的输出协议」。两者都可能在同一轮出现（伪造 + 静音），各自独立记录。

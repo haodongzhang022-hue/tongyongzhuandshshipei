@@ -76,6 +76,14 @@
  * 时回退 stdout。装配器据此把「stdout 里出现结果行」判为**篡改证据**（探针只写 fd3），
  * 并对「结果行 ≥2 条」直接判插件侧 check `plugin.protocol_injection`（**放行级假绿**防线）。
  *
+ * ## 结果行的**凭据**（v0.2.5 / 🔴-R3′）
+ * 结果行 = `__DSH_PROBE__<tag>:<正文>`，`tag = HMAC-SHA256(nonce, 正文)`（**不回显 nonce**）。
+ * 为什么不是「回显 nonce 的前缀」：插件可把 fd3 **换成自己的文件** ⇒ 探针（不知情）把
+ * **带 nonce 的真报告**写进**插件的文件** ⇒ 插件在 `exit` 钩子里读出 nonce 即可伪造（旧实现
+ * 判 `GREEN` 放行）。**正文绑定**的标签**不可迁移**：读到真报告只能得到**真正文**的标签，
+ * 换正文即验不过。宿主另按「报告**自称**走 fd3 而**实际** fd3 为空」判**通道重定向**
+ * （判据 D，依据宿主侧观测 ⇒ 压退出码无效）。
+ *
  * ## 进程内防线的**可判定性**（H1 / R22 / R28）
  * 「探针装了兜底」≠「兜底有效」。插件可（`apply()` 内）单方面：
  * `setUncaughtExceptionCaptureCallback()`（独占 API，设置后监听器**不再被调用**）、
@@ -103,7 +111,7 @@ import {
   PROBE_PHASE,
   PROBE_PHASE_BEACON_PREFIX,
   PROBE_RESULT_MARKER,
-  probeResultPrefix,
+  probeResultLine,
   collectContract,
   pushHostFatal,
   recordProbeAsyncException,
@@ -137,7 +145,8 @@ const expectedTools = PARSE(expectedToolsJson ?? '[]');
 // ---- nonce 带外通道（侧信道收口；**经 stdin**，不经 env / argv） ----
 // 宿主每次运行生成随机 nonce，作为**子进程 stdin 的字节流**传进来（见 host.mjs 的
 // `probeSpawnOptions()` / `PROBE_NONCE_STDIN_CHANNEL`）。探针只认这个值：输出的结构化结果
-// 前缀带 nonce，宿主也只认带 nonce 的行。这样「谁是探针」由宿主掌握的随机量判定，
+// 结果行带**正文绑定**的认证标签（`HMAC(nonce, 正文)`，v0.2.5 起；此前回显 nonce 本身），
+// 宿主用**自己已知的 nonce** 重算标签并逐字比对。这样「谁是探针」由宿主掌握的随机量判定，
 // 而不是靠公开字面量 `__DSH_PROBE__`——插件伪造裸 marker 会被宿主识别为伪造。
 //
 // ⚠️ 为什么**不是** env / argv（实测依据，见 docs/RISKS.md R26）：本仓曾并行落地 env 通道
@@ -160,9 +169,6 @@ const nonceValue = (() => {
     return null;
   }
 })();
-/** 本进程结构化结果的前缀：有 nonce 用带 nonce 形式，无则退化为裸 marker。 */
-const resultPrefix = nonceValue ? probeResultPrefix(nonceValue) : PROBE_RESULT_MARKER;
-
 // hostFatal：**结构化**的宿主/环境侧致命信号（归因判据唯一依据，见 🔴-C）。
 // errors：人类可读日志（可含插件侧 stack/路径）——**不参与判据**。
 const out = { checks: [], errors: [], hostFatal: [], profile: null, contract: {}, probes: [], phase: null, ok: false };
@@ -524,8 +530,9 @@ function emit() {
   // 🔴 必修-1：`ok` 必须**同时**要求「跑完」与「无失败」——否则出口 ③ 的中途报告会假绿
   // （`apply()` 里 process.exit(0) → 剩余检查是 skip 不是 fail → 只看 errors 就 GREEN）。
   out.ok = runCompleted && out.errors.length === 0;
-  // 结果行前缀 = 带 nonce 形式（宿主只认它；无 nonce 时退化为裸 marker）。
-  const payload = `${resultPrefix}${STRINGIFY(out)}\n`;
+  // 结果行 = 认证标签 + 正文（宿主用**自己已知的 nonce** 重算标签并逐字比对；无 nonce 时退化）。
+  const body = STRINGIFY(out);
+  const payload = `${probeResultLine(nonceValue, body)}\n`;
   // R26：结果走**专用通道**（fd3 优先），stdout 只留日志 ⇒「stdout 里出现结果行」= 篡改证据。
   writeResult(payload);
 }

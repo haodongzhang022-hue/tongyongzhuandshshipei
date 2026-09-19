@@ -26,7 +26,7 @@ import {
   PROBE_PHASE_BEACON_PREFIX,
   PROBE_RESULT_MARKER,
   createProbeNonce,
-  probeResultPrefix,
+  probeReportTag,
   pushHostFatal,
 } from './contract.mjs';
 import { tmpdir } from 'node:os';
@@ -279,8 +279,9 @@ export function runHostProbe(options) {
     //
     // R26（复评）**两条防线并集**（互相独立、都要）：
     // - **nonce 带外通道**（侧信道）：宿主随机 nonce 经 **stdin** 下发（不进 argv/env ⇒
-    //   不落 `/proc/self/environ`、不出现在 `ps` 里），探针输出带 nonce 前缀 ⇒ 插件伪造
-    //   裸 marker 被识别为**伪造**（`plugin.probe_result_forged`）；
+    //   不落 `/proc/self/environ`、不出现在 `ps` 里）；探针输出**正文绑定**的逐行认证标签
+    //   （`HMAC(nonce, 正文)`，v0.2.5 起）⇒ 插件伪造（裸 marker / 标签不符）被识别为
+    //   **伪造**（`plugin.probe_result_forged`），且**读到真报告也伪造不出新正文**（R3′）；
     // - **结果通道隔离**：结构化结果走 **fd3**，stdout 只留日志 ⇒「stdout 里出现结果行」本身
     //   就是篡改证据（`plugin.protocol_injection`）；`spawnSync` 才拿得到 fd3。
     const nonce = createProbeNonce(randomBytes);
@@ -314,7 +315,10 @@ export function runHostProbe(options) {
       result.errors.push(`探针非零退出（status=${error.status ?? 'null'}${error.signal ? `, signal=${error.signal}` : ''}）`);
     }
 
-    interpretProbeStdout(result, stdout, { resultFd, nonce: nonce.value });
+    // `reportedChannel` 供判据 D（🔴-R3′）：宿主侧先按「报告自述的通道形态」快照一次。
+    // ⚠️ 这里**必须**用 `JSON.parse` 而不是 `credentialOf`（结果行格式由上面统一解释）；
+    // 探针报告自述字段取自 fd3/stdout 上的**报告正文**（解释内部再按标签校验）。
+    interpretProbeStdout(result, stdout, { resultFd, nonce: nonce.value, reportedChannel: reportedChannelOf(resultFd, stdout, nonce.value) });
     return result;
   } catch (error) {
     // 装配阶段兜底：一律宿主/环境侧（探针脚本未产出结构化结果前的失败不可能是插件造成）
@@ -349,6 +353,66 @@ export function collectProbeResultLines(text) {
 }
 
 /**
+ * 从结果行里读出探针**自述的通道形态**（`payload.resultChannel`），供判据 D（🔴-R3′）使用。
+ *
+ * 为什么单独一个函数、且在解释之前先取：判据 D 要回答「报告**自称**走哪条通道」，而这条
+ * 自述必须与「宿主**实际**从 fd3 读到了什么」比对。若等到解释之后才取，结果可能已被
+ * `checks` / `result` 归一覆盖（自述来自报告正文，不是 `result.resultChannel`）。
+ *
+ * ## 两档可信度（都只用来回答「报告**自称**走哪条通道」，**不用来采信报告**）
+ * 1. **凭据有效**的行（标签与正文相符）⇒ 优先采用它的自述；
+ * 2. 无有效行时，退化为对**任意**结果行正文的 best-effort 解析（**攻击者可控**）。
+ *
+ * 第 2 档为什么存在（🔴-R3′）：本实现的凭据是**正文绑定标签** ⇒ 插件用「从被重定向的真报告里
+ * 读到的凭据」伪造时，那行凭据**无效**；若只认第 1 档，判据 D 会**漏判** R3′ 最核心的形态。
+ * 放宽是安全的：第 2 档读到的只是「自称」，而判据 D 的**硬证据**是「宿主实际从 fd3 读到空」
+ * （宿主侧观测，插件不可控）；且「自称 `stdout-degraded` 以规避 D」的插件仍会被判据 C
+ * （凭据不可迁移）判出 ⇒ **不会放行**。
+ *
+ * 纪律：本函数**不得**因畸形输入抛错（它跑在装配路径上，抛错会把插件问题变成宿主问题）。
+ * 读不到（无结果行 / 解析失败 / 无该字段）时返回 `null` ⇒ 判据 D **不触发**（保守，不制造假红）。
+ *
+ * @param {string} resultFd 宿主实际从 fd3 读到的文本
+ * @param {string} stdout 探针 stdout
+ * @param {string} nonce 宿主生成的 nonce
+ * @returns {string|null} `'fd3'` / `'stdout-degraded'` / null
+ */
+export function reportedChannelOf(resultFd, stdout, nonce) {
+  const claimOf = (line, requireCredential) => {
+    try {
+      const rest = line.slice(PROBE_RESULT_MARKER.length);
+      const sep = rest.indexOf(':');
+      if (sep <= 0) return null;
+      const tag = rest.slice(0, sep);
+      const body = rest.slice(sep + 1);
+      if (requireCredential && probeReportTag(nonce, body) !== tag) return null;
+      const parsed = JSON.parse(body);
+      return typeof parsed?.resultChannel === 'string' ? parsed.resultChannel : null;
+    } catch {
+      return null;
+    }
+  };
+  try {
+    const channelText = String(resultFd ?? '');
+    const isolated = channelText.trim().length > 0;
+    const lines = isolated ? collectProbeResultLines(channelText) : collectProbeResultLines(String(stdout ?? ''));
+    // 第 1 档：凭据有效的行
+    for (const line of lines) {
+      const claim = claimOf(line, true);
+      if (claim !== null) return claim;
+    }
+    // 第 2 档：无有效行 ⇒ 退化为 best-effort（见 JSDoc 的「两档可信度」）
+    for (const line of collectProbeResultLines(String(stdout ?? ''))) {
+      const claim = claimOf(line, false);
+      if (claim !== null) return claim;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 把探针的 stdout **解释**进 `result`（纯函数，装配器与离线回归共用同一份）。
  *
  * 抽出来的理由：这段逻辑是本中台最容易「静默判错」的地方（判据字段 `hostFatal[]` 的写入端），
@@ -356,63 +420,104 @@ export function collectProbeResultLines(text) {
  * （含 SIGKILL 这类不可捕获终止的产物）直接断言归因，不必等 CI 装宿主。
  *
  * 情形（**协议注入防线最优先**）：
- * ## R26 两条防线（**并集**，互相独立）
+ * ## R26 防线（**并集**，互相独立）
  * **A · 结构不变量**：正常探针一次运行**恒为 1 条**结果行（实测 8 份夹具全为 1）
  *   ⇒ 结果行 **≥2 条**即铁证是篡改（无需知道谁写的）。
  * **B · 通道隔离**：结构化结果**只**认 fd3 ⇒「stdout 里出现结果行」本身即篡改证据。
- * **C · nonce 带外通道**（侧信道）：传入 `options.nonce` 时**只有**带该 nonce 前缀的行才算报告；
- *   出现裸 `__DSH_PROBE__` / nonce 不匹配的行 ⇒ 判**伪造**（{@link PLUGIN_PROBE_FORGED_RESULT_CHECK}），
- *   且**不得**把它当作报告（否则插件 `write('__DSH_PROBE__{绿卡}')` 就能自我发绿卡）。
+ * **C · 逐行认证标签**（v0.2.5 起；原为「回显 nonce 的前缀」）：传入 `options.nonce` 时
+ *   **只有**「正文与标签相符」的行才算报告（`HMAC(nonce, 正文)`，宿主用**自己已知的 nonce** 重算）。
+ *   出现裸 `__DSH_PROBE__` / 标签不符的行 ⇒ 判**伪造**
+ *   （{@link PLUGIN_PROBE_FORGED_RESULT_CHECK}），且**不得**把它当作报告。
  *   不传 `nonce`（离线单测 / 手工调用）时退化为「认裸 marker」的历史行为。
+ * **D · 通道重定向判据**（🔴-R3′ 收口，v0.2.5）：`options.reportedChannel === 'fd3'`（探针报告
+ *   **自称**结果走 fd3）而宿主**实际**从 fd3 读到的内容为空、却在 stdout 看到「正文与标签相符」的
+ *   结果行 ⇒ 判 `plugin.protocol_injection`、**不采信任何一条**。依据是**宿主侧对 fd3 的实际观测**
+ *   （不是报告自述）⇒ 插件压 `process.exitCode` / 关 fd3 / 把 fd3 换成自己的文件都无效。
+ *   ⚠️ 为什么必须有它（评审实测 R3′）：插件把 fd3 换成**自己的文件** ⇒ 探针（不知情）把**真报告**
+ *   写进插件的文件 ⇒ 插件在 `exit` 钩子里读出凭据 ⇒ 再伪造 ⇒ 旧实现判 **GREEN 放行**。
+ *   ⇒ **nonce 保密性不是唯一防线**（该形态是探针**亲自**把凭据交给插件的）。
  *
  * 归因顺序（**协议注入防线最优先**）：
  * 0. **结果通道被篡改** → 落插件侧 check `plugin.protocol_injection`、`runCompleted=false`、
  *    `ok=false`、`hostFatal[]` 为空。**不再**采信任何一条（`find(first)` 只作末位兼容）。
  * 1. 有结构化结果 → 原样透传 `checks` / `hostFatal` / `phase` / `runCompleted`；
  *    `ok` 必须**同时**要求「跑完」（完成位）与「无失败」（🔴 必修-1）；带 nonce 时，
- *    伪造证据（裸 marker 行）在报告解析后追加为 fail check（本轮不可信 ⇒ `ok` 必为 false）。
+ *    伪造证据（标签不符的行）在报告解析后追加为 fail check（本轮不可信 ⇒ `ok` 必为 false）。
  * 2. 无结构化结果 + **有相位信标** → 不可捕获终止（SIGKILL / OOM）发生在**插件集成**相位
  *    → 落插件侧 check `plugin.abnormal_termination`，`hostFatal[]` 保持为空（不甩锅上游）。
  * 3. 无结构化结果 + 无信标 → 终止在宿主装配段 → `hostFatal[]`（真上游信号，不丢）。
  *
  * @param {object} result 装配器结果对象（就地写入）
  * @param {string} stdout 探针 stdout（**只应含日志**；出现结果行即篡改证据）
- * @param {string|{resultFd?:string, nonce?:string|null}} [channelOrOptions] 结果通道（fd3 文本）
- *   或选项对象 `{ resultFd, nonce }`；两种写法都支持（旧 2 参调用与 3 参字符串调用行为不变）
+ * @param {string|{resultFd?:string, nonce?:string|null, reportedChannel?:string|null}} [channelOrOptions]
+ *   结果通道（fd3 文本）或选项对象 `{ resultFd, nonce, reportedChannel }`；两种写法都支持
+ *   （旧 2 参调用与 3 参字符串调用行为不变）。`reportedChannel` = 探针报告**自称**的通道形态
+ *   （`'fd3'` / `'stdout-degraded'` / null）——判据 D 用它比对**宿主侧实际观测**。
  * @returns {object} 同一个 result（便于链式使用）
  */
 export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   const options = typeof channelOrOptions === 'object' && channelOrOptions !== null ? channelOrOptions : { resultFd: channelOrOptions };
   const resultFd = options.resultFd ?? '';
   const nonce = options.nonce ?? null;
+  const reportedChannel = options.reportedChannel ?? null;
   const text = String(stdout ?? '');
   const channelText = String(resultFd ?? '');
-  const expectedPrefix = nonce ? probeResultPrefix(nonce) : PROBE_RESULT_MARKER;
   const channelMarkers = collectProbeResultLines(channelText);
   const stdoutMarkers = collectProbeResultLines(text);
   // 结果行分两类（R26 的**两条独立证据链**）：
-  // - **匹配 nonce 前缀**的 = 像探针写的（进通道/条数结构判定）；
-  // - **不匹配**（裸 marker / 别的 nonce）= **冒用探针输出协议** ⇒ 伪造证据（{@link PLUGIN_PROBE_FORGED_RESULT_CHECK}）。
-  const matchingOnChannel = channelMarkers.filter((line) => line.startsWith(expectedPrefix));
-  const matchingOnStdout = stdoutMarkers.filter((line) => line.startsWith(expectedPrefix));
+  // - **凭据有效**的（正文与标签相符）= 像探针写的（进通道/条数结构判定）；
+  // - **无效**（裸 marker / 标签不符）= **冒用探针输出协议** ⇒ 伪造证据（{@link PLUGIN_PROBE_FORGED_RESULT_CHECK}）。
+  //
+  // 凭据（v0.2.5 起）= 逐行**认证标签** `HMAC(nonce, 正文)`，**不是**回显 nonce 的前缀。
+  // 为什么改（🔴-R3′）：插件可把 fd3 换成自己的文件 ⇒ 探针把带 nonce 的真报告写进插件文件 ⇒
+  // 插件读出 nonce 即可伪造（旧实现判 GREEN 放行）。正文绑定的标签**不可迁移**：
+  // 读到真报告只得到真正文的标签，伪造正文需要 nonce（插件没有）。
+  const credentialOf = (line) => {
+    if (!nonce) return { ok: true, body: line.slice(PROBE_RESULT_MARKER.length) };
+    const rest = line.slice(PROBE_RESULT_MARKER.length);
+    const sep = rest.indexOf(':');
+    if (sep <= 0) return { ok: false, body: '' };
+    const tag = rest.slice(0, sep);
+    const body = rest.slice(sep + 1);
+    return { ok: tag === probeReportTag(nonce, body), body };
+  };
+  const matchingOnChannel = channelMarkers.filter((line) => credentialOf(line).ok);
+  const matchingOnStdout = stdoutMarkers.filter((line) => credentialOf(line).ok);
   const forgedMarkers = nonce
-    ? [...channelMarkers, ...stdoutMarkers].filter((line) => !line.startsWith(expectedPrefix))
+    ? [...channelMarkers, ...stdoutMarkers].filter((line) => !credentialOf(line).ok)
     : [];
   // 通道隔离（R26 修法 B）：结构化结果**只**认 fd3。fd3 不可用（离线回归台 / 直接跑探针 /
   // 老装配器）时回退 stdout——此时 2 参调用行为与 v0.1.9c 完全一致（旧断言不破）。
   const isolated = channelText.trim().length > 0;
   const markers = isolated ? matchingOnChannel : matchingOnStdout;
   const marker = markers.length > 0 ? markers[0] : null;
+  // ---- 判据 D（🔴-R3′）：通道**重定向**（报告自称走 fd3，宿主实际从 fd3 读到空） ----
+  // 依据 = **宿主侧对 fd3 的实际观测**（`channelText` 为空）+ 报告**自述**（`reportedChannel`）
+  // ——两者都不是插件可控的退出码 / 报告正文字节。该形态下探针的结果行**只**应出现在 fd3；
+  // stdout 上出现**任何**结果行都说明「结果行不是从这个进程的 fd3 来的」⇒ 硬判篡改、
+  // 不采信任何一条（`markers` 全部丢弃）。
+  //
+  // ⚠️ 与评审给的最小式（要求 stdout 行「匹配 nonce」）的**差别与理由**：在本实现的
+  // **正文绑定标签**下，插件用「从被重定向的真报告里读到的凭据」伪造时，那行的凭据**本身无效**
+  // （标签只对真正文有效）⇒ 若按「匹配 nonce」判，D 会**漏判** R3′ 最核心的那个形态。
+  // 故这里放宽到「有**任何**结果行」——它仍然保守：健康路径下 stdout **零**结果行
+  // （探针只写 fd3），且本判据已用 `reportedChannel === 'fd3'` 排除了「降级到 stdout」的合法形态。
+  const channelRedirectEvidence = reportedChannel === RESULT_CHANNEL_FD3
+    && !isolated
+    && stdoutMarkers.length > 0;
   // ---- R26 协议注入防线（放行级假绿）----
   // **结构不变量**：正常探针一次运行**恒为 1 条**结果行。≥2 条即铁证是篡改（无需知道谁写的）；
   // 通道隔离生效后，「stdout 里出现结果行」同样是铁证（探针的结果**只**走 fd3）。
-  // ⚠️ 与「nonce 不匹配」（伪造）的分工：本项是**结构级**异常（条数 / 通道），一旦成立就
-  // **无法判断哪一条是真报告** ⇒ 硬判篡改、丢弃全部结果；nonce 不匹配则是**软**证据——
-  // 真报告（带 nonce）仍可解析，故在报告解析后**追加** fail check（保住真缺陷的可读性）。
+  // ⚠️ 与「凭据无效」（伪造）的分工：本项是**结构级**异常（条数 / 通道 / 通道重定向），
+  // 一旦成立就**无法判断哪一条是真报告** ⇒ 硬判篡改、丢弃全部结果；凭据无效则是**软**证据——
+  // 真报告（标签相符）仍可解析，故在报告解析后**追加** fail check（保住真缺陷的可读性）。
   const injectionEvidence = [];
   if (markers.length > 1) injectionEvidence.push(`结果通道出现 ${markers.length} 条结果行（正常恒为 1 条）`);
   if (isolated && matchingOnStdout.length > 0) {
     injectionEvidence.push(`结果走独立通道，但 stdout 里也出现 ${matchingOnStdout.length} 条结果行（探针只写结果通道）`);
+  }
+  if (channelRedirectEvidence) {
+    injectionEvidence.push('报告自称走 fd3，但宿主实际从 fd3 读到空、而 stdout 出现结果行（通道被重定向：探针的真报告被写进了插件替换的文件）');
   }
   if (injectionEvidence.length > 0) {
     result.runCompleted = false;
@@ -476,7 +581,7 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   }
   let payload;
   try {
-    payload = JSON.parse(marker.slice(expectedPrefix.length));
+    payload = JSON.parse(credentialOf(marker).body);
   } catch (error) {
     // 探针输出不可解析 = 探针自身（本仓文件）出问题 → 宿主侧，不甩锅插件
     pushHostFatal(result, `探针输出不可解析：${String(error?.message ?? error).slice(0, 200)}`);
@@ -496,7 +601,7 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   if (Array.isArray(payload.hostFatal)) result.hostFatal.push(...payload.hostFatal);
   // 完成位**原样透传**（探针未给出时保持 false）：`ok` 必须同时要求「跑完」与「无失败」。
   result.runCompleted = payload.runCompleted === true;
-  // nonce 伪造证据**在报告解析之后**落 check（payload.checks 已就位）：
+  // 伪造证据（裸 marker / 标签不符）**在报告解析之后**落 check（payload.checks 已就位）：
   // 本轮报告不可信 ⇒ `result.ok` 必为 false（errors 非空），且报告里看得见伪造项。
   if (forgedEvidence) result.checks.push(forgedEvidence);
   // ---- 🔴 必修-4：退出码交叉校验（两个独立产物互相矛盾即篡改） ----
@@ -530,12 +635,14 @@ export function interpretProbeStdout(result, stdout, channelOrOptions = '') {
   // ---- 批 1.5（🔴-R2）：结果通道**可见化** + 降级**不得放行** ----
   // 探针在报告里回报 `resultChannel`（'fd3' | 'stdout-degraded'）。老探针 / 无该字段时按
   // 「结果通道是否真的用上了」推断（`isolated` = fd3 有内容）。
-  const reportedChannel = typeof payload.resultChannel === 'string' ? payload.resultChannel : null;
+  // ⚠️ 命名：判据 D 的入参也叫 `reportedChannel`（宿主侧在解释**之前**取的同一字段），
+  // 此处是「报告正文里读到的那一份」，供落 `result.resultChannel` —— 两者同源、不重复取值。
+  const payloadChannel = typeof payload.resultChannel === 'string' ? payload.resultChannel : null;
   // 通道形态以**探针的报告为准**（`payload.resultChannel`）——它是唯一知道「fd3 是否可写」的一方。
   // 老探针 / 合成 payload 无该字段时**不**追溯判降级（保持向后兼容：2 参调用的历史行为不变）。
-  result.resultChannel = reportedChannel ?? (isolated ? RESULT_CHANNEL_FD3 : null);
+  result.resultChannel = payloadChannel ?? (isolated ? RESULT_CHANNEL_FD3 : null);
   result.resultChannelAtStart = typeof payload.resultChannelAtStart === 'string' ? payload.resultChannelAtStart : null;
-  result.resultChannelDegraded = reportedChannel === RESULT_CHANNEL_STDOUT_DEGRADED;
+  result.resultChannelDegraded = payloadChannel === RESULT_CHANNEL_STDOUT_DEGRADED;
   if (result.resultChannelDegraded) {
     // 降级 = 结构化结果走 stdout ⇒ 「stdout 上出现结果行」**不再**构成篡改证据（装配器已回落到
     // stdout）。故本轮结论**不可信**：必须能看见、且**不得**判 PASS。两种成因归因不同：

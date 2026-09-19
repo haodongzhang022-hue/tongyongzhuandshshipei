@@ -497,6 +497,21 @@ try {
     eq('批 1.5 通道可见化（真宿主）：正常路径 resultChannel=fd3', 'fd3', healthyChannel.resultChannel);
     eq('批 1.5 通道可见化（真宿主）：正常路径未降级 + 归因 PASS', 'false|PASS',
       `${healthyChannel.resultChannelDegraded}|${healthyChannel.attribution}`);
+
+    // 🔴-R3′（v0.2.5，真宿主）：插件把 fd3 **换成自己的文件** ⇒ 探针把真报告写进插件文件 ⇒
+    // 插件读出凭据后伪造绿卡 + **压 process.exitCode=0**。旧实现判 GREEN 放行；现在必须 RED。
+    // 为什么必须真宿主也跑：fd 号复用（`closeSync(3)` + `openSync` 拿到 3）依赖**真 spawn 的 fd 布局**，
+    // 假宿主（离线台）自己拼 stdio，可能掩盖真实行为。
+    const fd3Redirect = verify(path.join(ROOT, 'tests/fixtures', 'plugin-fd3-redirect-plugin.mjs'), 'demo_echo');
+    const fd3Failed = (fd3Redirect.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3′（真宿主）：**不得** GREEN / PASS（旧实现此处放行）', true,
+      fd3Redirect.summary?.verdict !== 'GREEN' && fd3Redirect.attribution !== 'PASS');
+    eq('🔴-R3′（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${fd3Redirect.attribution}|${fd3Redirect.summary?.verdict}`);
+    eq('🔴-R3′（真宿主）：失败项含 plugin.protocol_injection（判据 D，依据宿主侧对 fd3 的实际观测）', true,
+      fd3Failed.includes('plugin.protocol_injection'));
+    eq('🔴-R3′（真宿主）：hostFatal 为空 + 完成位 false（插件侧 / 不放行）', '0|false',
+      `${(fd3Redirect.hostFatal ?? []).length}|${fd3Redirect.runCompleted}`);
   }
 
   // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----

@@ -504,26 +504,32 @@ assert "🔴-1 反向反证：SIGTERM 下确实**不是**被超时杀掉的（�
 echo "  [18] 🆕 nonce 带外通道（侧信道：只认带 nonce 的报告 + 伪造即判）+ v0.1.9d R28/R26/R24 三形态"
 NONCE_OUT="$("$NODE_BIN" --input-type=module -e '
 import { interpretProbeStdout } from "'"$ROOT"'/src/harness/host.mjs";
-import { createProbeNonce, probeResultPrefix, PLUGIN_PROBE_FORGED_RESULT_CHECK } from "'"$ROOT"'/src/harness/contract.mjs";
+import { createProbeNonce, probeResultLine, probeReportTag, PROBE_RESULT_MARKER, PLUGIN_PROBE_FORGED_RESULT_CHECK } from "'"$ROOT"'/src/harness/contract.mjs";
 import { randomBytes } from "node:crypto";
 const { value } = createProbeNonce(randomBytes);
 const good = { checks: [{ name: "host.tools_ready", status: "pass" }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: "plugin-integration" };
 const forgedLine = "__DSH_PROBE__" + JSON.stringify({ checks: [{ name: "plugin.loaded", status: "pass" }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: "plugin-integration" }) + "\n";
-const realLine = probeResultPrefix(value) + JSON.stringify(good) + "\n";
+const realLine = probeResultLine(value, JSON.stringify(good)) + "\n";
 // ① 真报告（带 nonce）→ 认；伪造裸 marker → 判伪造
 const a = { checks: [], errors: [], hostFatal: [], phase: "host-assembly" };
 interpretProbeStdout(a, forgedLine + realLine, { nonce: value });
 // ② 只有裸 marker（无 nonce 传入）→ 退化为历史行为（认裸 marker）
 const b = { checks: [], errors: [], hostFatal: [], phase: "host-assembly" };
-interpretProbeStdout(b, realLine.replace(probeResultPrefix(value), "__DSH_PROBE__"), {});
+interpretProbeStdout(b, realLine.replace(PROBE_RESULT_MARKER + probeReportTag(value, JSON.stringify(good)) + ":", "__DSH_PROBE__"), {});
 // ③ nonce 随机性：两次生成必须不同
 const n2 = createProbeNonce(randomBytes);
+// ③ 凭据**不可迁移**（R3′）：把真报告的标签配到自造正文上 ⇒ 标签不符 ⇒ 判伪造、不被采信
+const stolenTag = probeReportTag(value, JSON.stringify(good));
+const forgedBody = JSON.stringify({ checks: [{ name: "plugin.loaded", status: "pass" }], errors: [], hostFatal: [], ok: true, runCompleted: true, phase: "plugin-integration" });
+const c = { checks: [], errors: [], hostFatal: [], phase: "host-assembly" };
+interpretProbeStdout(c, PROBE_RESULT_MARKER + stolenTag + ":" + forgedBody + "\n", { nonce: value });
 console.log([
   a.checks.some((c) => c.name === PLUGIN_PROBE_FORGED_RESULT_CHECK && c.status === "fail"),
   a.ok === false,
   a.checks.some((c) => c.name === "host.tools_ready" && c.status === "pass"),
   b.checks.length === 1 && b.ok === true,
   value !== n2.value,
+  c.checks.some((x) => x.name === PLUGIN_PROBE_FORGED_RESULT_CHECK && x.status === "fail") && c.ok !== true,
 ].join("|"));
 ')"
 assert "伪造裸 marker 被判 plugin.probe_result_forged（真缺陷不再被绿卡掩盖）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f1)"
@@ -531,6 +537,7 @@ assert "伪造 ⇒ ok=false（不放行，绝不当成通过）" "true" "$(echo 
 assert "带 nonce 的真报告仍被正确读取（通道不误伤正常路径）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f3)"
 assert "无 nonce（离线/手工调用）→ 退化为历史行为（认裸 marker）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f4)"
 assert "nonce 值每次随机（固定值 = 没设防）" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f5)"
+assert "🔴-R3′：标签不可迁移（真报告标签 + 自造正文）⇒ 判伪造、不被采信" "true" "$(echo "$NONCE_OUT" | cut -d'|' -f6)"
 
 # 端到端：伪造夹具经**真协议**跑（宿主生成 nonce + 探针带 nonce 输出 + 宿主只认带 nonce 行）
 FORGED_OUT="$("$NODE_BIN" --input-type=module -e '
