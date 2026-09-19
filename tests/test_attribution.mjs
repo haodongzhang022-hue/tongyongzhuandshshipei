@@ -1561,31 +1561,107 @@ console.log('  [12] 🔴-5 命名口径对齐（check 名单一事实源 + 跨�
   // 跨产物扫描：夹具 / 闸门 / 文档里提到的 check 名必须在唯一事实源内。
   // 只认「像 check 名」的字面量（含已知前缀 + 点号 + 小写/下划线），避免把路径 / 包名算进来。
   // 只认「像 check 名」的字面量：前缀 + 点号 + 小写/下划线。
-  // 排除两类噪声（否则守卫自己被文件名 / 方法调用刷红）：
-  //  - 以 `.mjs` / `.json` 结尾的文件名（`contract.mjs` / `plugin.json`）；
-  //  - 紧跟 `(` 的方法调用（`await plugin.apply(...)` 不是 check 名）。
+  // ---- 跨产物命名一致性扫描（🔴-5 + 🟡-4 扩面）----
+  //
+  // 🟡-4（评审实测）：扫描面原先**窄于其名**——只覆盖 fixtures / gate / 两份文档。
+  // 实测：往 `.cnb.yml` 注入未登记名 → 守卫**仍绿**；往 `docs/RISKS.md` 追加未登记名 → **仍绿**。
+  // 而 🔴-5 的原始形态（断言名 vs 实现名不一致）恰恰发生在 `test_offline.sh` /
+  // `test_e2e_regression.mjs` / `.cnb.yml` 这些**未被扫描**的产物里。
+  //
+  // ## 扩面后的识别口径**必须分两类**（否则守卫被自己的噪声刷红 = 变成噪声源）
+  // - **代码产物**（夹具 / 测试脚本 / `.cnb.yml`）：check 名出现在**字符串字面量里**
+  //   （断言名 / 失败消息 / 期望值：`"registry.exact"`、`bad.push("失败项不是 X")`）。
+  //   故扫描口径 = 「单行字符串字面量的**内容**」里的 check 名。直接对代码跑裸词正则会命中
+  //   `process.exit` / `ctx.plugin` / `registry.channels` / `definition.name` / `guard.status`
+  //   等**非 check 名**（评审 🟡-4 实测的假阳性），把守卫变成噪声源。
+  //   先 `stripComments` 去注释，避免「注释里举例说明」被当成漂移。
+  // - **文档产物**（`docs/*.md` / `README.md`）：check 名在表格 / 清单里**不带引号**
+  //   （`| 1 | host.tools_ready | ... |`），故认裸词，并沿用「紧跟 `(` 即方法调用」的排除。
   const CHECK_NAME_RE = /\b(?:host|detect|contract|guard|compat|plugin|registry|dispatch|lifecycle)\.[a-z][a-z0-9_]*\b/g;
+  /** 单行字符串字面量（代码产物的识别口径：只扫**内容**，不含引号本身）。 */
+  const STRING_LITERAL_RE = /(['"`])([^'"`\n]*)\1/g;
   /** 非 check 的合法字面量：文件名（`contract.mjs`）与包名（`plugin.json`）。 */
   const NOT_A_CHECK = new Set(['mjs', 'json', 'js', 'cjs']);
+  /** 判定一个候选字面量是否为「未登记 check 名」（两口径共用同一份过滤）。 */
+  const unregistered = (name) => !ALL_CHECK_NAMES.includes(name) && !NOT_A_CHECK.has(name.slice(name.indexOf('.') + 1));
+  /** 口径 A：扫代码产物——取**字符串字面量内容**里的 check 名（先去注释）。 */
+  const scanCodeArtifact = (source) => {
+    const out = [];
+    for (const literal of stripComments(source).matchAll(STRING_LITERAL_RE)) {
+      for (const m of literal[2].matchAll(CHECK_NAME_RE)) if (unregistered(m[0])) out.push(m[0]);
+    }
+    return out;
+  };
+  /** 口径 B：扫文档产物——裸词，排除紧跟 `(` 的方法调用。 */
+  const scanDocArtifact = (source) => {
+    const out = [];
+    for (const m of source.matchAll(CHECK_NAME_RE)) {
+      if (!unregistered(m[0])) continue;
+      if (source.slice(m.index + m[0].length).trimStart().startsWith('(')) continue;
+      out.push(m[0]);
+    }
+    return out;
+  };
+  // 代码产物：夹具 + 测试脚本本体 + CI 编排。排除**本文件自身**（`[12]` 段里**故意**写出
+  // 未登记名做守卫自证——自证不是漂移，不排除的话守卫会被自己的样例刷红）。
   const scanTargets = [
     ...readdirSync(path.join(ROOT, 'tests', 'fixtures')).map((f) => path.join('tests', 'fixtures', f)),
-    path.join('tests', 'gate_plugin_side.sh'),
+    ...readdirSync(path.join(ROOT, 'tests')).filter((f) => /\.(sh|mjs)$/.test(f)).map((f) => path.join('tests', f)),
+    '.cnb.yml',
+  ].filter((rel) => rel !== path.join('tests', 'test_attribution.mjs'));
+  const docTargets = [
+    path.join('docs', 'RISKS.md'),
+    path.join('docs', 'ARCHITECTURE.md'),
     path.join('docs', 'ADAPTER_GUIDE.md'),
     path.join('docs', 'INDEX.md'),
+    'README.md',
   ];
   const unknown = [];
   for (const rel of scanTargets) {
-    const text = readText(path.join(ROOT, rel), 'utf8');
-    for (const m of text.matchAll(CHECK_NAME_RE)) {
-      if (ALL_CHECK_NAMES.includes(m[0])) continue;
-      if (NOT_A_CHECK.has(m[0].slice(m[0].indexOf('.') + 1))) continue; // 文件名不是 check 名
-      // 方法调用（`await plugin.apply(...)`）不是 check 名：紧跟 `(` 的排除。
-      if (text.slice(m.index + m[0].length).trimStart().startsWith('(')) continue;
-      unknown.push(`${rel}: ${m[0]}`);
-    }
+    for (const name of scanCodeArtifact(readText(path.join(ROOT, rel), 'utf8'))) unknown.push(`${rel}: ${name}`);
   }
-  eq('🔴-5：夹具/闸门/文档里的 check 名全部登记在唯一事实源（未登记即红，杜绝命名漂移）',
+  for (const rel of docTargets) {
+    for (const name of scanDocArtifact(readText(path.join(ROOT, rel), 'utf8'))) unknown.push(`${rel}: ${name}`);
+  }
+  eq('🔴-5：夹具/测试脚本/.cnb.yml/文档里的 check 名全部登记在唯一事实源（未登记即红，杜绝命名漂移）',
     JSON.stringify([]), JSON.stringify([...new Set(unknown)]));
+
+  // 🟡-4 守卫自证：**五种注入形态**逐条必须被抓到（防「扩面了但识别口径空转」）。
+  // ①②③ 是代码产物（字符串字面量内容），④⑤ 是文档产物（裸词 / 表格）。
+  for (const [label, sample, scanner] of [
+    ['① 代码产物：`.cnb.yml` 注入形态（失败消息里的未登记名）',
+      'if (!guard || guard.status !== "fail") bad.push("失败项不是 plugin.nonexistent_check");', scanCodeArtifact],
+    ['② 测试脚本：`assert` 断言名漂移（🔴-5 原始形态：断言 vs 实现名不一致）',
+      'assert "失败项为 plugin.nonexistent_check" "true" "$x"', scanCodeArtifact],
+    ['③ 测试脚本：`eq()` 断言名漂移（`.mjs` 形态）',
+      "eq('失败项含 plugin.nonexistent_check', true, actual)", scanCodeArtifact],
+    ['④ 文档：`docs/RISKS.md` 追加裸词形态',
+      '| R99 | 注入 | 判据 plugin.nonexistent_check |', scanDocArtifact],
+    ['⑤ 文档：`docs/INDEX.md` 表格行形态（反引号内）',
+      '| 99 | `plugin.nonexistent_check` | 测试 |', scanDocArtifact],
+  ]) {
+    eq(`🟡-4 守卫自证：${label} 被抓到`, JSON.stringify(['plugin.nonexistent_check']),
+      JSON.stringify([...new Set(scanner(sample))]));
+  }
+  // 反向护栏（**必须有**，否则扩面就成了噪声源）：评审 🟡-4 实测的假阳性形态必须全部被过滤。
+  // 两类：① 非 check 名（方法调用 / 字段访问 / 文件名）；② 注释里的举例（代码产物先 stripComments）。
+  eq('🟡-4 反向护栏：非 check 名（`process.exit` / `ctx.plugin` / `registry.channels` / `guard.status` / `host.reg` / `*.mjs`）不误报',
+    JSON.stringify([]), JSON.stringify([...new Set(scanCodeArtifact([
+      'process.exit(1)',
+      "require('./.ci/verify-broken.json')",
+      'ctx.plugin(ctx)',
+      'registry.channels[0]',
+      'definition.name',
+      'guard.status',
+      'host.reg',
+      "readText(path.join(ROOT, 'contract.mjs'))",
+    ].join('\n')))]));
+  eq('🟡-4 反向护栏：注释里的举例不算漂移（先 stripComments；代码产物口径）',
+    JSON.stringify([]), JSON.stringify([...new Set(scanCodeArtifact(
+      '// 例如断言名写成 plugin.nonexistent_check 就会红\n/* 或 plugin.another_bogus */\n'))]));
+  eq('🟡-4 反向护栏：文档里的方法调用（`await plugin.apply(...)`）不算 check 名',
+    JSON.stringify([]), JSON.stringify([...new Set(scanDocArtifact('探针的 `await plugin.apply(ctx)` 永不返回。'))]));
+
   // 守卫自证：一个「名字对不上」的样例必须被抓到（防本守卫空转）
   const mutated = '失败项 `plugin.async_uncaught_exception` 实际落 `plugin.unexpected_exception`';
   const mutatedUnknown = [...new Set([...mutated.matchAll(CHECK_NAME_RE)].map((m) => m[0]))].filter((n) => !ALL_CHECK_NAMES.includes(n));
@@ -1644,15 +1720,55 @@ console.log('  [14] 信任边界显式前提 + 结构性重做一页方案');
   eq('重做方案留待总师裁定项（不自行拍板范围）', true, redo.includes('待总师裁定'));
   eq('重做方案给出回滚路径（fd 不可用 → 显式降级，不静默）', true, redo.includes('回滚') && redo.includes('降级'));
 
-  // 唯一事实源守卫：R24 的终止信号必须来自 host.mjs 常量（probeSpawnOptions + npm 共用一份）
+  // ---- R24 终止信号的**逐站点**源码守卫（🟡-1；🔴-1 的修复本身必须有防线）----
+  //
+  // 评审 🟡-1 实测：`test_offline.sh [17]` 断言的是 `tests/offline-probe-harness.mjs` **自己的**
+  // `killSignal`，**不是生产文件**。把 `src/harness/host.mjs` 里**两处** `killSignal: 'SIGKILL'`
+  // 全删 → 套件全绿 ⇒ 🔴-1 一旦被回退，CI 挂死会**静默复现**。原 `[\s\S]{0,500}` 窗口断言也
+  // 随注释增长而失真（窗口内塞够注释即失配/误配）。
+  //
+  // 识别口径：用**括号配平**取出该调用的实参列表，再断言目标常量出现在**这一次调用**里——
+  // 既避免「文件里别处有就算过」的假绿，也不依赖字符距离。
   const hostSrc = readText(path.join(ROOT, 'src/harness/host.mjs'), 'utf8');
   const hostCode = codeOnly(hostSrc);
+  /** 取出从 `startIdx` 起的调用实参列表（括号配平；仅用于源码守卫，不解析 JS）。 */
+  const callArgsAt = (src, startIdx) => {
+    const open = src.indexOf('(', startIdx);
+    if (open === -1) return '';
+    let depth = 0;
+    for (let i = open; i < src.length; i += 1) {
+      if (src[i] === '(') depth += 1;
+      else if (src[i] === ')') { depth -= 1; if (depth === 0) return src.slice(open, i + 1); }
+    }
+    return '';
+  };
   eq('R24：host.mjs 导出 CHILD_KILL_SIGNAL = SIGKILL（唯一事实源）', true,
     /CHILD_KILL_SIGNAL = .SIGKILL./.test(hostSrc));
   eq('R24：probeSpawnOptions 的 killSignal 默认取 CHILD_KILL_SIGNAL（回退成字面量 SIGTERM 即红）', true,
     /killSignal = CHILD_KILL_SIGNAL/.test(hostCode));
-  eq('R24：npm 安装子进程同样用 CHILD_KILL_SIGNAL（同族加固，不得无界挂起）', true,
-    /execFileSync\( S , \[[\s\S]{0,500}killSignal: CHILD_KILL_SIGNAL/.test(hostCode));
+  // 站点 ①（探针段）：`probeSpawnOptions` 的**返回对象**必须真的把 killSignal 传出去
+  //（只把默认值写在解构里不算：删掉返回对象里的 `killSignal,` 一行即静默失效）。
+  const probeFnBody = (() => {
+    const i = hostCode.indexOf('export function probeSpawnOptions');
+    return i === -1 ? '' : hostCode.slice(i, hostCode.indexOf('\n}', i));
+  })();
+  eq('🟡-1 站点①（探针段）：probeSpawnOptions 的返回对象含 killSignal（删掉即红）', true,
+    /return \{[\s\S]*?\bkillSignal,\s*[\s\S]*?\};/.test(probeFnBody));
+  // 站点 ②（npm 安装段）：`execFileSync('npm', ...)` 的**本次**选项对象必须含
+  // `killSignal: CHILD_KILL_SIGNAL`（同族加固：npm 也可能挂住 ⇒ timeoutMs 对安装段同样要有界）。
+  const npmCallArgs = callArgsAt(hostCode, hostCode.indexOf('execFileSync( S , ['));
+  eq('🟡-1 站点②（npm 安装段）：execFileSync 的本次选项含 killSignal: CHILD_KILL_SIGNAL（删掉即红）', true,
+    npmCallArgs.includes('killSignal: CHILD_KILL_SIGNAL'));
+  // 守卫自证（把评审 🟡-1 的两次变异写成可执行断言——防「守卫写成了只守替身」）：
+  // ① 删站点① 的返回对象里那一行 → 判否；② 删站点② 的那一行 → 判否；
+  // ③ 把站点② 的常量挪到调用**之外**（模拟「文件里别处还有一份」的假绿形态）→ 判否。
+  eq('🟡-1 守卫自证：站点① 删掉返回对象里的 killSignal 即判否（不是空转）', false,
+    /return \{[\s\S]*?\bkillSignal,\s*[\s\S]*?\};/.test(probeFnBody.replace(/\bkillSignal,\s*\n/, '')));
+  eq('🟡-1 守卫自证：站点② 删掉本次选项里的 killSignal 即判否（不是空转）', false,
+    npmCallArgs.replace('killSignal: CHILD_KILL_SIGNAL,', '').includes('killSignal: CHILD_KILL_SIGNAL'));
+  eq('🟡-1 守卫自证：killSignal 只出现在本次调用**之外**时判否（防「文件里别处有就算过」）', false,
+    codeOnly(`${npmCallArgs.replace('killSignal: CHILD_KILL_SIGNAL,', '')}\n/* 别处还有一份：killSignal: CHILD_KILL_SIGNAL */`)
+      .includes('killSignal: CHILD_KILL_SIGNAL'));
   eq('R24：离线回归台**镜像**生产路径的 spawn 参数（不自造一套）', true,
     /probeSpawnOptions\(/.test(readText(path.join(ROOT, 'tests/offline-probe-harness.mjs'), 'utf8')));
   eq('R24：有界占死夹具存在（供反向反证：SIGTERM 下超时形同虚设）', true,

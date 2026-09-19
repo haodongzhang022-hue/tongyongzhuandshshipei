@@ -467,7 +467,16 @@ const r = runOfflineProbe({ pluginPath: path.join("'"$ROOT"'", "tests/fixtures/p
 console.log((Date.now() - t0) + "|" + (r.exit.signal ?? "none") + "|" + r.attribution);
 ')"
 BOUNDED_MS="$(echo "$BOUNDED_OUT" | cut -d'|' -f1)"
-assert "占死事件循环：5s timeout 内**有界**返回（< 20s，实测约 5s）" "yes" "$([[ "$BOUNDED_MS" -lt 20000 ]] && echo yes || echo no)"
+# 🟡-2（评审实测）：原式 `[[ "$BOUNDED_MS" -lt 20000 ]]` 在读数**为空或非数字**时**判真**
+# （bash 把空串当 0）⇒ 探针若完全跑不出输出，这条「有界」断言会**假绿**。
+# 修法：先断言「纯数字」（`^[0-9]+$`）再比大小；并加守卫自证（空值 / 非数字必须判否）。
+bounded_ok() { [[ "${1:-}" =~ ^[0-9]+$ ]] && [[ "$1" -lt 20000 ]]; }
+assert "占死事件循环：耗时读数必须是**纯数字**（空值/非数字不得参与比较）" "yes" "$([[ "$BOUNDED_MS" =~ ^[0-9]+$ ]] && echo yes || echo no)"
+assert "占死事件循环：5s timeout 内**有界**返回（< 20s，实测约 5s）" "yes" "$(bounded_ok "$BOUNDED_MS" && echo yes || echo no)"
+# 守卫自证：把「为什么必须先判数字」写成可执行断言（防后人改回裸 -lt）
+assert "🟡-2 守卫自证：空读数判否（裸 -lt 会把它当 0 判真 = 假绿）" "no" "$(bounded_ok "" && echo yes || echo no)"
+assert "🟡-2 守卫自证：非数字读数判否（裸 -lt 会误判）" "no" "$(bounded_ok "abc" && echo yes || echo no)"
+assert "🟡-2 守卫自证：正常读数仍判是（收紧不得误伤）" "yes" "$(bounded_ok "5012" && echo yes || echo no)"
 assert "占死事件循环：由 SIGKILL 收尾（signal=SIGKILL，非无限等待）" "SIGKILL" "$(echo "$BOUNDED_OUT" | cut -d'|' -f2)"
 assert "占死事件循环：归因 PLUGIN_REGRESSION（不甩锅上游）" "PLUGIN_REGRESSION" "$(echo "$BOUNDED_OUT" | cut -d'|' -f3)"
 
