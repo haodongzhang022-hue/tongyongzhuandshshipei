@@ -6,7 +6,8 @@
  * - `detect`   探测本地宿主版本线（需宿主实例；无宿主时报 unknown，不报错）
  * - `matrix`   打印通道矩阵（稳定版 / 开发版 / 历史线）
  * - `verify`   多通道验收（`--channel stable|dev|legacy|all`，`all` = 三通道全跑）
- * - `watch`    上游变更侦测（dist-tag 漂移 + 契约指纹 diff）
+ * - `watch`    上游变更侦测（dist-tag 漂移 + 契约指纹 diff + **自动归因影响面**）；
+ *              `--markdown` 出人类视图；`--json` 落盘（含 triage）
  * - `report`   验收 + 二级信息输出（`--markdown` 出人类视图；`--channel` 与 verify 同义）
  * - `cache`    宿主依赖缓存维护（默认保留当前三通道钉版指纹，其余历史残留清理）
  *
@@ -29,6 +30,7 @@ import {
   planSnapshotUpdate,
   watchUpstream,
 } from './watch/upstream.mjs';
+import { toTriageMarkdown, triageUpstream } from './triage/index.mjs';
 import { VERSION } from './version.mjs';
 
 /** 所有可用通道（`all` 的展开结果，与 `.cnb.yml` / `.cnb/web_trigger.yml` 保持同一语义）。 */
@@ -38,7 +40,7 @@ export const ALL_CHANNELS = ['stable', 'dev', 'legacy'];
 const BOOLEAN_FLAGS = new Set(['offline', 'markdown', 'help', 'prune-cache']);
 
 /** 已知带值参数（未知的 `--key` 显式报错，避免拼错参数被静默忽略）。 */
-const VALUE_KEYS = new Set(['channel', 'plugin', 'tools', 'json']);
+const VALUE_KEYS = new Set(['channel', 'plugin', 'tools', 'json', 'contract-from']);
 
 /**
  * 解析 `--key value` / `--key=value` / `--flag` 形式的参数。
@@ -115,7 +117,7 @@ function usage() {
     '  dsh-adapt matrix                                    # 通道矩阵',
     '  dsh-adapt verify --channel stable|dev|legacy|all     # 验收（all = stable+dev+legacy）',
     '        --plugin <path>  --tools a,b  [--offline] [--json <out>] [--markdown]',
-    '  dsh-adapt watch  [--json <out>]                      # 上游变更侦测',
+    '  dsh-adapt watch  [--json <out>] [--markdown]         # 上游变更侦测 + 自动归因影响面',
     '  dsh-adapt report --plugin <path> --tools a,b [--channel stable|dev|legacy|all] [--markdown]',
     '  dsh-adapt cache  [--prune-cache]                     # 宿主依赖缓存维护（默认保留当前钉版指纹）',
     '',
@@ -196,12 +198,49 @@ function cmdVerify(args) {
 
 async function cmdWatch(args) {
   const report = await watchUpstream({ hubRoot: HUB_ROOT });
+  // 自动归因：把「有没有漂移」推到「漂移到哪、影响谁、中台改哪一处、插件要不要动」。
+  // 契约漂移用**基线 vs 本次通道契约**对比；本次无验收采集时（纯 watch），仍可按基线 + 失败队列判定。
+  const snapshot = contractSnapshot({ hubRoot: HUB_ROOT });
+  const baseline = snapshot.load()?.contracts ?? null;
+  // watch 场景没有「本次通道契约」（未跑真宿主），故只对**已在通道报告中回传的契约**做 diff；
+  // 若调用方通过 --contract-from 提供了验收报告，则一并纳入（CI 上 watch 与 verify 串联时用）。
+  const currentContracts = readContractsFromReport(args['contract-from']);
+  const contractDrift = currentContracts ? diffContracts(baseline, currentContracts) : { changed: false, items: [] };
+  const triage = triageUpstream({ report, contractDrift });
+  const output = { ...report, triage, contractDrift };
   if (typeof args.json === 'string') {
     mkdirSync(path.dirname(path.resolve(args.json)), { recursive: true });
-    writeFileSync(path.resolve(args.json), `${JSON.stringify(report, null, 2)}\n`);
+    writeFileSync(path.resolve(args.json), `${JSON.stringify(output, null, 2)}\n`);
   }
-  console.log(JSON.stringify(report, null, 2));
-  process.exit(report.offline ? 2 : report.drift.length > 0 ? 1 : 0);
+  if (args.markdown) console.log(toTriageMarkdown(triage));
+  else console.log(JSON.stringify(output, null, 2));
+  process.exit(report.offline ? 2 : triage.hasDrift ? 1 : 0);
+}
+
+/**
+ * 从验收报告 JSON 里取「每个 ok 通道的契约指纹」（供 watch 做契约漂移 diff）。
+ *
+ * 为什么需要它：纯 `watch` 只查 dist-tag，拿不到**本次**真实宿主采到的契约；
+ * CI 上通常先 `verify --json` 再 `watch`，这时把验收报告喂进来，watch 就能同时给出
+ * 「版本漂移」与「契约漂移 + 影响面」，不必再跑一遍真宿主。
+ *
+ * @param {string|undefined} file 验收报告路径（`verify` 的 `--json` 产物）
+ * @returns {object|null} channel → contract；不可用时返回 null（**不猜**）
+ */
+function readContractsFromReport(file) {
+  if (typeof file !== 'string' || !existsSync(file)) return null;
+  try {
+    const report = JSON.parse(readFileSync(file, 'utf8'));
+    const contracts = {};
+    for (const channel of report.channels ?? []) {
+      if (channel?.channel && channel.contract && Object.keys(channel.contract).length > 0) {
+        contracts[channel.channel] = channel.contract;
+      }
+    }
+    return Object.keys(contracts).length > 0 ? contracts : null;
+  } catch {
+    return null;
+  }
 }
 
 function cmdReport(args) {

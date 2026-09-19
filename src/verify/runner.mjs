@@ -17,6 +17,8 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { HUB_ROOT, loadChannels, runHostProbe } from '../harness/host.mjs';
 import { CONTRACT_SIDE_CHECKS, HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, PLUGIN_HARD_EVIDENCE, PLUGIN_SIDE_CHECKS } from '../harness/contract.mjs';
+// 漂移相关性表的唯一事实源（与 `docs/ARCHITECTURE.md` 判据表第 3 条、triage 影响面同源）
+import { DRIFT_IMPACT } from '../triage/index.mjs';
 import { channelContractDrift, contractSnapshot } from '../watch/upstream.mjs';
 
 /**
@@ -50,7 +52,10 @@ export function verifyChannel(options) {
 
   // 契约漂移：把本次指纹与该通道基线对比（失败运行的 `{}` 不参与对比，防假信号）
   const contractDrift = channelContractDrift(options.previousContracts ?? null, options.channel, probe.contract);
-  const detail = probe.ok
+  // 🔴-R2：降级运行**不得判 PASS**——探针侧已置 `probe.ok=false`（并记 errors），这里再做一次
+  // 显式收口（装配器 / 老探针路径下 `probe.ok` 可能仍为真，防线不能只挂在一处）。
+  const degraded = probe.resultChannelDegraded === true;
+  const detail = probe.ok && !degraded
     ? { attribution: 'PASS', channel: options.channel, reasons: ['全部检查通过'] }
     : attributionDetail(probe, channel, options.channel, { contractDrift });
   const attribution = detail.attribution;
@@ -59,7 +64,7 @@ export function verifyChannel(options) {
     label: channel.label,
     line: channel.line,
     intent: channel.intent,
-    ok: probe.ok,
+    ok: probe.ok && !degraded,
     attribution,
     attributionReasons: detail.reasons,
     profile: probe.profile,
@@ -68,8 +73,23 @@ export function verifyChannel(options) {
     contractDrift,
     checks: probe.checks,
     errors: probe.errors,
-    hostFatal: probe.hostFatal ?? [],
+    hostFatal: Array.isArray(probe.hostFatal) ? probe.hostFatal : [],
+    // 完成位：探针是否**跑完**（🔴 必修-1）。未跑完的运行**绝不**能判 PASS——
+    // 中途被打断时「没跑到的检查」是 skip 不是 fail，只看失败项会假绿。
+    runCompleted: probe.runCompleted === true,
+    // 结果通道形态（批 1.5 / 🔴-R2）：'fd3' | 'stdout-degraded'。**降级必须显式可见**——
+    // 报告与二级信息里看得见「这次结果走的是哪条通道」，且降级运行**不得判 PASS**（见下 `ok`）。
+    resultChannel: probe.resultChannel ?? null,
+    resultChannelDegraded: probe.resultChannelDegraded === true,
+    resultChannelAtStart: probe.resultChannelAtStart ?? null,
+    // 🔴-R3 §三：「报告**自称**降级」这一成因（与「真环境限制」相反）——报告层据此分开说，
+    // 否则人会把「插件篡改通道」读成「环境没有 fd3」（收口前实测：AMBER / UPSTREAM_DRIFT）。
+    resultChannelDegradeClaimed: probe.resultChannelDegradeClaimed === true,
+    // 探针执行相位（host-assembly / plugin-integration）：异常归属的依据，排障时看得见
+    probePhase: probe.phase ?? null,
     probeExit: probe.probeExit ?? null,
+    // nonce 带外通道形态（stdin）——探针侧设了就必须透传到报告，否则排障时看不到通道口径
+    probeNonceChannel: probe.probeNonceChannel ?? null,
     install: probe.install,
     cacheHit: probe.cacheHit,
     durationMs: probe.durationMs,
@@ -102,11 +122,18 @@ export { HOST_FATAL_FIELD, HOST_FATAL_PREFIX, HOST_SIDE_CHECKS, CONTRACT_SIDE_CH
  * 1. **宿主/环境侧**：结构化字段 `probe.hostFatal[]` 非空，或失败项属 {@link HOST_SIDE_CHECKS}
  *    （宿主未就绪 / 版本线不可判定 / 契约探测未卸载）→ `UPSTREAM_DRIFT`。
  *    `errors[]` 是**人类可读日志**（含插件侧 stack / 文件路径），**不参与任何判据**；
+ * 1b. **完成位缺失**（`probe.runCompleted === false` 且无失败项且 `checks` 非空）
+ *    → `PLUGIN_REGRESSION`。探针中途被打断时「没跑到的检查」是 `skip` 而非 `fail`，
+ *    若照常往下走，一个「`apply()` 里 `process.exit(0)`」的插件会因为恰好没有失败项而被判
+ *    **PASS / GREEN（假绿）**——比 AMBER 更危险（AMBER 至少不放行）；完成位是这类运行的
+ *    **唯一**可区分信号。为什么排在**宿主侧之后**（而不是最前）：离线缺缓存 / 装配失败这类
+ *    **真上游信号**同样满足 `runCompleted === false`，排在最前就会把上游问题翻成插件回归；
  * 2. **版本线 unknown** → `UPSTREAM_DRIFT`；
  * 2b. **插件侧硬证据**（{@link PLUGIN_HARD_EVIDENCE}，如 `guard.reserved_rejected`）
  *    → `PLUGIN_REGRESSION`，**优先于任何漂移相关性**：插件违反宿主硬约束与上游契约是否
  *    漂移无关，漂移窗口内也必须判插件（评审 🔴-C；精确 check 名，不用 `guard.*` 通配）；
  * 3. **契约指纹与基线不一致且漂移字段与失败 check 相关** → `UPSTREAM_DRIFT`；
+ *    （相关性表唯一事实源 = `triage/index.mjs` 的 `DRIFT_IMPACT`，精确 check 名匹配）；
  * 4. **中台契约 check 失败且无可用基线**（首次采集，无法判定上游是否变了）→ 保守判 `UPSTREAM_DRIFT`；
  * 5. **插件侧 check 失败** → `PLUGIN_REGRESSION`；
  * 6. 有失败但无任何可识别 check（探针被外力打断等）→ `UNKNOWN`（不猜、不甩锅）。
@@ -130,9 +157,18 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
 
   // 1. 宿主/环境侧：**只读结构化字段** hostFatal[]（绝不扫 errors 自由文本——插件侧 stack/路径
   //    里出现 `fatal(host)` 字面量就会翻案，评审 🔴-C），或失败项属宿主侧 check 名。
-  const hostFatal = probe?.[HOST_FATAL_FIELD] ?? [];
+  // 🟢：归一为数组——此前「非数组但 length>0」（如外部传入字符串）会被当成漂移信号；
+  // 现在只认真正的数组元素（判据字段的**读取端**也不许有含糊）。
+  const rawHostFatal = probe?.[HOST_FATAL_FIELD];
+  const hostFatal = Array.isArray(rawHostFatal) ? rawHostFatal.filter((item) => String(item ?? '').trim().length > 0) : [];
   if (hostFatal.length > 0) {
     reasons.push(`[${channelName}] 探针报告宿主/环境侧致命错误（${hostFatal.length} 条，字段 ${HOST_FATAL_FIELD}）：${String(hostFatal[0]).slice(0, 200)}`);
+    // 🟢 可读性（评审建议）：宿主侧信号与插件侧失败可能**同时**存在（如宿主装配失败前插件已失败）。
+    // 判据优先级不变（宿主侧优先），但理由链要如实说出来，避免人误读成「插件没问题」。
+    const alsoPluginFailed = PLUGIN_SIDE_CHECKS.filter((name) => failedNames.has(name));
+    if (alsoPluginFailed.length > 0) {
+      reasons.push(`[${channelName}] 注意：本次**同时**存在插件侧失败 check（${alsoPluginFailed.join(',')}）——宿主侧信号优先判漂移，但插件侧问题需另行修复（见 checks[].detail）`);
+    }
   }
   for (const name of HOST_SIDE_CHECKS) {
     if (failedNames.has(name)) reasons.push(`[${channelName}] 宿主侧检查失败：${name}`);
@@ -140,6 +176,25 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
   // 2. 版本线不可判定
   if (probe?.profile && probe.profile.flavor === 'unknown') reasons.push(`[${channelName}] 版本线探测为 unknown（${probe.profile.evidence ?? ''}）`);
   if (reasons.length > 0) return { attribution: 'UPSTREAM_DRIFT', channel: channelName, reasons };
+
+  // 1b. **完成位缺失**（🔴 必修-1）：探针跑过、但**没跑完**，且一条 fail 都没有 ——
+  //     这正是「假绿」风险区（`apply()` 里 `process.exit(0)` → 剩余检查是 `skip` 不是 `fail`
+  //     → 只看失败项会判 PASS/GREEN，比 AMBER 更危险）。完成位是这类运行的**唯一**可区分信号。
+  //     为什么排在宿主侧之后：离线缺缓存 / 装配失败这类**真上游信号**也满足 runCompleted=false，
+  //     若排在最前就会把上游问题翻成插件回归（判据 1 必须优先）。
+  //     为什么要求 `checks.length > 0`：探针**完全没输出结构化结果**时（装配器侧失败、
+  //     人工构造的报告）不应据完成位翻案——那种情形交给判据 1（hostFatal[]）与判据 6（UNKNOWN）。
+  if (probe?.runCompleted === false && failedChecks.length === 0 && (probe?.checks ?? []).length > 0) {
+    return {
+      attribution: 'PLUGIN_REGRESSION',
+      channel: channelName,
+      reasons: [
+        `[${channelName}] 探针**未跑完**（完成位 runCompleted=false）且无失败项——验收被插件侧中断`
+          + `（提前 process.exit / 挂住事件循环 / 不可捕获终止）；未跑到的检查是 skip 而非 fail，`
+          + `**不得**据此判通过（假绿比 AMBER 更危险）。详见 checks[].detail 与 probePhase。`,
+      ],
+    };
+  }
 
   // 2b. 插件侧硬证据：优先于漂移相关性（漂移窗口内插件违规仍判插件，评审 🔴-C）
   const hardEvidence = PLUGIN_HARD_EVIDENCE.filter((name) => failedNames.has(name));
@@ -157,14 +212,15 @@ export function attributionDetail(probe, channel, channelName, evidence = {}) {
   const drift = evidence.contractDrift;
   if (drift?.changed && drift.items?.length > 0) {
     const fields = new Set(drift.items.map((item) => item.field));
-    const related =
-      // P2-6：`guard.reserved_rejected` **不入表**（已由 2b 硬证据优先拦下）；`reservedName` 漂移
-      // 只对应中台自检 `guard.reserved_name`——上游取消保留名 + 插件自己声明保留名时，
-      // 判漂移等于把插件违规甩给上游。
-      (fields.has('reservedName') && failedNames.has('guard.reserved_name'))
-      || (fields.has('schemaSubset') && failedNames.has('compat.schema_flatten'))
-      || (fields.has('configProjection') && failedNames.has('detect.flavor_known'))
-      || (fields.has('outputShape') && [...failedNames].some((name) => name.startsWith('dispatch.')));
+    // P2-6 / v0.1.7：漂移相关性**不在本文件硬编码**——唯一事实源是 `triage/index.mjs` 的
+    // `DRIFT_IMPACT`（字段 → 受影响 check 名，精确匹配，不用 `dispatch.` 这类前缀通配）。
+    // 为什么去硬编码：过去这里是 4 条手写 `||`，与文档里的相关性表、triage 影响面表**三处各自维护**，
+    // 任何一处新增字段都会静默漏判（漂移相关=判上游，漏了就把插件 bug 甩给上游）。
+    // 现在三处共用一份：改 `DRIFT_IMPACT` 一处即全生效，漏登记字段会被 triage 标 `known:false` 显式暴露。
+    //
+    // 纪律（不得回退）：`PLUGIN_HARD_EVIDENCE`（`guard.reserved_rejected`）**永不入表**——
+    // 它已在 2b 优先拦下；把它算作「漂移相关」= 插件违规甩锅上游（历史缺陷 🔴-C）。
+    const related = [...fields].some((field) => (DRIFT_IMPACT[field]?.checks ?? []).some((name) => failedNames.has(name)));
     if (related) {
       return {
         attribution: 'UPSTREAM_DRIFT',

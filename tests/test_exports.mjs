@@ -12,6 +12,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, copyFileSy
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONDITIONAL_PROBE_CHECKS } from '../src/harness/contract.mjs';
+import { codeOnly } from './source-scan.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -148,6 +150,99 @@ console.log("  [2b'] INDEX 清单标题/序号列/注脚结构");
     foot.includes('test_exports.mjs') && foot.includes('[2b]'));
 }
 
+// ---- 2b'''. 「另有 N 项条件检查」的 N 由 CONDITIONAL_PROBE_CHECKS 长度反推（复测 🟡-4） ----
+// 为什么补（评审 🟡-4）：`src/harness/contract.mjs` 的 JSDoc 曾写死「另有 1 项条件检查」，
+// 而两份文档早已改成 2 项——代码与文档各说各话；更糟的是「另有 N 项」这句**无守卫**
+// （`tests/` 搜「另有」0 命中）：改文档不改代码、或反之，都静默通过（与 🟡-2「删声明即静默」同族）。
+// 现在把 N 从**唯一事实源**（`CONDITIONAL_PROBE_CHECKS.length`）反推，两份文档必须一致，
+// 且每一条条件检查名都要在文档表里出现（防止「N 对但名单少了一项」）。
+console.log("  [2b'''] 文档「另有 N 项条件检查」与 CONDITIONAL_PROBE_CHECKS 一致");
+{
+  const N = CONDITIONAL_PROBE_CHECKS.length;
+  // 🟡-1（评审复评）：此前只守 ADAPTER_GUIDE / INDEX 两份 ⇒ ARCHITECTURE / README **可静默漂移**
+  // （实测：ARCHITECTURE 的「另有 8→9」+ `plugin.protocol_injection` 改名 → exports 仍全绿）。
+  // 文档即防线：凡声明了条件项数 / 名单的文档都必须纳入守卫。
+  // ⚠️ 名单匹配按**标识符词元**判（split 后精确相等），不用 `text.includes(name)`：
+  // 否则把 `plugin.probe_result_forged` 改成 `plugin.probe_result_forgedX` 时 `includes` 仍命中
+  // （前缀包含）⇒ 改名静默逃逸（与 🟡-1 同族）。
+  const hasIdent = (hay, name) => hay.split(/[^A-Za-z0-9_.]+/).includes(name);
+  for (const file of ['docs/ADAPTER_GUIDE.md', 'docs/INDEX.md', 'docs/ARCHITECTURE.md']) {
+    const text = readFileSync(path.join(ROOT, file), 'utf8');
+    const declared = /另有\s*(\d+)\s*项条件检查/.exec(text);
+    if (!declared) { bad(`${file} 声明「另有 N 项条件检查」`, '未找到该声明（声明本身是必需项）'); continue; }
+    eq(`${file} 的「另有 N 项条件检查」N = CONDITIONAL_PROBE_CHECKS.length`, String(N), declared[1]);
+    const missing = CONDITIONAL_PROBE_CHECKS.filter((name) => !hasIdent(text, name));
+    eq(`${file} 条件检查表覆盖全部条件项（名单取自唯一事实源）`, JSON.stringify([]), JSON.stringify(missing));
+  }
+  // README 用另一种写法（「17 项探针（+N 条件项）」）——同样必须与唯一事实源一致，且不得静默漂移。
+  {
+    const readme = readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+    const m = /\+(\d+)\s*条件项/.exec(readme);
+    if (!m) bad('README 声明「+N 条件项」', '未找到该声明（声明本身是必需项）');
+    else eq('README 的「+N 条件项」N = CONDITIONAL_PROBE_CHECKS.length', String(N), m[1]);
+  }
+  // 守卫自证：N 改字即红（把两份文档的 N 改掉，断言必须不成立）
+  const idxText = readFileSync(path.join(ROOT, 'docs/INDEX.md'), 'utf8');
+  const mutated = idxText.replace(/另有\s*\d+\s*项条件检查/, `另有 ${N + 1} 项条件检查`);
+  eq('🟡-4 守卫自证：N 被改字即红', false, /另有\s*(\d+)\s*项条件检查/.exec(mutated)?.[1] === String(N));
+  // 守卫自证：条件项名单被删一项即红。
+  //
+  // ⚠️ 纪律（本轮实测发现的**守卫自身缺陷**）：自证必须把变异作用在**条件检查表**这一段落上，
+  // 不能对整份文档做 `text.replace(dropped, ...)` —— 条件检查名可能**同时**出现在别处
+  // （如 INDEX.md 的「负例插件」索引行里也写了 `plugin.abnormal_termination`），
+  // 于是「删掉一条」的变异只改了第一处、`includes()` 仍然命中 → **自证断言空转**（实测逃逸）。
+  // 修法：先把条件检查表段落切出来（自「另有 N 项条件检查」起，到下一个空行后的引用块止），
+  // 变异与断言都在**该段落内**做——与「文档即防线」的口径一致（守的是那张表，不是全文）。
+  const tableOf = (text) => {
+    const start = text.search(/另有\s*\d+\s*项条件检查/);
+    if (start < 0) return '';
+    // 标题行与表之间可能隔一个空行 → 先定位**表头行**（`| 条件检查 |`），再取到其后第一个空行。
+    const lines = text.slice(start).split('\n');
+    const head = lines.findIndex((line) => /^\|\s*条件检查\s*\|/.test(line));
+    if (head < 0) return '';
+    const end = lines.findIndex((line, i) => i > head && line.trim() === '');
+    return lines.slice(head, end < 0 ? undefined : end).join('\n');
+  };
+  const idxTable = tableOf(idxText);
+  eq('🟡-4 守卫自证：条件检查表段落可定位（段落锚点改名即红）', true, idxTable.includes('| 条件检查 |'));
+  const dropped = CONDITIONAL_PROBE_CHECKS[CONDITIONAL_PROBE_CHECKS.length - 1];
+  const mutatedTable = idxTable.replace(dropped, '`some_other_check`');
+  const missingInMutated = CONDITIONAL_PROBE_CHECKS.filter((name) => !mutatedTable.includes(name));
+  eq('🟡-4 守卫自证：条件检查表内缺一项即红', JSON.stringify([dropped]), JSON.stringify(missingInMutated));
+  eq('🟡-4 守卫自证：未变异的表不缺项（反证断言非空转）', JSON.stringify([]),
+    JSON.stringify(CONDITIONAL_PROBE_CHECKS.filter((name) => !idxTable.includes(name))));
+  // 反证（把「为什么必须按段落变异」写成断言，防后人改回整份文档 replace）：
+  // 整份文档 replace 只改到**第一处**；若同一 check 名在别处（如索引行）也出现，
+  // `includes()` 仍命中 → 旧自证**空转**（这正是上一版实测逃逸的形态）。
+  // ⚠️ 反证必须**自造**一个「名字出现两次」的文本，不能依赖当前文档恰好如此——
+  // 否则文档一改（如新增一行索引）反证就自己变红/变绿，成为新的漂移源。
+  {
+    // 造一段「名字出现两次」的文本：条件检查表里一次 + 别处索引行一次。
+    const synthetic = [
+      '**另有 1 项条件检查**：',
+      '',
+      '| 条件检查 | 出口 |',
+      '|---|---|',
+      `| \`${dropped}\` | ⑤ |`,
+      '',
+      `另见索引：\`${dropped}\``,
+      '',
+    ].join('\n');
+    eq('🟡-4 反证：自造文本可被段落切出（否则下面的反证空转）', true, tableOf(synthetic).includes(dropped));
+    const wholeReplace = synthetic.replace(dropped, '`some_other_check`');
+    const tableOnly = tableOf(synthetic).replace(dropped, '`some_other_check`');
+    eq('🟡-4 反证：整份文档 replace 只改第一处 → 仍命中（旧自证空转）', true, wholeReplace.includes(dropped));
+    eq('🟡-4 反证：按段落变异则真的丢掉该项（新自证有效）', false, tableOnly.includes(dropped));
+  }
+  // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷）
+  // 唯一事实源的 JSDoc 不得再写死 N（评审 🟡-4 的原始缺陷：JSDoc 写「1 项」、文档写「2 项」）。
+  // 只判**代码**视图：JSDoc 里为了说明历史而引用「另有 1 项条件检查」这句原文不算违规
+  // （否则守卫会因文档而红，逼人把历史说明删掉——那正是「文档即防线」要保留的东西）。
+  const contractSrc = readFileSync(path.join(ROOT, 'src/harness/contract.mjs'), 'utf8');
+  eq('🟡-4：contract.mjs 的条件项 JSDoc 不再写死 N（改由本守卫反推）', false,
+    /另有\s*\d+\s*项条件检查/.test(codeOnly(contractSrc)));
+}
+
 // ---- 2b''. CHANGELOG 对防线编号的自述必须可检索到真实断言（复测 🟡P2-新-3） ----
 // 为什么补：v0.1.5 曾自述「[2b] 守住 INDEX 标题/顺序」，但当时 [2b] 只守顺序、不守标题结构——
 // 即**自述超前于落地**。这里做机器可检：CHANGELOG 里点名的防线编号（[7b] / [2b] / [2b'] / [2c] 等）
@@ -165,6 +260,10 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
     '[2b]': expSrc,
     '[2c]': expSrc,
     '[13]': offlineSrc,
+    // v0.1.7 新增防线：漂移相关性表唯一事实源（离线）与 triage 影响面（离线）
+    '[7c]': attrSrc,
+    '[9]': attrSrc,
+    '[14]': offlineSrc,
   };
   const claimed = new Set();
   // 只扫「回归防线」列与「防线编号」提及，避免把正文里对其他编号的引用算成自述
@@ -175,6 +274,7 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
   eq('CHANGELOG 自述的防线编号均可在对应测试文件检索到', [], missing);
   ok('CHANGELOG 防线编号自述扫描完成', `已声明 ${claimed.size} 类，未登记 ${unknown.length} 类`);
 }
+
 
 // ---- 2c. 文档自述版本 = package.json 版本（防「文档说 vX，实际是 vY」） ----
 console.log('  [2c] 文档头部版本与 package.json 一致');

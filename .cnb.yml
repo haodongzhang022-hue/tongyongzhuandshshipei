@@ -66,6 +66,23 @@ main:
             # 漂移窗口 + 插件声明保留名 → 仍 PLUGIN_REGRESSION（🔴-C 原始复现）；
             # hub 路径含 npm 不得翻案（🔴-A / 🔴-B 原始复现场景）
             node tests/test_e2e_regression.mjs
+        - name: plugin-error-not-host-signal
+          script: |
+            # 🔴-D / 🔴 必修-2/3 闸门：插件侧错误**不得**进判据字段 hostFatal[]。
+            # ⚠️ 口径前提（v0.1.9b 收窄，评审复评 H1）：以「探针进程内防线未被插件干预」为前提——
+            #    插件可 setUncaughtExceptionCaptureCallback() 静音防线（放行级假绿），见 docs/RISKS.md R22/R23。
+            # 四条出口（同步 / 异步 / 进程 exit / run() 被拖住）+ 不可捕获边界（SIGKILL）
+            # + 侧信道（🆕 nonce：伪造 __DSH_PROBE__ 绿卡 → 判 plugin.probe_result_forged）
+            # + **防过度修正**（健康插件仍须 17/17 GREEN）。
+            # 断言口径（🟡-3）：逐夹具断言**完整失败项集合**（多一条噪音失败也红），
+            # 不再只断「含期望项」——后者会静默放行夹具退化出的额外失败。
+            #
+            # 口径与夹具清单的唯一事实源是 tests/gate_plugin_side.sh —— push 段与 PR 段
+            # **共用同一份**（评审 🟢 重复项：此前两段各自维护，54 行差异 ⇒ 迟早一处加了
+            # 夹具、另一处忘了，闸门静默失效）。
+            #
+            # 出口④ 的回归加速：宿主侧**缩短**看门狗窗口（探针只许缩短、不许延长）。
+            DSH_PROBE_RUN_WATCHDOG_MS=5000 bash tests/gate_plugin_side.sh
     - name: upstream-watch
       docker:
         image: node:22
@@ -116,9 +133,11 @@ main:
           script: |
             # 归因端到端回归（含 🔴-C 漂移窗口不吞插件硬违规）
             node tests/test_e2e_regression.mjs
-        - name: attribution-e2e
+        - name: plugin-error-not-host-signal
           script: |
-            node tests/test_e2e_regression.mjs
+            # 🔴-D / 🔴 必修-2/3 闸门（同 push 段，**同一份脚本**）：
+            # 四条出口 + 不可捕获边界 + 🆕 侧信道（nonce 伪造）+ 完整失败项集合 + 防过度修正（健康插件 17/17）。
+            DSH_PROBE_RUN_WATCHDOG_MS=5000 bash tests/gate_plugin_side.sh
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
     - name: upstream-drift-scan
@@ -127,7 +146,10 @@ main:
       stages:
         - name: watch
           script: |
-            node src/cli.mjs watch --json ./.ci/watch.json
+            # 上游漂移侦测 + **自动归因影响面**：把「有没有漂移」推到
+            # 「漂移到哪（契约字段）→ 影响哪些检查 → 中台改哪一处 → 插件要不要动」。
+            # 退出码 1 = 有漂移（版本或契约），显式可见；不阻断（漂移是信号，不是错误）。
+            node src/cli.mjs watch --json ./.ci/watch.json --markdown
         - name: legacy-weekly
           script: |
             # 历史线周检：仅周日跑 legacy 全量验收，避免每日消耗
@@ -169,5 +191,6 @@ $:
       stages:
         - name: watch
           script: |
-            node src/cli.mjs watch --json ./.ci/watch.json
-            cat ./.ci/watch.json
+            # 页面按钮「上游漂移侦测」：先打人类视图（影响面 + 改哪一处），再留机器可读 JSON
+            node src/cli.mjs watch --json ./.ci/watch.json --markdown || true
+            node -e 'const r=require("./.ci/watch.json");console.log(JSON.stringify({hasDrift:r.triage.hasDrift,hubFiles:r.triage.hubFiles,plugins:r.triage.plugins},null,2))'

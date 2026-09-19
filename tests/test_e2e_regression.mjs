@@ -19,6 +19,28 @@
  *    `PLUGIN_REGRESSION`（判据只读结构化 `hostFatal[]`，不扫插件侧 stack/路径文本）。
  * 8. **真宿主侧致命信号**（离线缺缓存）→ 期望 `UPSTREAM_DRIFT` 且 `hostFatal` 非空
  *    （收窄判据不得丢掉真漂移）。
+ * 9. **🔴-D（插件侧异常不得进判据字段）**：插件写错代码（未初始化类字段 / 抛错 getter）时，
+ *    探针读插件侧数据（`tools.schemas()` / `definitions.map()`）会抛错——该异常必须落**插件侧 check**，
+ *    归因 `PLUGIN_REGRESSION`/RED，且 `hostFatal[]` **必须为空**（历史缺陷：落进 `hostFatal[]` →
+ *    误判 `UPSTREAM_DRIFT`/AMBER，把插件 bug 甩给上游并盖掉插件侧已失败的 check）。
+ * 9b. **🔴-D 同族活口（插件侧*异步*异常）**：插件在 `apply()` 里排后台任务（`queueMicrotask` 抛错 /
+ *    `Promise.reject` 无人处理）——异常**不在** `run()` 调用栈上，顶层 `catch` 接不到。
+ *    历史缺陷：探针在写出 `__DSH_PROBE__` 前被 Node 杀掉 → 装配器看到「探针未输出结构化结果」
+ *    → 无条件 `pushHostFatal()` → `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**（整份报告消失）。
+ *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.async_uncaught_exception`、
+ *    `checks` 非空且已跑完的检查全在（报告不丢）、`probePhase = plugin-integration`。
+ * 9c. **🔴 必修-2/3（进程 exit 出口 / `run()` 被拖住）**：插件在 `apply()` 里调 `process.exit(0)`，
+ *    或返回一个**永不 resolve** 的 Promise——前者不抛异常（`catch` 与 `uncaughtException` 都接不到），
+ *    后者既无异常也无退出。历史缺陷：探针在写出结构化结果前消失 → `UPSTREAM_DRIFT`/AMBER + `checks` 归零；
+ *    更糟的是「顺手加个 exit 钩子但**不带完成位**」→ 剩余检查是 `skip` 不是 `fail` → **假绿**。
+ *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、失败项 `plugin.early_exit` /
+ *    `plugin.run_incomplete`、`runCompleted = false`（**未跑完绝不给 ok**）、已跑完的 pass 项保留。
+ * 9e. **🔴 必修-4（同族放行级假绿）**：插件猴子补丁 `JSON.stringify` 把失败项改成 pass、清空
+ *    `errors` / `hostFatal`、把 `ok` 置真 ⇒ 报告字节被替换（nonce 前缀照样匹配）。收口 =
+ *    探针**加载期捕获引用**（修法 A）+ 装配器**退出码交叉**（修法 B，`plugin.exit_code_mismatch`）。
+ *    现在必须：`PLUGIN_REGRESSION`/RED、`hostFatal = []`、真缺陷 `registry.exact` 仍被判出。
+ * 9d. **不可捕获终止（SIGKILL）**：探针来不及写报告，装配器按**相位信标**归因 →
+ *    `plugin.abnormal_termination`（插件侧）/ `hostFatal = []`；无信标则仍走 `hostFatal[]`（真漂移不丢）。
  *
  * 用法：`node tests/test_e2e_regression.mjs [--cache-dir <dir>] [--channel stable]`
  * 退出码：0 = 全绿；1 = 有失败；2 = 环境不具备（无宿主缓存且未联网）→ 显式跳过，不假装通过。
@@ -28,9 +50,11 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, write
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { channelFingerprint, loadChannels } from '../src/harness/host.mjs';
+import { channelFingerprint, loadChannels, runHostProbe } from '../src/harness/host.mjs';
 // P2-8：插件侧 check 名单**从唯一事实源 import**（此前硬编码 12 项，表一改测试就不设防）
 import { PLUGIN_SIDE_CHECKS } from '../src/harness/contract.mjs';
+import { attributeFailure } from '../src/verify/runner.mjs';
+import { buildSecondary } from '../src/report/secondary.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -123,7 +147,9 @@ function verify(pluginPath, tools, { tmp = SOURCE_CACHE, channelName = CHANNEL, 
   try {
     execFileSync('node', [path.join(scratch, 'src', 'cli.mjs'), 'verify', '--channel', channelName, '--plugin', pluginPath, '--tools', tools, '--json', out, ...(offline ? ['--offline'] : [])], {
       cwd: scratch,
-      env: { ...process.env, TMPDIR: tmp },
+      // 出口④（run() 被拖住）的回归加速：宿主侧**缩短**看门狗窗口（探针只许缩短、不许延长）。
+      // 不设的话该夹具要等默认 20s——慢，但**不会**假绿（那才是要害）。
+      env: { ...process.env, TMPDIR: tmp, DSH_PROBE_RUN_WATCHDOG_MS: process.env.DSH_PROBE_RUN_WATCHDOG_MS ?? '5000' },
       encoding: 'utf8',
       timeout: 600_000,
     });
@@ -230,6 +256,360 @@ try {
   eq('离线缺缓存（真宿主）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT', offlineReport.attribution);
   eq('离线缺缓存：结构化 hostFatal 非空（判据只读该字段）', true, (offlineReport.hostFatal ?? []).length > 0);
   eq('离线缺缓存：理由链指向 hostFatal 字段', true, (offlineReport.attributionReasons ?? []).some((r) => r.includes('hostFatal')));
+  // ---- 11. 🔴-D：插件侧异常（未初始化字段 / 抛错 getter）不得进 hostFatal[] ----
+  console.log('  [8] 🔴-D：插件写错代码 → 必须判插件且 hostFatal 为空');
+  for (const [label, fixture, failedCheck] of [
+    ['插件 definitions 抛错 getter → PLUGIN_REGRESSION', 'plugin-side-throw-plugin.mjs', 'guard.reserved_rejected'],
+    ['插件注册项 getter 抛错 → PLUGIN_REGRESSION', 'plugin-registry-throw-plugin.mjs', 'registry.exact'],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    // 核心不变量（🔴-D，v0.1.9b 口径收窄）：**在探针进程内防线未被插件干预的前提下**，插件侧错误不进 hostFatal[]
+    // （绝对口径「永不进」已被评审复评 H1 推翻：见 docs/RISKS.md R22/R23）
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    // 失败项必须是插件侧 check（不得是宿主侧）
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    const hostSide = new Set(['host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed']);
+    eq(`${label}（失败项无宿主侧 check）`, 0, failed.filter((n) => hostSide.has(n)).length);
+    eq(`${label}（失败项含 ${failedCheck}）`, true, failed.includes(failedCheck));
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack（夹具路径 / at 帧）
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+    eq(`${label}（hostFatal 不含 stack 帧 'at '）`, false, /\n\s*at /.test(fatalText));
+    // 插件侧 stack 仍应保留在**日志**里（可排障，只是不参与判据）
+    eq(`${label}（插件侧 stack 保留在 errors 日志中）`, true, (report.errors ?? []).some((e) => e.includes(fixture)));
+    // 相位随报告透出（排障看得见异常归属依据）
+    eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+  }
+
+  // ---- 11b. 🔴-D 同族活口：插件侧**异步**异常（后台任务抛错 / 预取 promise 拒绝） ----
+  console.log('  [8b] 🔴-D 异步活口：插件后台任务抛错 → 必须判插件、hostFatal 为空、报告不丢');
+  for (const [label, fixture] of [
+    ['后台微任务抛错（uncaughtException）', 'plugin-async-throw-plugin.mjs'],
+    ['预取 promise 拒绝（unhandledRejection）', 'plugin-async-reject-plugin.mjs'],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    // 核心不变量（🔴-D，v0.1.9b 口径收窄）：**在探针进程内防线未被插件干预的前提下**，插件侧错误不进 hostFatal[]
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    // 报告完整性：旧缺陷下 checks 归零（整份报告消失）——这是本条活口比同步版更狠的地方
+    const checks = report.checks ?? [];
+    eq(`${label}（checks 非空——整份报告不得消失）`, true, checks.length > 0);
+    eq(`${label}（已跑完的 pass 项全部保留，不只是失败项）`, true, checks.filter((c) => c.status === 'pass').length >= 10);
+    eq(`${label}（失败项含 plugin.async_uncaught_exception）`, true,
+      checks.some((c) => c.name === 'plugin.async_uncaught_exception' && c.status === 'fail'));
+    // 失败项必须全在插件侧表内（不得出现宿主侧 check 失败 → 否则归因会被判据 1 抢走）
+    const pluginSide = new Set(PLUGIN_SIDE_CHECKS);
+    const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（失败项全在插件侧，名单取自 PLUGIN_SIDE_CHECKS）`, true, failed.every((name) => pluginSide.has(name)));
+    eq(`${label}（无宿主侧 check 失败）`, 0,
+      failed.filter((n) => ['host.tools_ready', 'detect.flavor_known', 'contract.probe_disposed'].includes(n)).length);
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack（夹具路径 / at 帧）
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+    eq(`${label}（hostFatal 不含 stack 帧 'at '）`, false, /\n\s*at /.test(fatalText));
+    // 插件侧 stack 仍应保留在**日志**里（可排障，只是不参与判据）
+    eq(`${label}（插件侧 stack 保留在 errors 日志中）`, true, (report.errors ?? []).some((e) => e.includes(fixture)));
+    // 相位随报告透出（异常归属依据）
+    eq(`${label}（probePhase=plugin-integration）`, 'plugin-integration', report.probePhase);
+    // 确定性：同一夹具连跑两次，checks 形态一致（防「报告随抛错时机变化」）
+    const again = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    eq(`${label}（重跑结论一致：同一归因）`, report.attribution, again.attribution);
+    eq(`${label}（重跑报告形态一致：pass 数相同）`,
+      checks.filter((c) => c.status === 'pass').length, (again.checks ?? []).filter((c) => c.status === 'pass').length);
+  }
+
+  // ---- 11c. 🔴 必修-2/3：进程 exit 出口 / run() 被拖住 / 不可捕获终止（真宿主） ----
+  // 为什么必须真宿主也跑：离线回归台用的是**假宿主**（只模拟探针用到的那点宿主面），
+  // 而「插件在真 ToolRuntime 装配下 process.exit」与「真宿主下挂住」的时序可能不同。
+  // 放行判据（总师 §三⑤）：异步路径 + 进程 exit 路径均 `hostFatal=[]`，且健康插件仍 17/17。
+  console.log('  [8c] 🔴 必修-2/3：四条出口在真宿主下均判插件、hostFatal 为空、未跑完不得假绿');
+  for (const [label, fixture, expectedCheck, expectedCompleted, expectsPass] of [
+    ['进程 exit（apply 内 process.exit(0)）', 'plugin-exit-plugin.mjs', 'plugin.early_exit', false, true],
+    ['run() 被拖住（apply 返回永不 resolve 的 Promise）', 'plugin-hang-plugin.mjs', 'plugin.run_incomplete', false, true],
+    ['不可捕获终止（SIGKILL）', 'plugin-sigkill-plugin.mjs', 'plugin.abnormal_termination', false, false],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    const checks = report.checks ?? [];
+    const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，不放行）`, 'RED', report.summary?.verdict);
+    // 核心不变量（🔴-D，v0.1.9b 口径收窄）：**在探针进程内防线未被插件干预的前提下**，插件侧错误不进 hostFatal[]
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    eq(`${label}（失败项含 ${expectedCheck}）`, true, failed.includes(expectedCheck));
+    // 完成位（🔴 必修-1）：未跑完的运行**不得**判通过（假绿比 AMBER 更危险）
+    eq(`${label}（完成位 runCompleted=${expectedCompleted}）`, expectedCompleted, report.runCompleted);
+    eq(`${label}（未跑完不得判 GREEN/PASS）`, true, report.attribution !== 'PASS' && report.summary?.verdict !== 'GREEN');
+    // 失败项必须全在插件侧表内（不得出现宿主侧 check 失败 → 否则归因会被判据 1 抢走）
+    const pluginSide = new Set(PLUGIN_SIDE_CHECKS);
+    eq(`${label}（失败项全在插件侧，名单取自 PLUGIN_SIDE_CHECKS）`, true, failed.every((name) => pluginSide.has(name)));
+    // 报告完整性：**可捕获**出口必须保留已跑完的检查（历史缺陷下 checks 归零 = 整份报告消失）
+    eq(`${label}（已跑完的 pass 项保留——报告不丢）`, expectsPass, checks.some((c) => c.status === 'pass'));
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack（夹具路径 / at 帧）
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+    eq(`${label}（hostFatal 不含 stack 帧 'at '）`, false, /\n\s*at /.test(fatalText));
+  }
+  // 出口③ 的**假绿**反证（评审 🔴 必修-1 点名的实验）：同一夹具在「带完成位」的实现下必须 RED；
+  // 不带完成位时它会变 GREEN/checks=6 —— 这正是「用一个 HIGH 换一个 MEDIUM」的机制，
+  // 故这里额外断言「失败项存在」（不带完成位时失败项是 0 条，只有 skip）。
+  {
+    const exitReport = verify(path.join(ROOT, 'tests/fixtures', 'plugin-exit-plugin.mjs'), 'demo_echo');
+    const exitChecks = exitReport.checks ?? [];
+    eq('🔴 假绿反证：进程 exit 夹具**确实**产生了失败项（不是「只有 skip」的假绿形态）', true,
+      exitChecks.some((c) => c.status === 'fail'));
+    eq('🔴 假绿反证：进程 exit 夹具的 skip 项 > 0（未跑到的检查被如实标注，不是凭空消失）', true,
+      exitChecks.some((c) => c.status === 'skip'));
+  }
+
+
+  // ---- 11d. 🆕 nonce 带外通道（侧信道，真宿主）：伪造绿卡不得掩盖真缺陷 ----
+  // 为什么必须真宿主也跑：nonce 协议贯穿「宿主生成 → **stdin** 下发 → 探针带 nonce 输出 →
+  // 宿主只认带 nonce 行」四段，其中 stdin 下发**只有真宿主路径**会走到
+  // （离线回归台的假宿主自己拼 spawn 参数，可能掩盖协议拼装错误）。
+  console.log('  [8d] 🆕 侧信道：插件伪造 __DSH_PROBE__ 绿卡 → 判 plugin.probe_result_forged + 真缺陷仍被抓');
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-forged-result-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('伪造夹具（真宿主）：归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION', report.attribution);
+    eq('伪造夹具（真宿主）：verdict=RED（不放行）', 'RED', report.summary?.verdict);
+    eq('伪造夹具（真宿主）：hostFatal 为空（伪造者不得把责任甩给上游）', 0, (report.hostFatal ?? []).length);
+    eq('伪造夹具（真宿主）：失败项含 plugin.probe_result_forged（伪造被识别）', true, failed.includes('plugin.probe_result_forged'));
+    eq('伪造夹具（真宿主）：真实缺陷 registry.exact 仍被抓住（绿卡没掩盖它）', true, failed.includes('registry.exact'));
+    eq('伪造夹具（真宿主）：**不得**判 PASS/GREEN', true, report.attribution !== 'PASS' && report.summary?.verdict !== 'GREEN');
+  }
+
+  // ---- 11e. v0.1.9d 新增：R28 防线被顶替（真宿主） ----
+  // 为什么必须真宿主也跑：这两条的判据分别在**探针收尾自检**（R28）与**装配器解释输出**（R26）里，
+  // 而离线回归台用的是假宿主 + 同一个装配器实现——真宿主能覆盖「真 ToolRuntime 装配下的时机差异」
+  // （例如插件依赖在 import 期就动了 process 监听器）。两条都是**放行级假绿**，必须双跑。
+  console.log('  [8e] v0.1.9d：R28 防线被顶替（真宿主，放行级假绿收口）');
+  for (const [label, fixture, expectedCheck, expectedCompleted] of [
+    ['R28 防线被顶替（摘掉探针兜底 + 装自己的）', 'plugin-defense-tamper-plugin.mjs', 'plugin.process_defense_tampered', true],
+  ]) {
+    const report = verify(path.join(ROOT, 'tests/fixtures', fixture), 'demo_echo');
+    const checks = report.checks ?? [];
+    const failed = checks.filter((c) => c.status === 'fail').map((c) => c.name);
+    eq(`${label}（归因）`, 'PLUGIN_REGRESSION', report.attribution);
+    eq(`${label}（verdict=RED，**绝不放行**）`, 'RED', report.summary?.verdict);
+    eq(`${label}（失败项含 ${expectedCheck}）`, true, failed.includes(expectedCheck));
+    eq(`${label}（hostFatal 为空——插件侧错误不进判据字段）`, 0, (report.hostFatal ?? []).length);
+    eq(`${label}（完成位 runCompleted=${expectedCompleted}）`, expectedCompleted, report.runCompleted);
+    eq(`${label}（ok 不得为真——假绿防线）`, false, report.ok === true);
+    // R28 的关键性质：探针**确实跑完了**（它只是不知道防线被顶替）⇒ 完成位仍真、pass 项保留
+    if (expectedCheck === 'plugin.process_defense_tampered') {
+      eq(`${label}（探针确实跑完 ⇒ 已跑完的 pass 项保留）`, true, checks.some((c) => c.status === 'pass'));
+    }
+    // 不变量守卫：hostFatal[] 里不得出现插件侧 stack
+    const fatalText = (report.hostFatal ?? []).join('\n');
+    eq(`${label}（hostFatal 不含夹具路径）`, false, fatalText.includes(fixture));
+  }
+
+  // ---- 11f. R24：同步死循环 → 宿主**二次终止**（真宿主 + 有界 timeout） ----
+  // 为什么单列（评审复评 R24）：默认 `timeoutMs=600s` 下 3s 同步循环会正常跑完（那本身不是缺陷），
+  // 本形态只在**有界 timeout** 下成立 ⇒ 用 `runHostProbe({ timeoutMs: 1000 })` 直接断言：
+  // 收口时间、`probeExit.signal`、归因落点、`hostFatal` 为空。
+  // ---- 11g. 🔴 必修-4（真宿主）：猴子补丁 JSON.stringify 伪造绿卡 ----
+  // 为什么必须真宿主也跑：修法 A 的「加载期捕获」依赖**探针模块加载顺序**（捕获必须早于插件
+  // import / apply），而离线回归台用的是**同一个探针文件**但假宿主——真宿主能覆盖「真 ToolRuntime
+  // 装配下的时机差异」；修法 B（退出码交叉）依赖装配器**真的** spawn 子进程并读到退出码。
+  // 两条都是**放行级假绿**，必须双跑（离线 [9.13] + 本段）。
+  console.log('  [8g] 🔴 必修-4：猴子补丁 JSON.stringify 伪造绿卡（加载期捕获 + 退出码交叉，真宿主）');
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-stringify-tamper-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-4（真宿主）：归因 PLUGIN_REGRESSION（不甩锅上游）', 'PLUGIN_REGRESSION', report.attribution);
+    eq('🔴-4（真宿主）：verdict=RED（**绝不放行**）', 'RED', report.summary?.verdict);
+    eq('🔴-4（真宿主）：hostFatal 为空（插件侧错误不进判据字段）', 0, (report.hostFatal ?? []).length);
+    eq('🔴-4（真宿主）：真缺陷 registry.exact 仍被判失败（绿卡没掩盖它）', true, failed.includes('registry.exact'));
+    eq('🔴-4（真宿主）：ok 不得为真（假绿防线）', false, report.ok === true);
+    eq('🔴-4（真宿主）：探针退出实况被**无条件**记录（退出码 1 ⇒ 交叉校验可用）', 1, report.probeExit?.status ?? null);
+    eq('🔴-4（真宿主）：报告为真 ⇒ 不出现退出码矛盾（防线不误伤真报告）', false,
+      failed.includes('plugin.exit_code_mismatch'));
+  }
+
+  // ---- 11h. 🔴-R3′（真宿主）：结果通道重定向 + 压退出码 ⇒ 宿主侧通道观测交叉校验 ----
+  // 为什么必须真宿主也跑（评审复评 §3）：本形态的**三件套**（fd3 被换成文件 / 探针把真报告写进
+  // 文件 / 插件在 exit 钩子里读回凭据）全都依赖**真宿主路径**的 spawn 参数与 fd 布局——
+  // 离线台是假宿主，可能掩盖协议拼装错误。收口判据（宿主侧通道观测）也只有在真装配器
+  // （真的 spawn + 真的读管道）下才有意义。
+  console.log('  [8h] 🔴-R3′：结果通道重定向 + 压退出码（宿主侧通道观测，真宿主）');
+  {
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'demo_echo');
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3′（真宿主）：**不得** GREEN / PASS（旧实现下放行级假绿）', true,
+      report.summary?.verdict !== 'GREEN' && report.attribution !== 'PASS');
+    eq('🔴-R3′（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${report.attribution}|${report.summary?.verdict}`);
+    eq('🔴-R3′（真宿主）：失败项含 plugin.protocol_injection（通道被重定向）', true,
+      failed.includes('plugin.protocol_injection'));
+    eq('🔴-R3′（真宿主）：hostFatal 为空（插件侧错误不进判据字段）', 0, (report.hostFatal ?? []).length);
+    eq('🔴-R3′（真宿主）：完成位 false（不采信任何一条 ⇒ 未跑完）', false, report.runCompleted);
+    eq('🔴-R3′（真宿主）：ok 不得为真（假绿防线）', false, report.ok === true);
+    eq('🔴-R3′（真宿主）：插件压掉的退出码确实为 0（⇒ 退出码交叉不再是唯一兜底）', 0, report.probeExit?.status ?? null);
+    eq('🔴-R3′（真宿主）：报告不可信 ⇒ 真缺陷 registry.exact 不采信（整轮丢弃，不误报为通过）', false,
+      failed.includes('registry.exact') && report.ok === true);
+    // 反向护栏：健康插件在同一次运行里仍 17/17（防过度修正）
+    const healthy = verify(path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('🔴-R3′ 反向护栏（真宿主）：健康插件仍 PASS / 17 项全绿 / 未降级', 'PASS|17|false',
+      `${healthy.attribution}|${(healthy.checks ?? []).length}|${healthy.resultChannelDegraded}`);
+  }
+
+  // ---- 11i. 🔴-R3 附带（评审「下一步要求 ③」）：**自报降级 ⇒ 甩锅上游**（真宿主） ----
+  // 为什么必须真宿主也跑：判据依赖**宿主侧 fd3 能力实测**（`probeFd3Capability()` 真的起子进程），
+  // 而离线回归台是假宿主 —— 真宿主能覆盖「真实 spawn 环境下的能力探测结果」这条前提。
+  console.log('  [8i] 🔴-R3 附带：自报降级甩锅上游（宿主侧 fd3 能力实测，真宿主）');
+  {
+    process.env.DSH_CHANNEL_REDIRECT_MODE = 'degrade-claim';
+    const report = verify(path.join(ROOT, 'tests/fixtures', 'plugin-channel-redirect-plugin.mjs'), 'demo_echo');
+    delete process.env.DSH_CHANNEL_REDIRECT_MODE;
+    const failed = (report.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3③（真宿主）：归因**不得** UPSTREAM_DRIFT（插件 tamper 不甩给上游）', 'PLUGIN_REGRESSION', report.attribution);
+    eq('🔴-R3③（真宿主）：verdict=RED（不放行）', 'RED', report.summary?.verdict);
+    eq('🔴-R3③（真宿主）：hostFatal 为空（自报降级不得落环境/上游信号）', 0, (report.hostFatal ?? []).length);
+    eq('🔴-R3③（真宿主）：判 plugin.protocol_injection（自报与宿主实测矛盾）', true,
+      failed.includes('plugin.protocol_injection'));
+    eq('🔴-R3③（真宿主）：完成位 false + ok 不得为真', 'false|false', `${report.runCompleted}|${report.ok === true}`);
+    // 报告层：降级的两种成因必须分开说（否则人会把「插件篡改」读成「环境限制」）
+    const secondary = buildSecondary({
+      generatedAt: 'T',
+      plugin: 'p',
+      channels: [report],
+      summary: { total: 1, passed: 0, failed: 1, upstreamDrift: [], pluginRegression: [report.channel], unknown: [], verdict: report.summary?.verdict ?? 'RED' },
+    });
+    // ⚠️ 不能只看 `risks[0]`：本形态同时命中「通道被重定向」与「自报降级」两条风险
+    // （🔴-R3 并集后 `resultChannel=fd3-redirected` 会**先**落一条 HIGH）⇒ 必须按**内容**查找，
+    // 否则断言会随风险排序漂移（假红/假绿都可能）。
+    const degradeRisk = (secondary.risks ?? []).find((r) => (r.description ?? '').includes('自报与事实矛盾'));
+    eq('🔴-R3③（真宿主·报告层）：自报降级 ⇒ 有风险描述点明「自报与事实矛盾」', true, Boolean(degradeRisk));
+    eq('🔴-R3③（真宿主·报告层）：规避动作指向**插件侧**（不是「修环境」）', true,
+      (degradeRisk?.mitigation ?? '').includes('插件侧'));
+  }
+
+  console.log('  [8f] R24：同步死循环（宿主二次终止 SIGKILL + 相位信标归因，真宿主）');
+  {
+    const registry = loadChannels(ROOT);
+    const started = Date.now();
+    const probe = runHostProbe({
+      channelName: CHANNEL,
+      channel: registry.channels[CHANNEL],
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'plugin-sync-loop-plugin.mjs'),
+      expectedTools: ['demo_echo'],
+      hubRoot: ROOT,
+      timeoutMs: 1000,
+    });
+    const elapsed = Date.now() - started;
+    const failed = (probe.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('R24（真宿主）：probeExit.signal = SIGKILL（SIGTERM 会被探针出口③ 处理器吞掉）', 'SIGKILL', probe.probeExit?.signal ?? null);
+    eq('R24（真宿主）：收口时间 < timeoutMs × 3（不得挂死 / 不得吃满额度）', true, elapsed < 1000 * 3);
+    eq('R24（真宿主）：落插件侧 plugin.abnormal_termination（相位信标）', true,
+      failed.includes('plugin.abnormal_termination'));
+    eq('R24（真宿主）：hostFatal 为空（有信标 ⇒ 不甩锅上游）', 0, (probe.hostFatal ?? []).length);
+    eq('R24（真宿主）：完成位 false（未跑完不得判通过）', false, probe.runCompleted);
+    eq('R24（真宿主）：归因 PLUGIN_REGRESSION', 'PLUGIN_REGRESSION',
+      attributeFailure(probe, registry.channels[CHANNEL], CHANNEL));
+    // 反向护栏：同一 timeoutMs 下健康插件仍 17/17（防「把 timeout 调小」式过度修正）
+    const healthy = runHostProbe({
+      channelName: CHANNEL,
+      channel: registry.channels[CHANNEL],
+      pluginPath: path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'),
+      expectedTools: ['demo_echo', 'demo_status'],
+      hubRoot: ROOT,
+      timeoutMs: 1000,
+    });
+    eq('R24 反向护栏（真宿主）：同一 timeoutMs 下健康插件仍 17/17 全绿', 17,
+      (healthy.checks ?? []).filter((c) => c.status === 'pass').length);
+    eq('R24 反向护栏（真宿主）：健康插件 hostFatal 为空 + 跑完', '0|true',
+      `${(healthy.hostFatal ?? []).length}|${healthy.runCompleted}`);
+  }
+
+  // ---- 11g. 🆕 §3 反例固化（真宿主；复评裁定 ④）+ 批 1.5 通道可见化 ----
+  // 为什么必须真宿主也跑：反例的三条证据链（反读 nonce / 写 fd3 / 摘 exit 钩子 + 抢跑退出）
+  // 全都依赖**真宿主路径**的 spawn 参数与 fd 布局——离线台是假宿主，可能掩盖协议拼装错误。
+  console.log('  [8g] 🆕 §3 反例固化（真宿主，期望**不得** GREEN）+ 通道可见化');
+  {
+    const poc = verify(path.join(ROOT, 'tests/fixtures', 'plugin-host-tamper-poc-plugin.mjs'), 'demo_echo');
+    const pocFailed = (poc.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('§3 反例（真宿主）：**不得** GREEN / PASS（原始 PoC 曾判 GREEN 放行）', true,
+      poc.summary?.verdict !== 'GREEN' && poc.attribution !== 'PASS');
+    eq('§3 反例（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${poc.attribution}|${poc.summary?.verdict}`);
+    eq('§3 反例（真宿主）：hostFatal 为空（插件侧错误不进判据字段）', 0, (poc.hostFatal ?? []).length);
+    eq('§3 反例（真宿主）：伪造被识别（plugin.probe_result_forged）', true,
+      pocFailed.includes('plugin.probe_result_forged'));
+    eq('§3 反例（真宿主）：抢跑退出被归因插件侧（plugin.abnormal_termination）', true,
+      pocFailed.includes('plugin.abnormal_termination'));
+    eq('§3 反例（真宿主）：完成位 false（未跑完不得判通过）', false, poc.runCompleted);
+
+    // 批 1.5 第 8 项（真宿主）：**只摘出口③ 的 exit 钩子**（其余健康）→ 必须判出（原先不可判定）
+    const hook = verify(path.join(ROOT, 'tests/fixtures', 'plugin-exit-hook-tamper-plugin.mjs'), 'demo_echo');
+    const hookFailed = (hook.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('批 1.5 出口钩子（真宿主）：只摘 exit 钩子 → 判 plugin.process_defense_tampered', true,
+      hookFailed.includes('plugin.process_defense_tampered'));
+    eq('批 1.5 出口钩子（真宿主）：归因插件侧 / RED / hostFatal 为空 / 完成位 true（探针跑完了）', 'PLUGIN_REGRESSION|RED|0|true',
+      `${hook.attribution}|${hook.summary?.verdict}|${(hook.hostFatal ?? []).length}|${hook.runCompleted}`);
+
+    // 批 1.5 通道可见化（真宿主）：正常路径 resultChannel=fd3 且不降级
+    const healthyChannel = verify(path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('批 1.5 通道可见化（真宿主）：正常路径 resultChannel=fd3', 'fd3', healthyChannel.resultChannel);
+    eq('批 1.5 通道可见化（真宿主）：正常路径未降级 + 归因 PASS', 'false|PASS',
+      `${healthyChannel.resultChannelDegraded}|${healthyChannel.attribution}`);
+
+    // 🔴-R3′（v0.2.5，真宿主）：插件把 fd3 **换成自己的文件** ⇒ 探针把真报告写进插件文件 ⇒
+    // 插件读出凭据后伪造绿卡 + **压 process.exitCode=0**。旧实现判 GREEN 放行；现在必须 RED。
+    // 为什么必须真宿主也跑：fd 号复用（`closeSync(3)` + `openSync` 拿到 3）依赖**真 spawn 的 fd 布局**，
+    // 假宿主（离线台）自己拼 stdio，可能掩盖真实行为。
+    const fd3Redirect = verify(path.join(ROOT, 'tests/fixtures', 'plugin-fd3-redirect-plugin.mjs'), 'demo_echo');
+    const fd3Failed = (fd3Redirect.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3′（真宿主）：**不得** GREEN / PASS（旧实现此处放行）', true,
+      fd3Redirect.summary?.verdict !== 'GREEN' && fd3Redirect.attribution !== 'PASS');
+    eq('🔴-R3′（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${fd3Redirect.attribution}|${fd3Redirect.summary?.verdict}`);
+    eq('🔴-R3′（真宿主）：失败项含 plugin.protocol_injection（判据 D，依据宿主侧对 fd3 的实际观测）', true,
+      fd3Failed.includes('plugin.protocol_injection'));
+    eq('🔴-R3′（真宿主）：hostFatal 为空 + 完成位 false（插件侧 / 不放行）', '0|false',
+      `${(fd3Redirect.hostFatal ?? []).length}|${fd3Redirect.runCompleted}`);
+  }
+
+  // ---- 11i. 🔴-R3 §三（真宿主）：**自报降级**甩锅上游 + 形态可见化 ----
+  // 与 [8h]（R3′ 重定向 + 压退出码）**同一根因的两个出口**，但**判据分支不同**：
+  // [8h] 走「宿主侧观测 vs 自称 fd3 矛盾」；本段走**降级分支**（自称 `stdout-degraded`）
+  // 与**形态可见化**（`fd3-redirected` + 二级信息）。两条各自独立可回退即红（见 [9.14] 变异自证）。
+  console.log('  [8i] 🔴-R3 §三：自报降级甩锅上游 + 形态可见化（真宿主）');
+  {
+    // §三 同源形态：同一手法把伪造报告标成 `stdout-degraded` + 删掉早探测快照 + 伪造 `hostFatal[]`。
+    // 收口前实测 **AMBER / UPSTREAM_DRIFT**（把「插件关掉通道」讲成「环境没有 fd3」，甩锅上游）。
+    const degrade = verify(path.join(ROOT, 'tests/fixtures', 'plugin-channel-degrade-forge-plugin.mjs'), 'demo_echo');
+    const degradeFailed = (degrade.checks ?? []).filter((c) => c.status === 'fail').map((c) => c.name);
+    eq('🔴-R3 §三（真宿主）：**不得** AMBER / UPSTREAM_DRIFT（收口前实测甩锅上游）', true,
+      degrade.summary?.verdict !== 'AMBER' && degrade.attribution !== 'UPSTREAM_DRIFT');
+    eq('🔴-R3 §三（真宿主）：归因 PLUGIN_REGRESSION + verdict=RED', 'PLUGIN_REGRESSION|RED',
+      `${degrade.attribution}|${degrade.summary?.verdict}`);
+    eq('🔴-R3 §三（真宿主）：失败项恰为 plugin.protocol_injection（不采信任何一条）',
+      'plugin.protocol_injection', degradeFailed.join(','));
+    eq('🔴-R3 §三（真宿主）：伪造的 hostFatal[] 被丢弃（hostFatal 为空）', 0, (degrade.hostFatal ?? []).length);
+    eq('🔴-R3 §三（真宿主）：完成位 false + ok 不得为真', 'false|false',
+      `${degrade.runCompleted}|${degrade.ok === true}`);
+    eq('🔴-R3 §三（真宿主）：通道形态可见化为 fd3-redirected（宿主侧观测结论，非探针自报）',
+      'fd3-redirected', degrade.resultChannel);
+    eq('🔴-R3 §三（真宿主）：**不得**标成降级（降级 = 宿主没给 fd3，两者归因不同）', false,
+      degrade.resultChannelDegraded === true);
+    // 反向护栏：健康插件在同一次运行里仍 17/17 + 通道形态仍是 `fd3`（防过度修正）
+    const healthyChannel = verify(path.join(ROOT, 'tests/fixtures', 'demo-plugin.mjs'), 'demo_echo,demo_status');
+    eq('🔴-R3 §三 反向护栏（真宿主）：健康插件仍 PASS / 17 项 / resultChannel=fd3 / 未降级', 'PASS|17|fd3|false',
+      `${healthyChannel.attribution}|${(healthyChannel.checks ?? []).length}|${healthyChannel.resultChannel}|${healthyChannel.resultChannelDegraded}`);
+  }
+
+  // ---- 12. 🔴-D 反向护栏：宿主装配相位异常仍须判漂移 ----
+  console.log('  [9] 🔴-D 反向：宿主侧异常仍判漂移（收窄写入端不丢真漂移）');
+  {
+    const offline = verify(path.join(ROOT, 'tests/fixtures/demo-plugin.mjs'), 'demo_echo,demo_status', { tmp: path.join(work, 'empty-tmp-2'), offline: true });
+    eq('离线缺缓存（宿主装配相位）→ UPSTREAM_DRIFT', 'UPSTREAM_DRIFT', offline.attribution);
+    eq('离线缺缓存 → hostFatal 非空（宿主侧信号照写）', true, (offline.hostFatal ?? []).length > 0);
+    eq('离线缺缓存 → probePhase=host-assembly（未进插件集成段）', 'host-assembly', offline.probePhase);
+  }
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

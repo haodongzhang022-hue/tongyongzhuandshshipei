@@ -2,7 +2,9 @@
 
 > Issue: #1「dsh适配的通用改造的架构」
 > 角色：架构·总师 ｜ 状态：**CP1 已自验通过，待 CP2 人批准进入推广**
-> 版本：`dsh-adapt-hub v0.1.5`（module `adapt-hub`，文档收口：归因判据表对齐唯一事实源 + 判据表守卫）
+> 版本：`dsh-adapt-hub v0.2.8`（module `adapt-hub`；**v0.2.8（并集）**：本线 = 评审 §三 **4.2** —— 结果行**不回显 nonce**，改**正文绑定**逐行认证标签 `HMAC-SHA256(nonce, 正文)`（凭据**不可迁移**）+ 判据增补「stdout 无一条凭据有效」路径 + **双回退自证**；并行线 = 复评 **🟡-1/🟡-2/🟡-4** 防线化（`killSignal` **逐站点**源码守卫 / `[17]` 数值断言空值假绿收口 / 🔴-5 跨产物扫描扩面）；**归因更正**：nonce 保密性**不是唯一防线**。v0.2.7：**v0.2.7：🔴-R3′ 4.2 并入（凭据不可迁移）**——结果行**不再回显 nonce**，改为**正文绑定**的逐行认证标签 `HMAC-SHA256(nonce, 正文)`（宿主用自己已知的 nonce 重算并逐字比对）⇒ 通道重定向形态下「偷到真报告」也**伪造不出新正文**；判据增补「stdout 上无一条结果行凭据有效」这条独立触发路径；**双回退自证**（只关判据仍 RED；判据 + 凭据一起退回才复现旧实现的 GREEN）⇒「两条腿都承重」。**归因更正**：nonce 保密性**不是唯一防线**。v0.2.6（🔴-R3，两条并行线**取并集**）**：① **主判据**（**宿主侧观测** `resultChannelProvided`，取自唯一事实源 `probeSpawnOptions().stdio[3] === 'pipe'`——**不依赖探针自报** ⇒ 覆盖「报告被整体改写 / 无 `resultChannel` 字段」的形态）；② **辅判据**（报告**自称**走 fd3 而宿主侧该通道无内容）；③ **能力实测分支**（宿主侧 fd3 能力独立实测 `probeFd3Capability()`，每进程记忆化 ⇒ 自报降级而实测可用 = 矛盾）；④ **宿主侧观测分支**（本次已给 fd3 管道却自报降级 = 矛盾）——③④ 收口 **§三 同源形态「自报降级 ⇒ 甩锅上游」**（收口前实测 `AMBER`/`UPSTREAM_DRIFT`）；⑤ 形态可见值 `RESULT_CHANNEL_FD3_REDIRECTED = 'fd3-redirected'`（**宿主侧观测结论**，与「降级」显式分开）；⑥ 协议注入三条判据收敛为**单一落点** `markProtocolInjection()`。夹具 `plugin-channel-redirect-plugin`（三形态）+ `plugin-channel-degrade-forge-plugin` **进闸门**。v0.2.5：🔴-R3′（报告**自称**判据 + 压退出码）；v0.2.4：R26 残留边界②（fail-open）登记 + 批 2 首要目标并入；v0.2.3：批 1.5 + 评审复评并集（可达性口径更正 + 通道可见化 + §3 反例固化 + exit 钩子台账 + 🔴-A 无 nonce 硬崩收口 R30 + 🔴 必修-4 同族假绿收口 R29）；v0.2.2：nonce 通道改 **stdin**；v0.2.1：信任边界写成显式前提 + 结构性重做一页方案；v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；批 2 在办**）
+
+> 版本：`dsh-adapt-hub v0.2.7`（module `adapt-hub`；**v0.2.7：评审复评 🟡-1/🟡-2/🟡-4 防线化**——① `killSignal` **逐站点**源码守卫（站点①`probeSpawnOptions` 返回对象 / 站点②npm `execFileSync` 本次选项，括号配平取实参列表 + 三条守卫自证；修「`[17]` 只守了替身」）；② `[17]` 数值断言先 `^[0-9]+$` 再比大小（修空值假绿）+ 三条守卫自证；③ 🔴-5 跨产物扫描**扩面**到 `tests/*.sh` / `tests/*.mjs` / `.cnb.yml` / `RISKS` / `ARCHITECTURE` / `README`，识别口径分两类（代码产物只认字符串字面量内容 + `stripComments`；文档产物认裸词并排除方法调用）+ 五条注入自证 + 三条反向护栏；**v0.2.6（🔴-R3，两条并行线**取并集**）**：① **主判据**（**宿主侧观测** `resultChannelProvided`，取自唯一事实源 `probeSpawnOptions().stdio[3] === 'pipe'`——**不依赖探针自报** ⇒ 覆盖「报告被整体改写 / 无 `resultChannel` 字段」的形态）；② **辅判据**（报告**自称**走 fd3 而宿主侧该通道无内容）；③ **能力实测分支**（宿主侧 fd3 能力独立实测 `probeFd3Capability()`，每进程记忆化 ⇒ 自报降级而实测可用 = 矛盾）；④ **宿主侧观测分支**（本次已给 fd3 管道却自报降级 = 矛盾）——③④ 收口 **§三 同源形态「自报降级 ⇒ 甩锅上游」**（收口前实测 `AMBER`/`UPSTREAM_DRIFT`）；⑤ 形态可见值 `RESULT_CHANNEL_FD3_REDIRECTED = 'fd3-redirected'`（**宿主侧观测结论**，与「降级」显式分开）；⑥ 协议注入三条判据收敛为**单一落点** `markProtocolInjection()`。夹具 `plugin-channel-redirect-plugin`（三形态）+ `plugin-channel-degrade-forge-plugin` **进闸门**。v0.2.5：🔴-R3′（报告**自称**判据 + 压退出码）；v0.2.4：R26 残留边界②（fail-open）登记 + 批 2 首要目标并入；v0.2.3：批 1.5 + 评审复评并集（可达性口径更正 + 通道可见化 + §3 反例固化 + exit 钩子台账 + 🔴-A 无 nonce 硬崩收口 R30 + 🔴 必修-4 同族假绿收口 R29）；v0.2.2：nonce 通道改 **stdin**；v0.2.1：信任边界写成显式前提 + 结构性重做一页方案；v0.2.0：R24 `killSignal:SIGKILL` 有界 + R26 协议注入（nonce + fd3）+ R28 防线自检；批 2 在办**）
 
 ---
 
@@ -27,7 +29,8 @@
 stable(0.1.5-rc.2)  ✅ 17/17 检查通过   flavor=modern
 dev   (0.1.6-alpha.2) ✅ 17/17 检查通过   flavor=modern
 legacy(0.1.1-rc.2)  ✅ 17/17 检查通过   flavor=legacy
-离线单测 66 项 + 归因离线回归 80 项 + 发布面自检 20 项 ✅   归因端到端回归 43 项 ✅   负例插件被正确拦下 ✅   上游侦测可用（基线防自毁）✅
+离线单测 212 项 + 归因离线回归 654 项 + 发布面自检 43 项 ✅   归因端到端回归 191 项 ✅   负例插件被正确拦下 ✅   上游侦测 + 影响面自动归因可用（基线防自毁）✅
+
 ```
 
 ---
@@ -186,17 +189,19 @@ tongyongzhuandshshipei/
 │   ├── detect/{index.mjs,flavor.mjs}  # 版本线探测（+ 导出面）
 │   ├── compat/{schema,tool}.mjs       # 契约兼容层
 │   ├── harness/{host.mjs,probe-template.mjs}  # 隔离真宿主装配 + 探针
-│   ├── verify/runner.mjs              # 双通道验收 + 归因
+│   ├── verify/runner.mjs              # 双通道验收 + 归因（漂移相关性表**不在此硬编码**）
+│   ├── triage/index.mjs               # ★ 上游漂移**自动归因影响面**（唯一事实源：DRIFT_IMPACT）
 │   ├── watch/upstream.mjs             # 上游侦测 + 契约 diff
 │   └── report/secondary.mjs           # 二级信息汇报
 ├── templates/adapter/                 # 新插件接入模板（拷贝即用）
 ├── tests/
-│   ├── test_offline.sh                # 66 项离线单测（无网可跑）
-│   ├── test_attribution.mjs           # 80 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b]）
-│   ├── test_e2e_regression.mjs        # 43 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C 复现，含 verdict 断言）
+│   ├── test_offline.sh                # 212 项离线单测（无网可跑；含 [13] verdict 优先级 / [14] 漂移相关性表唯一事实源 / [15] watch 影响面 / [16] 🔴 四条出口离线探针回归 + 🔴-A 无 nonce 不硬崩 / [17] 🔴-1 占死事件循环有界返回 / [18] nonce 侧信道 + v0.1.9d 三形态 / [19] 批 1.5 通道可见化+降级不放行+§3 反例+exit 台账 / [20] 🔴 必修-4 同族假绿 / [21] 🔴-R3′ 通道重定向 + 压退出码 + 🔴-R3③ 自报降级甩锅 / [22] 🔴-R3 宿主侧观测主判据 + §三 自报降级）
+│   ├── test_attribution.mjs           # 654 项归因离线回归（契约采集无残留 + 判据只读结构化字段 + 硬证据优先 + 🔴-D 相位路由 + 🔴 四条出口/完成位 [9.9] + §四 反向护栏 + ARCHITECTURE 判据表守卫 [7b] + 漂移表唯一事实源 [7c] + triage 影响面 [9] + [9.10]-[9.17] R28/R26/R24/🔴 必修-4/R26 残留② fail-open/🔴-R3′ 通道重定向/🔴-R3③ 自报降级甩锅/🔴-R3 宿主侧观测）
+│   ├── test_e2e_regression.mjs        # 191 项归因端到端回归（真宿主；🔴-A / 🔴-B / 🔴-C / 🔴-D + 🔴 必修-2/3 四条出口复现 + [8d]-[8i] 侧信道/R28/R26/R24/§3 反例/🔴 必修-4/🔴-R3′ 通道重定向/🔴-R3③ 自报降级甩锅，含 verdict 与完成位断言）
+
 │   ├── test_exports.mjs               # 发布面自检（exports 全解析 + 模板拷贝可用）
 │   ├── test_hub.sh                    # 双通道真宿主验收编排
-│   └── fixtures/{demo,broken}-plugin.mjs
+│   └── fixtures/{demo,broken,plugin-side-throw,plugin-registry-throw,plugin-async-throw,plugin-async-reject}-plugin.mjs
 └── docs/{ARCHITECTURE,ADAPTER_GUIDE,RISKS,INDEX}.md
 ```
 
@@ -230,7 +235,7 @@ export function apply(ctx) {
 |---|---|---|
 | `dsh-adapt matrix` | 0 | 打印通道矩阵 |
 | `dsh-adapt verify --channel stable\|dev\|legacy\|all` | 0 = GREEN；1 = 有失败；2 = 用法/参数错误 | 验收（`all` = stable+dev+legacy） |
-| `dsh-adapt watch` | 0 = 无漂移；1 = 有漂移；2 = 离线 | 上游侦测 |
+| `dsh-adapt watch [--json <out>] [--markdown] [--contract-from <verify-json>]` | 0 = 无漂移；1 = 有漂移（版本或契约）；2 = 离线 | 上游侦测 **+ 自动归因影响面**（`--markdown` 出人类视图） |
 | `dsh-adapt report --markdown` | 同 verify | 二级信息 |
 
 **③ 归因契约（`verify` 报告，机器可读）**
@@ -240,6 +245,7 @@ export function apply(ctx) {
 | 优先级 | 证据 | 归因 |
 |---|---|---|
 | 1 | **结构化字段 `hostFatal[]` 非空**（`HOST_FATAL_FIELD`），或失败项属 `HOST_SIDE_CHECKS`（`host.tools_ready` / `detect.flavor_known` / `contract.probe_disposed`） | `UPSTREAM_DRIFT` |
+| **1b** | **完成位缺失**（`runCompleted === false`）且无失败项、`checks` 非空 —— 探针跑过但**没跑完**（插件提前 `process.exit` / 挂住事件循环 / 不可捕获终止）；未跑到的检查是 `skip` 而非 `fail`，**不得**据此判通过（假绿比 AMBER 更危险） | `PLUGIN_REGRESSION` |
 | 2 | 版本线探测为 `unknown` | `UPSTREAM_DRIFT` |
 | **2b** | 失败项属 **`PLUGIN_HARD_EVIDENCE`**（`guard.reserved_rejected`）—— 插件违反宿主硬约束，**优先于任何漂移相关性** | `PLUGIN_REGRESSION` |
 | 3 | 契约指纹漂移，且漂移字段与失败 check **一一对应**（`reservedName`↔`guard.reserved_name`、`schemaSubset`↔`compat.schema_flatten`、`configProjection`↔`detect.flavor_known`、`outputShape`↔`dispatch.*`） | `UPSTREAM_DRIFT` |
@@ -247,22 +253,91 @@ export function apply(ctx) {
 | 5 | 失败项属 `PLUGIN_SIDE_CHECKS` / `CONTRACT_SIDE_CHECKS`（基线一致） | `PLUGIN_REGRESSION` |
 | 6 | 有失败但无可识别 check（被外力中断等） | `UNKNOWN`（不猜、不甩锅） |
 
+> **写入端纪律（🔴-D / 🔴 必修-2/3）**：`hostFatal[]` 是判据唯一事实字段，它的**写入端**必须分相位——
+> 探针执行分 `host-assembly`（宿主包 import / Context 装配 / 契约采集）与 `plugin-integration`
+> （插件 import / apply / definitions / dispatch / 生命周期）两段；探针兜底按相位归因：
+> `host-assembly` 的未预期异常 → `hostFatal[]`；`plugin-integration` 的 → **插件侧 check**
+> （同步 `plugin.unexpected_exception` / 异步 `plugin.async_uncaught_exception`），
+> **绝不**进 `hostFatal[]`。
+> 读插件侧数据的两处（`tools.schemas()` / `definitions.map()`）另有独立护栏，异常落
+> `registry.exact` / `guard.reserved_rejected`。历史缺陷：顶层 catch 一律 `pushHostFatal()`，
+> 插件 bug（未初始化字段 / 抛错 getter）被写成宿主信号 → 判 `UPSTREAM_DRIFT`/AMBER，
+> 并盖掉插件侧已失败的 check。归属路由的唯一事实源：`src/harness/contract.mjs` 的
+> `PROBE_PHASE` / `probeFailureRoute()` / `probeProcessFailureRoute()` / `recordProbeException()` /
+> `recordProbeAsyncException()` / `recordProbeEarlyExit()` / `recordProbeRunIncomplete()`。
+>
+> **不变量（收窄后的准确口径）**：插件侧错误**不得**进 `hostFatal[]`——探针**可捕获**的全部
+> 逃逸形态（①②③④）都落插件侧 check；唯一例外是**不可捕获**的进程级终止（按信标归因，见下）。
+>
+> **两层兜底（同族活口：异步异常）**：只有**同步**异常在 `run()` 调用栈上、能被顶层 `catch` 接住。
+> 插件在 `apply()` 里排的后台任务（微任务 / 定时器 / 事件回调 / 预取 promise）抛错时异常**不在**
+> 栈上 → 探针在写出 `__DSH_PROBE__` 之前被杀 → 装配器只看到「探针未输出结构化结果」→
+> 无条件 `pushHostFatal()` → 插件 bug 判 `UPSTREAM_DRIFT`/AMBER，且 `checks` 从 17 掉到 **0**
+> （整份报告消失，比「盖掉一条 check」更彻底）。故探针另挂 `uncaughtException` /
+> `unhandledRejection` 两个进程级兜底：按同一份相位路由归因，**照常输出结构化结果**
+> （已跑完的检查全部保留），兜底处理器自身不抛、结果用 `writeSync` 输出（防 `exit` 截断 stdout）。
+> 边界：探针是**有限时长验收**，只在收尾前给已排队的微任务/宏任务一个 50ms 排空窗口；
+> 更晚的延迟抛错发生在探针退出之后，不属本防线范围。
+
+> **另有 9 项条件检查**（不计入 17 项，仅在异常路径出现；唯一事实源 = `CONDITIONAL_PROBE_CHECKS`，
+> 其项数由 `tests/test_exports.mjs` 断言与文档声明一致）：
+>
+> **条件检查项（不计入 17 项）**：`plugin.unexpected_exception`（① 同步）/ `plugin.async_uncaught_exception`
+> （② 异步）/ `plugin.early_exit`（③ 进程 `exit`）/ `plugin.run_incomplete`（④ `run()` 被拖住）/
+> `plugin.abnormal_termination`（不可捕获终止，由装配器按相位信标落）/
+> `plugin.process_defense_tampered`（⑤ 进程内防线被插件干预：静音 / 撤销 / **顶替** / **出口③ `exit` 钩子被摘**，探针收尾四重自检）/
+> `plugin.protocol_injection`（⑥ 结果通道被注入伪造结果 / **被插件关闭**，装配器结构不变量 + 通道隔离）/
+> `plugin.probe_result_forged`（🆕 侧信道：输出面出现无 nonce 的伪造报告行）/
+> `plugin.exit_code_mismatch`（🔴 必修-4 退出码交叉：报告自称通过但退出码非 0 ⇒ 两个独立产物矛盾）——唯一事实源 =
+> `src/harness/contract.mjs` 的 `CONDITIONAL_PROBE_CHECKS`；
+> 「17 项 ∪ 条件项 == 三张 check 表并集」与「`PROBE_CHECK_ORDER` == 探针实际输出顺序」由
+> `tests/test_attribution.mjs` [9.8e] 断言（漂移即红）；四条出口 + 完成位另有 [9.9] 一整段。
+>
+> **四条出口与完成位（🔴 必修-1/2/3）**：插件侧错误逃出 `run()` 调用栈有**四条**出口，
+> 每条都必须闭合（少一条 = 插件 bug 被装配器判成 `UPSTREAM_DRIFT`/AMBER，且 `checks` 归零）：
+> ① 同步异常（顶层 `catch`）；② 异步异常（`uncaughtException` / `unhandledRejection`）；
+> ③ 进程 `exit`（`process.on('exit')` + 自杀式信号处理器）；④ `run()` 被拖住
+> （**无条件**看门狗 `RUN_WATCHDOG_MS`，**不得 `unref`**）。归属规则唯一事实源 =
+> `contract.mjs` 的 `probeFailureRoute()` / `probeProcessFailureRoute()`（插件侧一律落 check，
+> **绝不**写 `hostFatal[]`）。**完成位** `runCompleted` 只在 `run()` 正常返回后置真，
+> `emit()` 的 `ok = runCompleted && errors.length === 0`——否则出口 ③ 的中途报告会**假绿**
+> （未跑到的检查是 `skip` 不是 `fail`）。
+>
+> ⚠️ **口径前提（v0.1.9b 收窄，评审复评 H1）**：上表的「插件侧一律落 check」以「探针进程内防线**有效**」为前提。
+> 插件可**单方面关闭**该防线：`process.setUncaughtExceptionCaptureCallback()` **停用** `uncaughtException`
+> 监听器（Node 语义）；`removeAllListeners('uncaughtException')` 直接撤销。实测（一行夹具）：
+> 装了 captureCallback 的插件后台抛错 → 防线静音 → `run()` 仍正常收尾 → 整轮 **GREEN / PASS / 17 项**
+> （**放行级假绿**）。故本文件**不得**把该不变量写成「永远 / 永不」绝对口径。见 `docs/RISKS.md` R22/R23，v0.1.9 修法 A。
+>
+> ⚠️ **架构前提（显式，评审复评 🟡-4 / 总师 §3-Q2）**：本中台的**全部结论**以
+> **「被测插件为可信代码」**为前提。探针与插件**同进程 + 共用输出面** ⇒ 插件（或**其依赖**）可
+> ① 伪造结构化结果标记（nonce 带外通道（**stdin**，不经 argv/env）+ fd3 通道隔离挡「无意的自我发绿卡」与「从环境块 / argv 反读」；同进程同 uid 的其它篡改仍需进程级隔离）、
+> ② 摘掉 / 静音探针的进程内防线（R22 / R23）、③ 在探针写出报告前退出并自补一条干净报告
+> ⇒ **探针结论不可信**。这是**架构前提被打破**，不是探针 bug——本中台是**验收**工具，**不是沙箱**。
+> ⇒ **不得**在缺少该前提时宣称「报告可信」；根治方向见 `docs/REDO-PROPOSAL.md`，风险 `docs/RISKS.md` **R26（HIGH）**。
+>
+> **边界（显式声明，不静默）**：**不可捕获**终止（`SIGKILL` / OOM / 原生 `abort` / stdout 被破坏）
+> 探针来不及写报告，由装配器按**相位信标** `__DSH_PROBE_PHASE__` 归因——有信标（插件代码运行期间）
+> → 插件侧 check `plugin.abnormal_termination`；无信标（宿主装配段）→ `hostFatal[]`（真上游信号不丢）。
+> 另：探针是**有限时长验收**，只在收尾前给已排队的微任务/宏任务一个 50ms 排空窗口（`ASYNC_DRAIN_MS`）。
+>
 > **2b 为什么必须在 3 之前**：上游若放宽保留名校验（`reservedName` 漂移），
 > `guard.reserved_rejected` 仍会 fail。若让漂移相关性先判，插件侧硬违规会被吞成
 > `UPSTREAM_DRIFT`/AMBER，责任被甩给上游（评审 🔴-C）。
 > `guard.reserved_name` 是**中台自检**（hub 自身护栏），不属硬证据——用 `guard.*`
 > 通配会过度修正（评审 🟡-1）。
 >
-> 判据表**唯一事实源**在 `src/harness/contract.mjs`（探针与执行器共用，防两侧漂移）。
+> 判据表**唯一事实源**有两处，各管一半（缺一即红）：
+> - check 名单与宿主侧字段的唯一事实源：`src/harness/contract.mjs`（探针与执行器共用，防两侧漂移）。
+> - 漂移相关性表的唯一事实源：`src/triage/index.mjs` 的 `DRIFT_IMPACT`（执行器与影响面报告共用，防三处各自维护）。
 >
 > **四条纪律（判据只认结构化证据 —— 评审 🔴-C 活口二的收口口径，文档侧对齐）**：
 > 1. 宿主/环境侧信号**只认结构化字段 `hostFatal[]`**（`HOST_FATAL_FIELD`）与 `HOST_SIDE_CHECKS` 名单；
 >    `errors[]`（含 `fatal(host):` 前缀行）是**人读日志**，**任何判据不读** —— 插件侧 stack / 文件路径 /
 >    CI 工作目录里出现该字面量**不得**翻案（实现见 `src/verify/runner.mjs` 判据 1）。
 > 2. 插件侧硬证据 `PLUGIN_HARD_EVIDENCE` **优先于**任何漂移相关性。
-> 3. 漂移字段必须与失败 check **一一对应**才判上游漂移（不把插件 bug 甩给上游）。
-> 4. 判据表**唯一事实源**在 `src/harness/contract.mjs`；本表由 `tests/test_attribution.mjs` [7b] 守住，
->    与唯一事实源口径不一致即红（**文档即防线**）。
+> 3. 漂移字段必须与失败 check **一一对应**才判上游漂移（不把插件 bug 甩给上游；对应表 = `DRIFT_IMPACT`，**不得**在 `runner.mjs` 里手写 `||`，也**不得**用 `dispatch.` 前缀通配）。
+> 4. 判据表**唯一事实源**在 `src/harness/contract.mjs`（check 名单/结构化字段）与 `src/triage/index.mjs`（漂移相关性表）；本表由 `tests/test_attribution.mjs` [7b]/[7c] 与 `tests/test_offline.sh` [14] 守住，与唯一事实源口径不一致即红（**文档即防线**）。
 
 **④ 通道定义契约（`registry/channels.json`）**
 
@@ -309,10 +384,20 @@ export function apply(ctx) {
 | M2 拓扑 | 架构图 + 模块清单 | ✅ done |
 | M3 可行性 | A1–A10 十项假设（真宿主验证） | ✅ done |
 | M4 工程 | 中台核心 + 双通道 + 侦测 + 汇报 | ✅ done |
-| M5 自验 | 三通道 17/17 + 离线 66 项 + 归因离线回归 80 项 + 发布面自检 20 项 + 归因端到端回归 43 项 + 负例拦下（含漂移窗口） | ✅ done |
+| M5 自验 | 三通道 17/17 + 离线 212 项 + 归因离线回归 654 项 + 发布面自检 43 项 + 归因端到端回归 191 项 + 负例拦下（含漂移窗口）+ 插件侧闸门 27 项（19 负例 + R24 六条 + 🔴-R3③ 一条 + 防过度修正） | ✅ done |
+
 | M6 文档 | 架构/接入/风险/索引 | ✅ done |
 | M7 推广 | 接入首个真实插件（建议 `dsh-OpenLiulan`） | ⏸ **待 CP2 人批准** |
 | M8 发布 | npm 包 / 组织级跨仓批量体检 | ⏸ **待 CP2 人批准** |
+| M9 上游自动归因 | `triage` 影响面：漂移到哪 / 影响谁 / 改哪一处 / 插件要不要动 | ✅ done（v0.1.7） |
+| M10 异步活口收口 | 插件侧**异步**异常（后台任务）进程级兜底 + 两处守卫加固（v0.1.8） | ✅ done |
+| M11 四条出口闭合 | **完成位** + 进程 exit 出口 + `run()` 被拖住 + 不可捕获终止（相位信标）——四条出口逐条闭合（v0.1.9） | ✅ done |
+
+| M13 信任边界显式前提 + 结构性重做方案 | R26 写成**显式前提**（HIGH）+ fd3/nonce 两条防线 + 一页重做方案（`docs/REDO-PROPOSAL.md`，批 2 **已立项在办**）；R29（全局改写假绿）/ R30（无 nonce 硬崩）已登记 | ✅ done（批 2 在办） |
+| M14 批 1.5（复评 🔴-R1/R2 收口） | 可达性口径更正（**可证伪**断言替代恒真式）+ 结果通道**可见化**（降级不得判 PASS）+ §3 反例**固化**进闸门 + `'exit'` 钩子纳入防线台账 + 计数守卫（CHANGELOG 入表 / 逐处比对） | ✅ done（v0.2.3） |
+| M15 R26 残留②（fail-open）登记 + 批 2 首要目标 | 评审复评 §三/§四 采信与并轨：**R26 残留边界②** 写明（隔离判定是「fd3 有没有内容」⇒ 探针**未 emit** 时**回退信任 stdout**；使能条件 = **「探针是否来得及 emit」**，**非**「写对通道」）；批 2 立项说明并入**首要目标 = 独立 fd 且永不回退 stdout**；离线 **[9.14]** 把现状固化为**可执行断言**（批 2 修好即红）。**只登记与固化断言，不改判据** | ✅ done（v0.2.4） |
+| M17 🔴-R3 收口（**并集**，v0.2.6） | **宿主侧观测主判据**（`resultChannelProvided`，不依赖探针自报）+ **§三 同源**降级分支（宿主已给 fd3 却自报 `stdout-degraded` ⇒ 矛盾 ⇒ 判篡改；收口前实测 `AMBER`/`UPSTREAM_DRIFT` 甩锅上游）+ 形态可见值 `fd3-redirected`（二级信息独立 HIGH 风险 + `resultChannelRedirected` 字段 + Markdown 标注）；夹具 `plugin-channel-degrade-forge-plugin` **进闸门**；离线 [9.16] + `test_offline.sh` [22] + 真宿主 [8i]；**两条腿各自的变异回退** | ✅ done（v0.2.6） |
+| M16 🔴-R3′ 通道重定向收口 | **宿主侧通道观测**交叉校验（报告自称 fd3 而宿主侧 fd3 为空 + stdout 有匹配 nonce 行 ⇒ `plugin.protocol_injection`，不采信任何一条）；夹具 `plugin-channel-redirect-plugin` **进闸门**；离线 [9.15] 20 条 + `test_offline.sh` [21] 16 条 + 真宿主 [8h] 10 条；变异自证（关掉观测 ⇒ 复现假绿） | ✅ done（v0.2.5） |
 
 **暂停确认点**
 
@@ -332,6 +417,7 @@ export function apply(ctx) {
 | 能力索引 | `docs/INDEX.md` | 一页找齐 |
 | 通道钉版表 | `registry/channels.json` | 唯一事实源 |
 | 契约指纹基线 | `registry/contract-snapshots/latest.json` | 漂移对比 |
+| 漂移影响面归因 | `src/triage/index.mjs` | 漂移字段 → 受影响检查 → 责任方 → 中台改哪一处 |
 | 验收执行器 | `src/verify/runner.mjs` | CI 调用 |
 | 页面按钮 | `.cnb/web_trigger.yml` | 人不用记命令 |
 | CI 流水线 | `.cnb.yml` | push/PR/crontab/web_trigger |
@@ -361,6 +447,6 @@ export function apply(ctx) {
 | 要素 | 内容 |
 |---|---|
 | **做对了** | ① 先真宿主验证再设计（A7 直接推翻「用 latest 当稳定线」的想当然）；② 把「归因」做成核心能力而非附属；③ 插件侧零宿主 import |
-| **做错了/差点错** | 初版 schema 校验器把「无 type 节点」误判为违规（实测宿主接受）——靠真宿主验收抓到，已修 |
+| **做错了/差点错** | ① 初版 schema 校验器把「无 type 节点」误判为违规（实测宿主接受）——靠真宿主验收抓到，已修；② 漂移相关性判据曾在 `runner.mjs` 手写 4 条 `||`，与文档表/影响面表**三处各自维护**（v0.1.7 收归 `DRIFT_IMPACT` 唯一事实源）；③ 护栏自查发现两个活口：纪律③的字面量断言删条件语义仍绿、正文声明句删除后**由纪律④顶包**仍绿（v0.1.7 已堵） |
 | **没做** | npm 发布、跨仓批量体检、PTC-only 增强（均显式暂缓，非遗忘） |
 | **下一步** | CP2 放行后：接首个真实插件 → 验证「改中台一处、插件零改动」的闭环 |
