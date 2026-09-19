@@ -259,6 +259,7 @@ console.log("  [2b''] CHANGELOG 防线编号自述可检索");
     "[2b']": expSrc,
     '[2b]': expSrc,
     '[2c]': expSrc,
+    '[2d]': expSrc,
     '[13]': offlineSrc,
     // v0.1.7 新增防线：漂移相关性表唯一事实源（离线）与 triage 影响面（离线）
     '[7c]': attrSrc,
@@ -284,6 +285,76 @@ console.log('  [2c] 文档头部版本与 package.json 一致');
   if (!m) bad('docs/ARCHITECTURE.md 头部有版本声明', '未匹配到「版本：dsh-adapt-hub vX」');
   else if (m[1] === pkg.version) ok('docs/ARCHITECTURE.md 版本 = package.json', 'v' + m[1]);
   else bad('docs/ARCHITECTURE.md 版本', '文档 v' + m[1] + ' ≠ package.json v' + pkg.version);
+}
+
+// ---- 2d. docs/INDEX.md「产物索引」表**完整性**（防「表格被空行截断 + 重复行」） ----
+// 为什么补：v0.2.8 实测——`docs/INDEX.md` §二 产物索引表里，`归因端到端回归` 一行**出现两次**，
+// 且两行之间夹了一个**空行**（Markdown 里等于把一张表**劈成两张**：后半张失去表头 ⇒ 渲染成纯文本、
+// 「一页找齐」的索引价值直接打折）。而既有守卫只守 §四 的 17 项清单（[2b]/[2b']）与 §二的**条件检查表**
+// （[2b''']）——**产物索引表整块无守卫** ⇒ 这类漂移可静默通过（exports 43 项全绿）。
+// 判据（三条，都按**定位**而非「字串在不在」）：
+//   1) 段落内不得出现「表格 —— 空行 —— 表格」的截断形态（表头与数据行必须连续）；
+//   2) 同一张表内不得有**整行重复**（按整行 trim 后精确判，不按前缀）；
+//   3) 每行首列的产物名不得重复（防「同物两行、内容各写一半」的顶包形态）。
+// 段落锚点：`## 二、产物索引` 起，到下一个 `## ` 标题止。
+console.log('  [2d] docs/INDEX.md 产物索引表完整性（无空行截断 / 无重复行）');
+{
+  const text = readFileSync(path.join(ROOT, 'docs/INDEX.md'), 'utf8');
+  const start = text.search(/^##\s*二、产物索引\s*$/m);
+  if (start < 0) bad('INDEX 可定位「二、产物索引」段落', '未匹配到段落标题（==真·入口清单丢失）');
+  else {
+    const after = text.slice(start);
+    const nextH2 = after.slice(1).search(/^##\s/m);
+    const section = nextH2 < 0 ? after : after.slice(0, nextH2 + 1);
+
+    // 取该段落内的表块：连续的以 `|` 开头的行（首块即产物索引表）
+    const lines = section.split('\n');
+    const blocks = [];
+    let cur = null;
+    for (const line of lines) {
+      if (/^\s*\|/.test(line)) {
+        if (!cur) { cur = []; blocks.push(cur); }
+        cur.push(line);
+      } else if (line.trim() === '') {
+        cur = null; // 空行 ⇒ 表块结束
+      } else {
+        cur = null; // 非表格行也断开（防跨段落累加）
+      }
+    }
+    eq('INDEX 产物索引段落内表块数 = 1（表格未被空行劈开）', 1, blocks.length);
+
+    const rows = (blocks[0] ?? []).filter((l) => !/^\s*\|[-:\s|]+\|\s*$/.test(l));
+    // 表头 + 分隔行 + 数据行；数据行 = 去掉表头行（首行）
+    const body = rows.slice(1);
+    // 判据 2：整行重复
+    const trimmed = body.map((l) => l.trim());
+    const dupRows = [...new Set(trimmed.filter((l, i) => trimmed.indexOf(l) !== i))];
+    eq('INDEX 产物索引表无整行重复', [], dupRows.map((l) => l.slice(0, 40)));
+
+    // 判据 3：首列产物名唯一
+    const firstCol = body.map((l) => l.split('|')[1]?.trim());
+    const dupNames = [...new Set(firstCol.filter((n, i) => firstCol.indexOf(n) !== i))];
+    eq('INDEX 产物索引表首列（产物名）唯一', [], dupNames);
+
+    // 守卫自证（三条变异必须各自判否，防「断言写成恒真」）：
+    // a) 在表中间插一个空行 ⇒ 表块数变 2
+    const splitIdx = 2;
+    const split = [...body.slice(0, splitIdx), '', ...body.slice(splitIdx)];
+    const countBlocks = (arr) => {
+      let n = 0; let c = false;
+      for (const l of arr) { if (/^\s*\|/.test(l)) { if (!c) { n += 1; c = true; } } else if (l.trim() === '') c = false; else c = false; }
+      return n;
+    };
+    eq('🟡[2d] 守卫自证：表内插空行 ⇒ 表块数 2（非恒真）', 2, countBlocks(split));
+    eq('🟡[2d] 守卫自证：原表块数 1（反证当前文档本身正常）', 1, countBlocks(body));
+    // b) 复制一行 ⇒ 重复行判据必须命中
+    const dupd = [...body, body[body.length - 1]];
+    const t2 = dupd.map((l) => l.trim());
+    eq('🟡[2d] 守卫自证：复制一行 ⇒ 重复行判据命中', true, t2.some((l, i) => t2.indexOf(l) !== i));
+    // c) 首列改名撞车 ⇒ 名重复判据必须命中
+    const col = ['A', 'B', 'A'].map((x) => x.split('|')[1]?.trim() ?? x);
+    eq('🟡[2d] 守卫自证：首列撞名 ⇒ 名重复判据命中', true, new Set(col).size !== col.length);
+  }
 }
 
 // ---- 3. 模板拷贝可用（按模板 README 指引：拷贝 + 改 import 行） ----
