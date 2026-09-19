@@ -42,6 +42,12 @@ if "$NODE_BIN" "$ROOT/tests/test_exports.mjs" > /tmp/exports.log 2>&1; then
 else
   bad "发布面自检失败"; tail -20 /tmp/exports.log
 fi
+# 契约基线「分段 + 只读」守卫（v0.3.0）：verify 不得写基线 / settle 是唯一写入点 / CI 接线正确
+if "$NODE_BIN" "$ROOT/tests/test_baseline_guard.mjs" > /tmp/baseline-guard.log 2>&1; then
+  ok "基线分段守卫全绿（$(sed -n 's/.*基线守卫）：\([0-9]*\) 项通过.*/\1/p' /tmp/baseline-guard.log) 项：verify 只读 + settle 唯一写入点 + 10:00 结算接线）"
+else
+  bad "基线分段守卫失败"; tail -20 /tmp/baseline-guard.log
+fi
 
 step "2. 示例插件 · 逐通道真宿主验收"
 for channel in $CHANNELS; do
@@ -118,16 +124,30 @@ if [[ "$WATCH_EXIT" -eq 0 ]]; then ok "上游无漂移（exit 0）"
 elif [[ "$WATCH_EXIT" -eq 1 ]]; then echo "  ⚠️ 检测到上游版本漂移（exit 1，需人工确认后 bump pins）"; ok "侦测器可用"
 else echo "  ⚠️ 侦测器离线（exit 2），不视为失败"; ok "侦测器可用（离线）"; fi
 
-step "6. 契约指纹基线"
-if [[ -f "$ROOT/registry/contract-snapshots/latest.json" ]]; then
-  ok "契约指纹已落盘（registry/contract-snapshots/latest.json）"
+step "6. 契约基线（v0.3.0：分段 + 只读；verify 不得写）"
+# 口径升级：旧断言是「latest.json 存在」+「没被改写」——**只在旧语义下有意义**，
+# 而且「存在」这件事在新语义下**什么都不能证明**（文件可能是历史遗留、也可能早该迁走）。
+# 现在断言**新语义**：① 基线链可解析；② 跑完 verify 之后基线**逐字节未变**（含分片目录）；
+# ③ `settle --dry-run` 确实**不落盘**（写基线只发生在真的结算）。
+BASELINE_BEFORE="$(git -C "$ROOT" status --porcelain -- registry/contract-snapshots | shasum | awk '{print $1}')"
+"$NODE_BIN" "$ROOT/src/cli.mjs" baseline --json /tmp/baseline.json > /tmp/baseline.log 2>&1
+if [[ -s /tmp/baseline.json ]]; then
+  ok "基线链可解析（$(grep -o '"chain": \[[^]]*\]' /tmp/baseline.json | head -1)）"
 else
-  bad "契约指纹未落盘"
+  bad "基线链不可解析"; tail -10 /tmp/baseline.log
 fi
-if git -C "$ROOT" diff --quiet -- registry/contract-snapshots/latest.json; then
-  ok "基线未被验收过程改写（无脏工作区；仅 ok 且契约变化时才写盘）"
+BASELINE_AFTER="$(git -C "$ROOT" status --porcelain -- registry/contract-snapshots | shasum | awk '{print $1}')"
+if [[ "$BASELINE_BEFORE" == "$BASELINE_AFTER" ]]; then
+  ok "基线未被验收过程改写（verify 只读；写基线只在 settle）"
 else
-  bad "基线被验收过程改写（漂移侦测会被自己写坏）"; git -C "$ROOT" diff --stat -- registry/contract-snapshots/latest.json
+  bad "基线被验收过程改写（基线会自己一直在动 ⇒ 累积偏移被静默吸收）"; git -C "$ROOT" status --porcelain -- registry/contract-snapshots
+fi
+# dry-run 自证：不落盘
+"$NODE_BIN" "$ROOT/src/cli.mjs" settle --from /tmp/baseline.json --at 2099-01-01T00:00:00Z --dry-run > /tmp/settle-dry.json 2>&1
+if git -C "$ROOT" status --porcelain -- registry/contract-snapshots | grep -q '2099-01-01'; then
+  bad "settle --dry-run 落盘了（dry-run 语义被破坏）"
+else
+  ok "settle --dry-run 不落盘（写基线只发生在真结算）"
 fi
 
 step "7. 文档计数防漂移（文档声明的项数必须等于实际跑出来的项数；声明缺失即红）"

@@ -24,12 +24,16 @@ import { tmpdir } from 'node:os';
 import { HUB_ROOT, channelFingerprint, loadChannels, pruneHostCache } from './harness/host.mjs';
 import { resolvePlugin, verifyAll, verifyChannel } from './verify/runner.mjs';
 import { buildSecondary, toMarkdown } from './report/secondary.mjs';
+import { diffContracts, watchUpstream } from './watch/upstream.mjs';
 import {
-  contractSnapshot,
-  diffContracts,
-  planSnapshotUpdate,
-  watchUpstream,
-} from './watch/upstream.mjs';
+  DEFAULT_SETTLE_HOUR,
+  legacySnapshot,
+  migrateLegacyLatest,
+  periodKey,
+  resolveBaseline,
+  segmentStore,
+  settleSegment,
+} from './watch/baseline.mjs';
 import { toTriageMarkdown, triageUpstream } from './triage/index.mjs';
 import { VERSION } from './version.mjs';
 
@@ -37,10 +41,10 @@ import { VERSION } from './version.mjs';
 export const ALL_CHANNELS = ['stable', 'dev', 'legacy'];
 
 /** 已知布尔开关（其余 `--key value` 视为带值参数）。 */
-const BOOLEAN_FLAGS = new Set(['offline', 'markdown', 'help', 'prune-cache']);
+const BOOLEAN_FLAGS = new Set(['offline', 'markdown', 'help', 'prune-cache', 'dry-run', 'migrate']);
 
 /** 已知带值参数（未知的 `--key` 显式报错，避免拼错参数被静默忽略）。 */
-const VALUE_KEYS = new Set(['channel', 'plugin', 'tools', 'json', 'contract-from']);
+const VALUE_KEYS = new Set(['channel', 'plugin', 'tools', 'json', 'contract-from', 'from', 'mode', 'release', 'at', 'settle-hour']);
 
 /**
  * 解析 `--key value` / `--key=value` / `--flag` 形式的参数。
@@ -118,6 +122,9 @@ function usage() {
     '  dsh-adapt verify --channel stable|dev|legacy|all     # 验收（all = stable+dev+legacy）',
     '        --plugin <path>  --tools a,b  [--offline] [--json <out>] [--markdown]',
     '  dsh-adapt watch  [--json <out>] [--markdown]         # 上游变更侦测 + 自动归因影响面',
+    '  dsh-adapt settle --from <verify.json>                # ★ 结算周期基线（唯一写基线的地方）',
+    '        [--mode day|release] [--release <版本标识>] [--at <ISO>] [--settle-hour 10] [--dry-run]',
+    '  dsh-adapt baseline [--migrate] [--json <out>]        # 看当前基线链（+ 一次性迁移遗留 latest.json）',
     '  dsh-adapt report --plugin <path> --tools a,b [--channel stable|dev|legacy|all] [--markdown]',
     '  dsh-adapt cache  [--prune-cache]                     # 宿主依赖缓存维护（默认保留当前钉版指纹）',
     '',
@@ -166,13 +173,14 @@ function cmdVerify(args) {
   // 验收后顺手清理历史残留缓存（保留本次三通道钉版指纹）——pruneHostCache 的真实调用点
   const cache = args['prune-cache'] ? pruneHostCache({ keepFingerprints: keepFingerprintsFor() }) : null;
 
-  // 基线维护（防自毁）：只有验收通过的通道才更新基线；失败不覆盖、不产生假漂移。
-  const snapshot = contractSnapshot({ hubRoot: HUB_ROOT });
-  const plan = planSnapshotUpdate({ snapshot, report });
-  const saved = plan.changed ? snapshot.save(plan.accepted) : { written: false, contracts: plan.merged };
-  const drift = diffContracts(plan.previous, Object.fromEntries(
-    report.channels.filter((c) => c.ok).map((c) => [c.channel, c.contract]),
-  ));
+  // 基线**不在这里写**（本版核心改动）：`verify` 每跑一次就改写基线，会让基线自己一直在动
+  // ⇒ 上游连续发版时 v1→v2→v3 的累积偏移被**静默吸收**。现在 `verify` 只**读**基线做对比，
+  // 写基线只发生在 `settle`（结算）——一天一个基线（默认 10:00 结算）。
+  const baseline = resolveBaseline({ hubRoot: HUB_ROOT });
+  const drift = diffContracts(
+    { contracts: baseline.contracts },
+    Object.fromEntries(report.channels.filter((c) => c.ok).map((c) => [c.channel, c.contract])),
+  );
 
   const output = {
     ...report,
@@ -180,10 +188,12 @@ function cmdVerify(args) {
     contractDrift: drift,
     cache,
     baseline: {
-      updated: plan.accepted && Object.keys(plan.accepted).length > 0 ? Object.keys(plan.accepted) : [],
-      skipped: plan.skipped,
-      written: Boolean(saved.written),
-      path: snapshot.path,
+      // 只读快照：这次对比用的是哪条链、哪个通道取自哪个周期
+      mode: 'read-only',
+      note: 'verify 不写基线；写基线请用 `dsh-adapt settle`（一天一个基线）',
+      chain: baseline.chain,
+      perChannel: baseline.perChannel,
+      channels: report.channels.filter((c) => c.ok).map((c) => c.channel),
     },
   };
   if (typeof args.json === 'string') {
@@ -196,18 +206,143 @@ function cmdVerify(args) {
   process.exit(report.summary.verdict === 'GREEN' ? 0 : 1);
 }
 
+/**
+ * 查看当前基线链（**只读**）；`--migrate` 把历史遗留 `latest.json` 一次性迁成分片。
+ *
+ * @param {object} args 已解析参数
+ */
+function cmdBaseline(args) {
+  const migration = args.migrate ? migrateLegacyLatest({ hubRoot: HUB_ROOT }) : null;
+  const resolved = resolveBaseline({ hubRoot: HUB_ROOT });
+  const store = segmentStore({ hubRoot: HUB_ROOT });
+  const output = {
+    chain: resolved.chain,
+    perChannel: resolved.perChannel,
+    channels: Object.keys(resolved.contracts),
+    segments: resolved.segments.map((seg) => ({
+      periodKey: seg.periodKey,
+      mode: seg.mode ?? null,
+      orderAt: seg.orderAt ?? null,
+      channels: Object.keys(seg.baseline ?? {}),
+      candidates: (seg.candidates ?? []).length,
+      ignored: seg.ignored ?? [],
+    })),
+    legacyLatestUsed: resolved.legacyLatest !== null,
+    segmentDir: store.dir,
+    ...(migration ? { migration } : {}),
+  };
+  if (typeof args.json === 'string') {
+    mkdirSync(path.dirname(path.resolve(args.json)), { recursive: true });
+    writeFileSync(path.resolve(args.json), `${JSON.stringify(output, null, 2)}\n`);
+  }
+  if (args.markdown) {
+    console.log([
+      '## 契约基线链（早 → 晚顺序合并）',
+      '',
+      `- 链：${resolved.chain.join(' → ') || '（空）'}`,
+      // 迁移后 latest.json 仍在磁盘上（作为历史存档），但**已不再参与链** ⇒ 不再告警
+      resolved.legacyLatest && !resolved.chain.some((k) => k.startsWith('migrated-'))
+        ? '- ⚠️ 仍在使用历史遗留 `latest.json`（跑一次 `baseline --migrate` 迁成周期分片）' : '',
+      '',
+      '| 周期 | 模式 | 通道 | 候选数 | 被忽略（取最早） |',
+      '|---|---|---|---|---|',
+      ...resolved.segments.map((seg) => `| ${seg.periodKey} | ${seg.mode ?? '—'} | ${Object.keys(seg.baseline ?? {}).join(', ') || '—'} | ${(seg.candidates ?? []).length} | ${(seg.ignored ?? []).join(', ') || '—'} |`),
+    ].filter(Boolean).join('\n'));
+  } else console.log(JSON.stringify(output, null, 2));
+  process.exit(0);
+}
+
+/**
+ * 结算一个周期的基线（**唯一写基线的地方**）。
+ *
+ * 语义（issue 口径）：
+ * - 默认**一天一个基线**：周期键 = 当天结算点日期（`--settle-hour`，默认 10 点，UTC+8）；
+ * - 可切 `--mode release`（`--release <版本标识>`）：**每个上游版本**建立**独自**基线；
+ * - 同周期已有基线时**取相对早的那个**（后跑的不覆盖），被忽略的候选记入 `ignored[]`；
+ * - 每周期写**独立分片** `registry/contract-snapshots/segments/<key>.json`，**不合并到主线**；
+ * - `--dry-run` 只看会写什么，不落盘。
+ *
+ * 退出码：0 = 已结算（或幂等无变化）；2 = 用法错误；3 = 运行时异常。
+ *
+ * @param {object} args 已解析参数
+ */
+function cmdSettle(args) {
+  const mode = typeof args.mode === 'string' ? args.mode : 'day';
+  const at = typeof args.at === 'string' ? args.at : new Date();
+  const key = periodKey({
+    mode,
+    at,
+    release: typeof args.release === 'string' ? args.release : undefined,
+    settleHour: typeof args['settle-hour'] === 'string' ? Number(args['settle-hour']) : DEFAULT_SETTLE_HOUR,
+  });
+  const store = segmentStore({ hubRoot: HUB_ROOT });
+  const report = readVerificationReports(args);
+  const settled = settleSegment({
+    store,
+    key,
+    dryRun: Boolean(args['dry-run']),
+    run: { at, mode, orderAt: at, source: args['from'] ?? null, channels: report.channels },
+  });
+  const resolved = resolveBaseline({ hubRoot: HUB_ROOT });
+  const output = {
+    periodKey: key,
+    mode,
+    dryRun: Boolean(args['dry-run']),
+    written: settled.written,
+    baselineChannels: Object.keys(settled.baseline ?? {}),
+    ignored: settled.ignored,
+    firstRunAt: settled.firstRunAt,
+    candidates: settled.candidates.length,
+    chain: resolved.chain,
+    perChannel: resolved.perChannel,
+    segmentDir: store.dir,
+  };
+  if (args.markdown) {
+    console.log([
+      `## 契约基线结算（${key}）`,
+      '',
+      `- 模式：${mode}｜链：${resolved.chain.join(' → ') || '（空）'}`,
+      `- 本次纳入通道：${Object.keys(settled.baseline ?? {}).join(', ') || '（无有效候选）'}`,
+      `- 同周期被忽略的候选（取最早）：${settled.ignored.join(', ') || '无'}`,
+      `- 落盘：${settled.written && !args['dry-run'] ? '是' : '否（dry-run 或幂等）'}`,
+      `- 分片目录：\`${store.dir}\``,
+    ].join('\n'));
+  } else console.log(JSON.stringify(output, null, 2));
+  process.exit(0);
+}
+
+/**
+ * 读取「本次运行的通道报告」。
+ *
+ * 结算的输入是**验收报告**（`verify --json` 的产物）而不是重新跑一遍真宿主——
+ * 这样结算可以放在 push/PR 之外的时间点（每日 10:00），不必重跑验收。
+ *
+ * @param {object} args 已解析参数
+ * @returns {{channels:object[]}} 通道报告
+ */
+function readVerificationReports(args) {
+  const file = typeof args.from === 'string' ? args.from : null;
+  if (!file) return { channels: [] };
+  try {
+    const report = JSON.parse(readFileSync(path.resolve(file), 'utf8'));
+    return { channels: report.channels ?? [] };
+  } catch {
+    return { channels: [] };
+  }
+}
+
 async function cmdWatch(args) {
   const report = await watchUpstream({ hubRoot: HUB_ROOT });
   // 自动归因：把「有没有漂移」推到「漂移到哪、影响谁、中台改哪一处、插件要不要动」。
   // 契约漂移用**基线 vs 本次通道契约**对比；本次无验收采集时（纯 watch），仍可按基线 + 失败队列判定。
-  const snapshot = contractSnapshot({ hubRoot: HUB_ROOT });
-  const baseline = snapshot.load()?.contracts ?? null;
+  const resolved = resolveBaseline({ hubRoot: HUB_ROOT });
+  const baseline = Object.keys(resolved.contracts).length > 0 ? resolved.contracts : null;
   // watch 场景没有「本次通道契约」（未跑真宿主），故只对**已在通道报告中回传的契约**做 diff；
   // 若调用方通过 --contract-from 提供了验收报告，则一并纳入（CI 上 watch 与 verify 串联时用）。
   const currentContracts = readContractsFromReport(args['contract-from']);
   const contractDrift = currentContracts ? diffContracts(baseline, currentContracts) : { changed: false, items: [] };
   const triage = triageUpstream({ report, contractDrift });
-  const output = { ...report, triage, contractDrift };
+  const output = { ...report, triage, contractDrift, baselineChain: { chain: resolved.chain, perChannel: resolved.perChannel } };
   if (typeof args.json === 'string') {
     mkdirSync(path.dirname(path.resolve(args.json)), { recursive: true });
     writeFileSync(path.resolve(args.json), `${JSON.stringify(output, null, 2)}\n`);
@@ -311,6 +446,8 @@ async function main() {
     if (command === 'matrix') cmdMatrix();
     else if (command === 'verify') cmdVerify(args);
     else if (command === 'watch') await cmdWatch(args);
+    else if (command === 'settle') cmdSettle(args);
+    else if (command === 'baseline') cmdBaseline(args);
     else if (command === 'report') cmdReport(args);
     else if (command === 'cache') cmdCache(args);
     else if (command === 'detect') cmdDetect();

@@ -2,8 +2,11 @@
 #
 # 设计要点（对应需求「跟着官方文档和新版本做适配」）：
 # 1. push / PR：离线单测 + **stable 与 dev 双通道真宿主验收**（legacy 走 crontab 周检，省额度）；
-# 2. crontab：每日侦测上游 dist-tag 漂移（越不稳定越需要自动化侦测）；
-# 3. web_trigger / web_trigger_watch：页面上给两个按钮，人不用记命令。
+#    **push / PR 只「读」契约基线**，绝不写 —— 每次 push 都改基线 = 基线自己一直在动，
+#    上游连续发版时的累积偏移会被静默吸收（issue 里点名的「三个通道 + 不同基线 ⇒ 大量问题」）。
+# 2. crontab：① **每日 10:00 结算基线**（一天一个基线，唯一写基线的地方）；
+#    ② 每日侦测上游 dist-tag 漂移（越不稳定越需要自动化侦测）；
+# 3. web_trigger / web_trigger_watch：页面上给按钮，人不用记命令。
 main:
   push:
     - name: offline-unit
@@ -21,6 +24,12 @@ main:
           script: |
             # 归因离线回归：契约采集无残留（🔴-A）+ 判据结构化（🔴-B）+ CLI 契约
             node tests/test_attribution.mjs
+        - name: baseline-readonly
+          script: |
+            # 契约基线「分段 + 只读」守卫（issue 口径）：
+            # ① verify 不得写基线（push 只读）；② push/PR 段不得出现写基线的命令；
+            # ③ 基线链可读且与分片一致（`settle` 是唯一写入点，且在 crontab 里）。
+            node tests/test_baseline_guard.mjs
     - name: dual-channel-verify
       docker:
         image: node:22
@@ -138,6 +147,27 @@ main:
             # 🔴-D / 🔴 必修-2/3 闸门（同 push 段，**同一份脚本**）：
             # 四条出口 + 不可捕获边界 + 🆕 侧信道（nonce 伪造）+ 完整失败项集合 + 防过度修正（健康插件 17/17）。
             DSH_PROBE_RUN_WATCHDOG_MS=5000 bash tests/gate_plugin_side.sh
+  # ★ 每日结算契约基线（10:00）：一天一个基线，**唯一写基线的地方**。
+  # 为什么是 10 点：用户点名「早晨 10 点，很多时候这时候都是不用的」——把写基线的动作
+  # 放在没人用仓库的时段，且**不跟** push / PR（否则基线被每一次 push 顶上，漂移被静默吸收）。
+  # 语义：同周期多次运行**取相对早的那个**当基线；每周期独立分片，不合并到主线。
+  "crontab: 0 10 * * *":
+    - name: settle-contract-baseline
+      docker:
+        image: node:22
+      stages:
+        - name: settle
+          script: |
+            # 结算输入是最近一次验收报告（这里按「当天先跑一次双通道验收」的口径，
+            # 验收产物由 CI 在 push 段产出；crontab 段独立跑一份，保证不依赖上一次 push）
+            node src/cli.mjs verify --channel all \
+              --plugin ./tests/fixtures/demo-plugin.mjs \
+              --tools demo_echo,demo_status \
+              --json ./.ci/verify-settle.json --markdown || true
+            # ★ 唯一写基线的地方：一天一个基线（周期键 = 当日结算点日期）
+            node src/cli.mjs settle --from ./.ci/verify-settle.json --mode day --markdown
+            # 链式合并后的当前基线（早 → 晚顺序合并，「连起来」才是最新版）
+            node src/cli.mjs baseline --markdown
   # 每日侦测上游漂移（Asia/Shanghai 03:30；最小调度间隔 5 分钟）
   "crontab: 30 3 * * *":
     - name: upstream-drift-scan
@@ -184,6 +214,23 @@ $:
               node src/cli.mjs verify --channel "$ch" --plugin "$PLUGIN_PATH" --tools "$TOOLS" --markdown || FAIL=1
             done
             exit $FAIL
+  web_trigger_settle:
+    - name: manual-settle-baseline
+      docker:
+        image: node:22
+      stages:
+        - name: settle
+          script: |
+            # 页面按钮「结算契约基线」：★ 唯一写基线的地方（人手动触发时用）
+            # CHANNEL 语义与 CLI 的 --channel 一致；SETTLE_MODE 支持一次跑成 --dry-run 演练
+            ARGS="--mode $SETTLE_MODE"
+            if [ "$SETTLE_MODE" = "release" ] && [ -n "$RELEASE_ID" ]; then ARGS="$ARGS --release $RELEASE_ID"; fi
+            if [ "$DRY_RUN" = "yes" ]; then ARGS="$ARGS --dry-run"; fi
+            node src/cli.mjs verify --channel all --plugin ./tests/fixtures/demo-plugin.mjs \
+              --tools demo_echo,demo_status --json ./.ci/verify-settle.json --markdown || true
+            # shellcheck disable=SC2086
+            node src/cli.mjs settle --from ./.ci/verify-settle.json $ARGS --markdown
+            node src/cli.mjs baseline --markdown
   web_trigger_watch:
     - name: manual-upstream-watch
       docker:
